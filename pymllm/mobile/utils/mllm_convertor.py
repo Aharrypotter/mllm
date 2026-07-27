@@ -1,12 +1,8 @@
 # Copyright (c) MLLM Team.
 # Licensed under the MIT License.
 
-import os
-import sys
 import json
 import argparse
-from pathlib import Path
-from typing import Dict, List
 
 from .. import convertor
 from ..convertor.model_file_v2 import ModelFileV2
@@ -34,18 +30,48 @@ def main():
     parser.add_argument(
         "--pipeline",
         type=str,
+        choices=sorted(BUILTIN_QUANTIZE_PIPELINE),
         help=f"Choose builtin pipeline in {BUILTIN_QUANTIZE_PIPELINE.keys()}",
     )
-    parser.add_argument("--passes", type=List, help="Passes that performs on params")
+    parser.add_argument(
+        "--include_prefix",
+        action="append",
+        default=[],
+        help=(
+            "Only convert parameters whose names start with this prefix. "
+            "Repeat the option to keep multiple prefixes."
+        ),
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
 
     args = parser.parse_args()
+    if args.format != "v2":
+        parser.error("this converter entry point currently supports only --format v2")
+    if args.cfg_path is not None and args.pipeline is None:
+        parser.error("--cfg_path requires --pipeline")
+    if any(not prefix for prefix in args.include_prefix):
+        parser.error("--include_prefix values must be non-empty")
     if args.verbose:
         print(f"Converting {args.input_path} to {args.output_path}")
         print(f"Output format: {args.format}")
 
     # Get params
-    params = convertor.load_model(args.input_path)
+    params = convertor.load_model(args.input_path, args.include_prefix)
+    if args.include_prefix:
+        params = {
+            name: tensor
+            for name, tensor in params.items()
+            if any(name.startswith(prefix) for prefix in args.include_prefix)
+        }
+        if not params:
+            parser.error(
+                "--include_prefix did not match any parameters; refusing to write an empty model"
+            )
+        if args.verbose:
+            print(
+                f"Kept {len(params)} parameters matching prefixes: "
+                + ", ".join(args.include_prefix)
+            )
 
     # Build pipeline
     if args.cfg_path is None and args.pipeline is not None and args.format == "v2":
@@ -110,4 +136,8 @@ def main():
             verbose=args.verbose,
         )
     else:
-        print("No pipeline specified")
+        parser.error("unsupported converter configuration")
+
+
+if __name__ == "__main__":
+    main()

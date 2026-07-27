@@ -1,12 +1,24 @@
 from __future__ import annotations
 
+import importlib
+
 from . import ffi
 from . import convertor
 from . import utils
 from . import quantize
 from . import nn
-from . import service
 from . import backends
+
+
+def __getattr__(name: str):
+    """Load optional subsystems only when a caller requests them."""
+    if name == "service":
+        module = importlib.import_module(f"{__name__}.service")
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 from .ffi import (
     # Floating point types
     float32,
