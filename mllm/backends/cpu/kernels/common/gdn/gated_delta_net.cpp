@@ -3,6 +3,7 @@
 
 #include "mllm/backends/cpu/kernels/common/gdn/gated_delta_net.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <stdexcept>
@@ -13,6 +14,8 @@
 
 namespace mllm::cpu::gdn {
 namespace {
+
+constexpr int kMaxStackNormalizedHeadDim = 256;
 
 float stableSoftplus(float value) {
   if (value > 20.0F) { return value; }
@@ -95,6 +98,61 @@ float updateAndDot(float* state, const float* key, const float* query, float del
   return dot;
 }
 
+void normalizeQueryAndKey(const float* query, const float* key, float query_scale, float key_scale, float* normalized_query,
+                          float* normalized_key, int length) {
+  int index = 0;
+#if defined(__aarch64__)
+  for (; index + 4 <= length; index += 4) {
+    vst1q_f32(normalized_query + index, vmulq_n_f32(vld1q_f32(query + index), query_scale));
+    vst1q_f32(normalized_key + index, vmulq_n_f32(vld1q_f32(key + index), key_scale));
+  }
+#endif
+  for (; index < length; ++index) {
+    normalized_query[index] = query[index] * query_scale;
+    normalized_key[index] = key[index] * key_scale;
+  }
+}
+
+float decayAndDotNormalized(float* state, const float* normalized_key, float decay, int length) {
+  float dot = 0.0F;
+  int index = 0;
+#if defined(__aarch64__)
+  float32x4_t sum = vdupq_n_f32(0.0F);
+  for (; index + 4 <= length; index += 4) {
+    float32x4_t state_value = vmulq_n_f32(vld1q_f32(state + index), decay);
+    vst1q_f32(state + index, state_value);
+    sum = vmlaq_f32(sum, state_value, vld1q_f32(normalized_key + index));
+  }
+  dot = vaddvq_f32(sum);
+#endif
+  for (; index < length; ++index) {
+    state[index] *= decay;
+    dot += state[index] * normalized_key[index];
+  }
+  return dot;
+}
+
+float updateAndDotNormalized(float* state, const float* normalized_key, const float* normalized_query, float delta,
+                             int length) {
+  float dot = 0.0F;
+  int index = 0;
+#if defined(__aarch64__)
+  float32x4_t sum = vdupq_n_f32(0.0F);
+  for (; index + 4 <= length; index += 4) {
+    float32x4_t state_value = vld1q_f32(state + index);
+    state_value = vmlaq_n_f32(state_value, vld1q_f32(normalized_key + index), delta);
+    vst1q_f32(state + index, state_value);
+    sum = vmlaq_f32(sum, state_value, vld1q_f32(normalized_query + index));
+  }
+  dot = vaddvq_f32(sum);
+#endif
+  for (; index < length; ++index) {
+    state[index] += delta * normalized_key[index];
+    dot += state[index] * normalized_query[index];
+  }
+  return dot;
+}
+
 }  // namespace
 
 void depthwiseCausalConvF32(const float* input, const float* weight, float* state, float* output, int batch_size,
@@ -139,6 +197,9 @@ void gatedDeltaRuleF32(const float* q, const float* k, const float* v, const flo
 
   const int key_head_repeats = num_value_heads / num_key_heads;
   const float query_dim_scale = 1.0F / std::sqrt(static_cast<float>(key_head_dim));
+  std::array<float, kMaxStackNormalizedHeadDim> normalized_query = {};
+  std::array<float, kMaxStackNormalizedHeadDim> normalized_key = {};
+  const bool use_pre_normalized_heads = sequence_length > 1 && key_head_dim <= kMaxStackNormalizedHeadDim;
 
   for (int batch = 0; batch < batch_size; ++batch) {
     for (int token = 0; token < sequence_length; ++token) {
@@ -158,6 +219,10 @@ void gatedDeltaRuleF32(const float* q, const float* k, const float* v, const flo
         squaredNorms(q + qk_base, k + qk_base, key_head_dim, query_norm_sq, key_norm_sq);
         const float query_scale = query_dim_scale / std::sqrt(query_norm_sq + 1.0e-6F);
         const float key_scale = 1.0F / std::sqrt(key_norm_sq + 1.0e-6F);
+        if (use_pre_normalized_heads) {
+          normalizeQueryAndKey(q + qk_base, k + qk_base, query_scale, key_scale, normalized_query.data(), normalized_key.data(),
+                               key_head_dim);
+        }
 
         const float gate = -std::exp(a_log[value_head]) * stableSoftplus(a[gate_index] + dt_bias[value_head]);
         const float decay = std::exp(gate);
@@ -165,10 +230,17 @@ void gatedDeltaRuleF32(const float* q, const float* k, const float* v, const flo
 
         for (int value_dim = 0; value_dim < value_head_dim; ++value_dim) {
           float* state_row = state + state_base + static_cast<std::size_t>(value_dim) * key_head_dim;
-          const float state_dot_key = decayAndDot(state_row, k + qk_base, decay, key_scale, key_head_dim);
-          const float delta = (v[value_base + value_dim] - state_dot_key) * beta;
-          output[value_base + value_dim] =
-              updateAndDot(state_row, k + qk_base, q + qk_base, delta, key_scale, query_scale, key_head_dim);
+          if (use_pre_normalized_heads) {
+            const float state_dot_key = decayAndDotNormalized(state_row, normalized_key.data(), decay, key_head_dim);
+            const float delta = (v[value_base + value_dim] - state_dot_key) * beta;
+            output[value_base + value_dim] =
+                updateAndDotNormalized(state_row, normalized_key.data(), normalized_query.data(), delta, key_head_dim);
+          } else {
+            const float state_dot_key = decayAndDot(state_row, k + qk_base, decay, key_scale, key_head_dim);
+            const float delta = (v[value_base + value_dim] - state_dot_key) * beta;
+            output[value_base + value_dim] =
+                updateAndDot(state_row, k + qk_base, q + qk_base, delta, key_scale, query_scale, key_head_dim);
+          }
         }
       }
     }
