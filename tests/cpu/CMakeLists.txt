@@ -14,4 +14,8 @@ add_executable(Mllm-Test-Qwen35-Tokenizer Qwen35TokenizerTest.cpp)
 target_link_libraries(Mllm-Test-Qwen35-Tokenizer PRIVATE gtest_main MllmCPUBackend)
 target_include_directories(Mllm-Test-Qwen35-Tokenizer PRIVATE ${MLLM_INCLUDE_DIR})
 
+add_executable(Mllm-Test-CPUContiguousOp ContiguousOpTest.cpp)
+target_link_libraries(Mllm-Test-CPUContiguousOp PRIVATE gtest_main MllmRT MllmCPUBackend)
+target_include_directories(Mllm-Test-CPUContiguousOp PRIVATE ${MLLM_INCLUDE_DIR})
+
 include(GoogleTest)
