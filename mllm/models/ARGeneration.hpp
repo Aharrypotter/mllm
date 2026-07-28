@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <iterator>
 #include <chrono>
+#include <unordered_set>
 
 #include "mllm/core/Tensor.hpp"
 #include "mllm/utils/AnyValue.hpp"
@@ -21,6 +22,18 @@ using IROutput = std::unordered_map<std::string, ir::IRContext::ptr_t>;
 struct ARGenerationStep {
   int64_t current_step = -1;
   int64_t cur_token_id = 0;
+};
+
+struct ARGenerationPerformanceStats {
+  bool valid = false;
+  bool completed = false;
+  int64_t total_duration_us = 0;
+  int64_t prefill_duration_us = 0;
+  int64_t decode_duration_us = 0;
+  int64_t ttft_duration_us = 0;
+  int64_t prefill_tokens = 0;
+  int64_t generated_tokens = 0;
+  int64_t decode_steps = 0;
 };
 
 class ARGeneration;
@@ -93,6 +106,8 @@ class ARGeneration {
 
   virtual IROutput trace(const ARGenerationOutputPast& input, const ARGenerationArgs& args);
 
+  ARGenerationPerformanceStats perfStats() const;
+
   virtual void perfSummary();
 
   int64_t sampleGreedy(Tensor& logits);
@@ -124,6 +139,12 @@ class ARGeneration {
   void customEventEndTimePoint(const std::string& name);
 
  protected:
+  using PerformanceClock = std::chrono::steady_clock;
+
+  void firstTokenEventTimePoint();
+
+  void generationEventEndTimePoint();
+
   bool do_sample_ = false;
   int eos_token_id_;
   int max_length_ = 1024;
@@ -131,13 +152,19 @@ class ARGeneration {
   int64_t ar_steps_ = 0;
   int64_t ar_prefill_tokens_ = 0;
 
-  std::chrono::high_resolution_clock::time_point llm_prefill_start_time_;
-  std::chrono::high_resolution_clock::time_point llm_prefill_end_time_;
-  std::chrono::high_resolution_clock::time_point llm_decode_start_time_;
-  std::chrono::high_resolution_clock::time_point llm_decode_end_time_;
-  std::unordered_map<std::string,
-                     std::pair<std::chrono::high_resolution_clock::time_point, std::chrono::high_resolution_clock::time_point>>
-      custom_event_time_;
+  PerformanceClock::time_point llm_prefill_start_time_;
+  PerformanceClock::time_point llm_prefill_end_time_;
+  PerformanceClock::time_point llm_first_token_time_;
+  PerformanceClock::time_point llm_decode_start_time_;
+  PerformanceClock::time_point llm_decode_end_time_;
+  std::chrono::microseconds llm_decode_duration_{0};
+  bool prefill_started_ = false;
+  bool prefill_finished_ = false;
+  bool first_token_recorded_ = false;
+  bool decode_event_active_ = false;
+  bool generation_completed_ = false;
+  std::unordered_map<std::string, std::pair<PerformanceClock::time_point, PerformanceClock::time_point>> custom_event_time_;
+  std::unordered_set<std::string> completed_custom_events_;
 };
 
 }  // namespace mllm::models
