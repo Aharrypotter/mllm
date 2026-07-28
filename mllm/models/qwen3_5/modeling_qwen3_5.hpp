@@ -34,8 +34,8 @@ inline auto makeRoPEInvFreq(int output_dim, float rope_theta) -> Tensor {
   return inv_freq;
 }
 
-inline auto makeRotaryPosEmbedding(Tensor& position_ids, const Tensor& inv_freq, float attention_scaling = 1.0f)
-    -> std::pair<Tensor, Tensor> {
+inline auto makeRotaryPosEmbedding(Tensor& position_ids, const Tensor& inv_freq,
+                                   float attention_scaling = 1.0f) -> std::pair<Tensor, Tensor> {
   auto batch_size = position_ids.shape()[0];
   auto seq_len = position_ids.shape()[1];
   auto inv_freq_len = inv_freq.shape()[0];
