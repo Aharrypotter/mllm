@@ -199,10 +199,12 @@ TEST(Qwen35GDNTest, MatchesOfficialL2NormalizationEpsilonPlacement) {
 TEST(Qwen35GDNTest, ParallelBatchValueHeadsMatchSerialBitwise) {
   constexpr int kBatch = 2;
   constexpr int kSequence = 4;
-  constexpr int kKeyHeads = 4;
-  constexpr int kValueHeads = 4;
-  constexpr int kKeyDim = 64;
-  constexpr int kValueDim = 64;
+  // Qwen3.5 4B/9B GDN geometry: each normalized key head is shared by
+  // two independently scheduled value-head recurrence tasks.
+  constexpr int kKeyHeads = 16;
+  constexpr int kValueHeads = 32;
+  constexpr int kKeyDim = 128;
+  constexpr int kValueDim = 128;
   constexpr int kThreadCount = 4;
 
   std::vector<float> q(kBatch * kSequence * kKeyHeads * kKeyDim);
