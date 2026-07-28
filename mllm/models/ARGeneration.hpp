@@ -24,6 +24,11 @@ struct ARGenerationStep {
   int64_t cur_token_id = 0;
 };
 
+// Snapshot of request-scoped autoregressive generation measurements.
+// valid gates timing fields; completed reports whether generation reached EOS
+// or the configured maximum length. All *_us fields are microseconds.
+// prefill_tokens counts input sequence tokens, generated_tokens includes a
+// sampled EOS token, and decode_steps excludes the first generated token.
 struct ARGenerationPerformanceStats {
   bool valid = false;
   bool completed = false;
@@ -106,7 +111,8 @@ class ARGeneration {
 
   virtual IROutput trace(const ARGenerationOutputPast& input, const ARGenerationArgs& args);
 
-  ARGenerationPerformanceStats perfStats() const;
+  // Returns the current request's timing and token-count snapshot.
+  [[nodiscard]] ARGenerationPerformanceStats perfStats() const;
 
   virtual void perfSummary();
 
@@ -145,8 +151,11 @@ class ARGeneration {
 
   void generationEventEndTimePoint();
 
+  [[nodiscard]] bool isEosToken(int64_t token_id, int64_t primary_eos_token_id) const;
+
   bool do_sample_ = false;
-  int eos_token_id_;
+  int eos_token_id_ = -1;
+  std::unordered_set<int64_t> additional_eos_token_ids_;
   int max_length_ = 1024;
 
   int64_t ar_steps_ = 0;

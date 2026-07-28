@@ -58,11 +58,6 @@ def main():
     # Get params
     params = convertor.load_model(args.input_path, args.include_prefix)
     if args.include_prefix:
-        params = {
-            name: tensor
-            for name, tensor in params.items()
-            if any(name.startswith(prefix) for prefix in args.include_prefix)
-        }
         if not params:
             parser.error(
                 "--include_prefix did not match any parameters; refusing to write an empty model"

@@ -16,6 +16,7 @@
 #include <fmt/ostream.h>
 
 #include "mllm/mllm.hpp"
+#include "mllm/backends/cpu/kernels/common/kai_w4a32_pack.hpp"
 #include "mllm/nn/Functional.hpp"
 #include "mllm/ffi/Object.hh"
 #include "mllm/utils/CPUArchHelper.hpp"
@@ -380,7 +381,6 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 //===----------------------------------------------------------------------===//
 // REGISTER: Quantize && Packing Functions.
 //===----------------------------------------------------------------------===//
-#include "mllm/backends/cpu/kernels/common/kai_w4a32_pack.hpp"
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def(

@@ -24,6 +24,8 @@ size_t nativeStride(size_t k) { return roundup(k, 2) / 2; }
 size_t scaleStride(size_t k) { return (roundup(k, kBlockLength) / kBlockLength) * sizeof(uint16_t); }
 
 uint16_t truncateToBFloat16(float value) {
+  // Match KleidiAI's portable kai_cast_bf16_f32 conversion so model files are
+  // deterministic across converter hosts without native BF16 instructions.
   uint32_t bits = 0;
   std::memcpy(&bits, &value, sizeof(bits));
   return static_cast<uint16_t>(bits >> 16);

@@ -1,4 +1,5 @@
 #include <fmt/core.h>
+#include <cstdio>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -6,6 +7,7 @@
 #include <mllm/mllm.hpp>
 #include <mllm/models/qwen3_5/modeling_qwen3_5.hpp>
 #include <mllm/models/qwen3_5/tokenization_qwen3_5.hpp>
+#include <mllm/preprocessor/tokenizers/Unicode.hpp>
 #include <mllm/utils/AnyValue.hpp>
 
 using mllm::Argparse;
@@ -91,7 +93,8 @@ MLLM_MAIN({
 
         for (auto& step : model.chat(inputs, {{"max_length", mllm::AnyValue(generation_limit)}})) {
           if (print_token_ids.isSet() && print_token_ids.get()) { fmt::print(stderr, "TOKEN_ID:{}\n", step.cur_token_id); }
-          std::wcout << tokenizer.detokenize(step.cur_token_id) << std::flush;
+          fmt::print("{}", mllm::preprocessor::wideString2Utf8String(tokenizer.detokenize(step.cur_token_id)));
+          std::fflush(stdout);
         }
 
         fmt::print("\n{}\n", std::string(60, '-'));

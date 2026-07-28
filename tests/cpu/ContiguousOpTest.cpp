@@ -10,8 +10,12 @@
 
 namespace {
 
-TEST(CPUContiguousOpTest, CopiesContiguousAndStridedViews) {
-  mllm::initializeContext();
+class CPUContiguousOpTest : public testing::Test {
+ protected:
+  static void SetUpTestSuite() { mllm::initializeContext(); }
+};
+
+TEST_F(CPUContiguousOpTest, CopiesContiguousAndStridedViews) {
   using namespace mllm;  // NOLINT
 
   auto input = Tensor::empty({2, 3, 4}, kFloat32, kCPU).alloc();
@@ -35,6 +39,18 @@ TEST(CPUContiguousOpTest, CopiesContiguousAndStridedViews) {
   };
   EXPECT_EQ(std::vector<float>(strided_slice.ptr<float>(), strided_slice.ptr<float>() + strided_slice.numel()),
             expected_strided_slice);
+}
+
+TEST_F(CPUContiguousOpTest, CopiesRankZeroScalar) {
+  using namespace mllm;  // NOLINT
+
+  auto scalar = Tensor::empty({}, kFloat32, kCPU).alloc();
+  scalar.ptr<float>()[0] = 3.25F;
+
+  const auto copy = scalar.contiguous();
+  EXPECT_TRUE(copy.shape().empty());
+  ASSERT_EQ(copy.numel(), 1);
+  EXPECT_FLOAT_EQ(copy.item<float>(), 3.25F);
 }
 
 }  // namespace

@@ -15,6 +15,19 @@ namespace {
 using mllm::cpu::gdn::depthwiseCausalConvF32;
 using mllm::cpu::gdn::gatedDeltaRuleF32;
 
+class ScopedCpuOpThreads {
+ public:
+  explicit ScopedCpuOpThreads(int32_t thread_count) : original_thread_count_(mllm::Context::instance().getCpuOpThreads()) {
+    mllm::Context::instance().setCpuOpThreads(thread_count);
+    mllm::initializeContext();
+  }
+
+  ~ScopedCpuOpThreads() { mllm::Context::instance().setCpuOpThreads(original_thread_count_); }
+
+ private:
+  int32_t original_thread_count_;
+};
+
 TEST(Qwen35GDNTest, CausalConvChunkingMatchesSinglePrefill) {
   constexpr int kBatch = 1;
   constexpr int kSequence = 4;
@@ -241,8 +254,7 @@ TEST(Qwen35GDNTest, ParallelBatchValueHeadsMatchSerialBitwise) {
                     serial_output.data(), kBatch, kSequence, kKeyHeads, kValueHeads, kKeyDim, kValueDim,
                     /*thread_count=*/1);
 
-  mllm::Context::instance().setCpuOpThreads(kThreadCount);
-  mllm::initializeContext();
+  const ScopedCpuOpThreads scoped_threads(kThreadCount);
   gatedDeltaRuleF32(q.data(), k.data(), v.data(), a.data(), b.data(), a_log.data(), dt_bias.data(), parallel_state.data(),
                     parallel_output.data(), kBatch, kSequence, kKeyHeads, kValueHeads, kKeyDim, kValueDim, kThreadCount);
 

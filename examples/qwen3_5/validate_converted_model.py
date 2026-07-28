@@ -13,7 +13,7 @@ import struct
 from collections import Counter
 from pathlib import Path
 
-from validate_checkpoint import _expected_text_shapes
+from validate_checkpoint import expected_text_shapes
 
 
 MODEL_HEADER = struct.Struct("<II512sIQ")
@@ -45,7 +45,7 @@ def _decode_c_string(value: bytes) -> str:
 def _expected_descriptors(
     text_config: dict, quant_config: dict
 ) -> dict[str, tuple[int, list[int], int]]:
-    source_shapes = _expected_text_shapes(text_config)
+    source_shapes = expected_text_shapes(text_config)
     patterns = [
         (re.compile(pattern), entry["hints"]) for pattern, entry in quant_config.items()
     ]

@@ -11,7 +11,17 @@ from . import backends
 
 
 def __getattr__(name: str):
-    """Load optional subsystems only when a caller requests them."""
+    """Lazily load an optional mobile subsystem.
+
+    Args:
+        name: Module attribute requested by the caller.
+
+    Returns:
+        The requested optional subsystem module.
+
+    Raises:
+        AttributeError: If ``name`` is not a supported optional subsystem.
+    """
     if name == "service":
         module = importlib.import_module(f"{__name__}.service")
         globals()[name] = module

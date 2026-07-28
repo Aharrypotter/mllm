@@ -246,7 +246,7 @@ class Qwen3_5FullAttention final : public nn::Module {
     return {output};
   }
 
-  int layer_idx_;
+  int layer_idx_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -559,6 +559,7 @@ class Qwen3_5ForCausalLM : public ARGeneration, public nn::Module {
     kv_cache_ = nn::StaticCache(cfg.max_cache_length, cfg.numFullAttentionLayers(), cfg.num_attention_heads,
                                 cfg.num_key_value_heads, cfg.head_dim, kFloat32, kFloat32, kCPU, false);
     eos_token_id_ = cfg.im_end_token_id;
+    additional_eos_token_ids_.insert(cfg.eos_token_id);
     max_length_ = cfg.max_cache_length;
     llm = reg<Qwen3_5Model>("model", cfg);
     lm_head_ = reg<nn::Linear>("lm_head_out", cfg.hidden_size, cfg.vocab_size, false, cfg.linear_impl_type);

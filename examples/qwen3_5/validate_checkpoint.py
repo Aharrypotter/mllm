@@ -15,7 +15,7 @@ from pathlib import Path
 from safetensors import safe_open
 
 
-def _expected_text_shapes(text_config: dict) -> dict[str, list[int]]:
+def expected_text_shapes(text_config: dict) -> dict[str, list[int]]:
     hidden_size = text_config["hidden_size"]
     intermediate_size = text_config["intermediate_size"]
     head_dim = text_config["head_dim"]
@@ -153,7 +153,7 @@ def main() -> None:
         )
     if len(text_config["layer_types"]) != text_config["num_hidden_layers"]:
         raise AssertionError("layer_types length must equal num_hidden_layers")
-    expected_shapes = _expected_text_shapes(text_config)
+    expected_shapes = expected_text_shapes(text_config)
     weight_map = index["weight_map"]
     actual_text_keys = {
         name for name in weight_map if name.startswith("model.language_model.")

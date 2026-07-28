@@ -119,7 +119,7 @@ void ARGenerationChatIterator::step() {
   step_count_++;
   gen_->ar_steps_++;
 
-  if (next_token_id == eos_token_id_) {
+  if (gen_->isEosToken(next_token_id, eos_token_id_)) {
     gen_->generationEventEndTimePoint();
     finished_ = true;
     return;
@@ -152,8 +152,8 @@ ARGenerationOutputPast ARGeneration::generate(const ARGenerationOutputPast& inpu
   for (int i = 0; i < max_length; ++i) {
     // Timing
     if (i == 0) {
-      if (past.count("sequence") > 0) { ar_prefill_tokens_ = past["sequence"].shape()[1]; }
       prefillEventStartTimePoint();
+      if (past.count("sequence") > 0) { ar_prefill_tokens_ = past["sequence"].shape()[1]; }
     } else {
       decodeEventStartTimePoint();
     }
@@ -187,7 +187,7 @@ ARGenerationOutputPast ARGeneration::generate(const ARGenerationOutputPast& inpu
       decodeEventEndTimePoint();
     }
 
-    if (next_token_id == eos_token_id) { break; }
+    if (isEosToken(next_token_id, eos_token_id)) { break; }
 
     // [B, S]
     past = output;
@@ -266,7 +266,7 @@ void ARGeneration::streamGenerate(const ARGenerationOutputPast& input, const ARG
 
     callback(next_token_id);
 
-    if (next_token_id == eos_token_id) { break; }
+    if (isEosToken(next_token_id, eos_token_id)) { break; }
 
     // [B, S]
     past = output;
@@ -571,6 +571,10 @@ void ARGeneration::decodeEventEndTimePoint() {
 void ARGeneration::generationEventEndTimePoint() {
   decodeEventEndTimePoint();
   generation_completed_ = true;
+}
+
+bool ARGeneration::isEosToken(int64_t token_id, int64_t primary_eos_token_id) const {
+  return token_id == primary_eos_token_id || additional_eos_token_ids_.contains(token_id);
 }
 
 void ARGeneration::customEventStartTimePoint(const std::string& name) {

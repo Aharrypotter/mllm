@@ -40,6 +40,8 @@ class FakeGeneration final : public ARGeneration {
     forward_count_ = 0;
   }
 
+  void addEosToken(int64_t token) { additional_eos_token_ids_.insert(token); }
+
  private:
   std::vector<int64_t> tokens_;
   std::size_t forward_count_ = 0;
@@ -119,6 +121,39 @@ TEST(ARGenerationPerformanceTest, ConsecutiveChatsResetRequestStats) {
   EXPECT_EQ(stats.prefill_tokens, 3);
   EXPECT_EQ(stats.generated_tokens, 2);
   EXPECT_EQ(stats.decode_steps, 1);
+}
+
+TEST(ARGenerationPerformanceTest, BatchGenerateRetainsPrefillTokenCount) {
+  FakeGeneration model({0, 1});
+  ARGenerationArgs args = {
+      {"max_length", AnyValue(2)},
+      {"eos_token_id", AnyValue(3)},
+  };
+
+  const auto output = model.generate({{"sequence", makeInput(5)}}, args);
+
+  const auto stats = model.perfStats();
+  EXPECT_TRUE(stats.valid);
+  EXPECT_TRUE(stats.completed);
+  EXPECT_EQ(stats.prefill_tokens, 5);
+  EXPECT_EQ(stats.generated_tokens, 2);
+  EXPECT_EQ(stats.decode_steps, 1);
+
+  const auto& generated = output.at("generated_sequence");
+  ASSERT_EQ(generated.shape(), (Tensor::shape_t{2}));
+  EXPECT_EQ(std::vector<int64_t>(generated.ptr<int64_t>(), generated.ptr<int64_t>() + generated.numel()),
+            (std::vector<int64_t>{0, 1}));
+}
+
+TEST(ARGenerationPerformanceTest, AdditionalEosTokenStopsChat) {
+  FakeGeneration model({0, 2, 1});
+  model.addEosToken(2);
+
+  EXPECT_EQ(runChat(model, 8, 3), (std::vector<int64_t>{0}));
+
+  const auto stats = model.perfStats();
+  EXPECT_TRUE(stats.completed);
+  EXPECT_EQ(stats.generated_tokens, 2);
 }
 
 }  // namespace

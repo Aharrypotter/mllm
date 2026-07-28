@@ -94,6 +94,8 @@ class QuantizeSolver:
             for payload in sub_group[1].values():
                 if sub_group[0]["replace"]:
                     planned_names.difference_update(payload.inputs_dict)
+        for sub_group in param_groups.values():
+            for payload in sub_group[1].values():
                 for output_name in payload.outputs_dict:
                     if output_name in planned_names:
                         raise ValueError(

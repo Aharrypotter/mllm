@@ -146,6 +146,7 @@ inline bool qwen3_5Regex(const std::string& str, std::vector<std::wstring>& spli
     if (qwen3_5TokenizerMatchPattern(w_string, pos, matched)) {
       splitted.push_back(matched);
     } else {
+      splitted.push_back(w_string.substr(pos, 1));
       ++pos;
     }
   }
@@ -252,9 +253,10 @@ class Qwen3_5Tokenizer final : public mllm::preprocessor::AutoTokenizer {
 
   ARGenerationOutputPast convertMessage(const Qwen3_5Message& message) {
     auto applied_string = Qwen3_5Message::message_template;
-    size_t pos = applied_string.find("{{{prompt}}}");
+    static constexpr char kPromptPlaceholder[] = "{{{prompt}}}";
+    size_t pos = applied_string.find(kPromptPlaceholder);
     if (pos == std::string::npos) { throw std::runtime_error("Qwen3.5 message template is missing the prompt placeholder"); }
-    applied_string.replace(pos, 12, message.prompt);
+    applied_string.replace(pos, sizeof(kPromptPlaceholder) - 1, message.prompt);
 
     auto sequence_str = tokenize(applied_string);
     std::vector<int64_t> ids;

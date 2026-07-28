@@ -71,10 +71,20 @@ struct Qwen3_5Config : protected ConfigFile {
     } else if (tc.contains("max_cache_length")) {
       max_cache_length = tc["max_cache_length"];
     }
+    std::string linear_impl_name;
+    bool has_linear_impl = false;
     if (tc.contains("linear_impl_type")) {
-      linear_impl_type = aops::str2LinearImplTypes(tc["linear_impl_type"]);
+      linear_impl_name = tc["linear_impl_type"].get<std::string>();
+      has_linear_impl = true;
     } else if (data().contains("linear_impl_type")) {
-      linear_impl_type = aops::str2LinearImplTypes(data()["linear_impl_type"]);
+      linear_impl_name = data()["linear_impl_type"].get<std::string>();
+      has_linear_impl = true;
+    }
+    if (has_linear_impl) {
+      linear_impl_type = aops::str2LinearImplTypes(linear_impl_name);
+      if (linear_impl_type == aops::LinearImplTypes::kDefault && linear_impl_name != "Default") {
+        throw std::invalid_argument("Qwen3.5 contains an unsupported linear_impl_type: " + linear_impl_name);
+      }
     }
 
     if (num_hidden_layers <= 0 || hidden_size <= 0 || head_dim <= 0 || intermediate_size <= 0 || vocab_size <= 0
@@ -124,7 +134,7 @@ struct Qwen3_5Config : protected ConfigFile {
   // Qwen3.5-specific: partial RoPE
   float partial_rotary_factor = 0.25;
   float rope_theta = 10000000.0;
-  int32_t rotary_dim() const { return static_cast<int32_t>(head_dim * partial_rotary_factor); }
+  [[nodiscard]] int32_t rotary_dim() const { return static_cast<int32_t>(head_dim * partial_rotary_factor); }
 
   // Qwen3.5-specific: GDN (Gated Delta Network) params
   int32_t linear_num_key_heads = 16;
@@ -147,15 +157,17 @@ struct Qwen3_5Config : protected ConfigFile {
   aops::LinearImplTypes linear_impl_type = aops::LinearImplTypes::kDefault;
 
   // Helpers
-  bool isFullAttentionLayer(int layer_idx) const { return layer_types.at(static_cast<size_t>(layer_idx)) == "full_attention"; }
-  int32_t numFullAttentionLayers() const {
+  [[nodiscard]] bool isFullAttentionLayer(int layer_idx) const {
+    return layer_types.at(static_cast<size_t>(layer_idx)) == "full_attention";
+  }
+  [[nodiscard]] int32_t numFullAttentionLayers() const {
     int32_t count = 0;
     for (auto& lt : layer_types) {
       if (lt == "full_attention") ++count;
     }
     return count;
   }
-  int32_t numGDNLayers() const { return num_hidden_layers - numFullAttentionLayers(); }
+  [[nodiscard]] int32_t numGDNLayers() const { return num_hidden_layers - numFullAttentionLayers(); }
 };
 
 }  // namespace mllm::models::qwen3_5

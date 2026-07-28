@@ -119,7 +119,7 @@ def load_model(file_path: str, include_prefixes: Sequence[str] = ()) -> Dict:
         if not MLLM_FIND_TORCH_AVAILABLE:
             raise ImportError("torch package is not available")
 
-        state_dict = torch.load(file_path, map_location="cpu")
+        state_dict = torch.load(file_path, map_location="cpu", weights_only=True)
         if include_prefixes:
             state_dict = {
                 name: tensor for name, tensor in state_dict.items() if should_load(name)
