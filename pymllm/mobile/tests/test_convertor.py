@@ -1,6 +1,8 @@
 # Copyright (c) MLLM Team.
 # Licensed under the MIT License.
 
+import struct
+
 import pytest
 import torch
 
@@ -8,6 +10,7 @@ from pymllm.mobile.convertor import load_model
 from pymllm.mobile.convertor.model_file_v2 import (
     ModelFileV2Descriptor,
     ModelFileV2ParamsDescriptor,
+    _pack_descriptor,
 )
 
 
@@ -41,3 +44,21 @@ def test_model_file_v2_rejects_shape_above_descriptor_rank():
             shape=[1] * 17,
             name="weight",
         )
+
+
+def test_model_file_v2_preserves_parameter_offsets_above_uint32():
+    parameter_offset = (1 << 32) + 12345
+    descriptor = ModelFileV2ParamsDescriptor(
+        param_id=7,
+        param_type=134,
+        param_size=4096,
+        param_offset=parameter_offset,
+        shape=[4096],
+        name="weight",
+    )
+
+    packed = _pack_descriptor(descriptor)
+    _, _, _, unpacked_offset, _ = struct.unpack_from("<IIQQQ", packed)
+
+    assert len(packed) == ModelFileV2ParamsDescriptor.SIZE
+    assert unpacked_offset == parameter_offset

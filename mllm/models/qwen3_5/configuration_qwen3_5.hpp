@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "mllm/core/ParameterFile.hpp"
 #include "mllm/core/aops/LinearOp.hpp"
 #include "mllm/engine/ConfigFile.hpp"
 
@@ -30,6 +31,8 @@ struct Qwen3_5Config : protected ConfigFile {
     vocab_size = tc["vocab_size"];
     head_dim = tc["head_dim"];
     tie_word_embeddings = tc.value("tie_word_embeddings", data().value("tie_word_embeddings", tie_word_embeddings));
+    hidden_act = tc.value("hidden_act", hidden_act);
+    mamba_ssm_dtype = tc.value("mamba_ssm_dtype", mamba_ssm_dtype);
 
     // Qwen3.5 hybrid attention
     attn_output_gate = tc.value("attn_output_gate", true);
@@ -118,6 +121,8 @@ struct Qwen3_5Config : protected ConfigFile {
   int32_t max_position_embeddings = 262144;
   float rms_norm_eps = 1e-06;
   int32_t vocab_size = 248320;
+  std::string hidden_act = "silu";
+  std::string mamba_ssm_dtype = "float32";
 
   // Qwen3.5-specific: hybrid attention
   bool attn_output_gate = true;
@@ -173,5 +178,80 @@ struct Qwen3_5Config : protected ConfigFile {
     }
   }
 };
+
+inline auto hasOfficialLayerSchedule(const Qwen3_5Config& config) -> bool {
+  if (config.full_attention_interval != 4 || config.layer_types.size() != static_cast<size_t>(config.num_hidden_layers)) {
+    return false;
+  }
+  for (int32_t layer_idx = 0; layer_idx < config.num_hidden_layers; ++layer_idx) {
+    const auto expected_type = (layer_idx + 1) % 4 == 0 ? "full_attention" : "linear_attention";
+    if (config.layer_types[static_cast<size_t>(layer_idx)] != expected_type) { return false; }
+  }
+  return true;
+}
+
+inline auto hasOfficialCommonRuntimeContract(const Qwen3_5Config& config) -> bool {
+  constexpr auto kKaiLinearImpl = aops::LinearImplTypes::kKaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_qai8dxp1x8_qsi4c32p8x8_1x8x32;
+  return !config.attention_bias && config.attn_output_gate && config.head_dim == 256 && config.max_position_embeddings == 262144
+         && config.rms_norm_eps == 1e-6F && config.vocab_size == 248320 && config.hidden_act == "silu"
+         && config.mamba_ssm_dtype == "float32" && hasOfficialLayerSchedule(config) && config.linear_num_key_heads == 16
+         && config.linear_key_head_dim == 128 && config.linear_value_head_dim == 128 && config.linear_conv_kernel_dim == 4
+         && config.rope_theta == 10000000.0F && config.partial_rotary_factor == 0.25F && config.eos_token_id == 248044
+         && config.im_end_token_id == 248046 && config.tie_word_embeddings && config.max_cache_length == 2048
+         && config.linear_impl_type == kKaiLinearImpl;
+}
+
+inline auto isOfficialQwen35_08BRuntimeConfig(const Qwen3_5Config& config) -> bool {
+  return hasOfficialCommonRuntimeContract(config) && config.hidden_size == 1024 && config.intermediate_size == 3584
+         && config.num_hidden_layers == 24 && config.num_attention_heads == 8 && config.num_key_value_heads == 2
+         && config.linear_num_value_heads == 16;
+}
+
+inline auto isOfficialQwen35_4BRuntimeConfig(const Qwen3_5Config& config) -> bool {
+  return hasOfficialCommonRuntimeContract(config) && config.hidden_size == 2560 && config.intermediate_size == 9216
+         && config.num_hidden_layers == 32 && config.num_attention_heads == 16 && config.num_key_value_heads == 4
+         && config.linear_num_value_heads == 32;
+}
+
+inline auto matchesOfficialRuntimeContract(const Qwen3_5Config& config) -> bool {
+  return isOfficialQwen35_08BRuntimeConfig(config) || isOfficialQwen35_4BRuntimeConfig(config);
+}
+
+inline auto modelNameForConfig(const Qwen3_5Config& config) -> std::string {
+  if (isOfficialQwen35_08BRuntimeConfig(config)) { return "Qwen3.5-0.8B"; }
+  if (isOfficialQwen35_4BRuntimeConfig(config)) { return "Qwen3.5-4B"; }
+  return "Qwen3.5 text model";
+}
+
+inline void validateModelConfigMatch(const Qwen3_5Config& config, const ParameterFile::ptr_t& parameter_file) {
+  constexpr auto kEmbeddingWeight = "model.language_model.embed_tokens.weight";
+  const auto model_name = modelNameForConfig(config);
+  if (!matchesOfficialRuntimeContract(config)) {
+    throw std::invalid_argument("Qwen3.5 model/config mismatch: CPU runner supports only the official Qwen3.5-0.8B and "
+                                "Qwen3.5-4B runtime contracts");
+  }
+  if (parameter_file == nullptr || !parameter_file->has(kEmbeddingWeight)) {
+    throw std::invalid_argument("Qwen3.5 model/config mismatch: " + model_name + " requires " + kEmbeddingWeight);
+  }
+
+  const auto embedding = parameter_file->pull(kEmbeddingWeight);
+  if (embedding.dtype() != kFloat32) {
+    throw std::invalid_argument("Qwen3.5 model/config mismatch: " + model_name + " requires a float32 embedding tensor");
+  }
+  const auto expected_numel = static_cast<size_t>(config.vocab_size) * static_cast<size_t>(config.hidden_size);
+  if (parameter_file->version() == ModelFileVersion::kV1) {
+    if (embedding.numel() != expected_numel) {
+      throw std::invalid_argument("Qwen3.5 model/config mismatch: " + model_name + " expects " + std::to_string(expected_numel)
+                                  + " embedding elements, got " + std::to_string(embedding.numel()));
+    }
+    return;
+  }
+
+  const auto shape = embedding.shape();
+  if (shape.size() != 2 || shape[0] != config.vocab_size || shape[1] != config.hidden_size) {
+    throw std::invalid_argument("Qwen3.5 model/config mismatch: " + model_name + " expects embedding shape ["
+                                + std::to_string(config.vocab_size) + ", " + std::to_string(config.hidden_size) + "]");
+  }
+}
 
 }  // namespace mllm::models::qwen3_5

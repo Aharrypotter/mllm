@@ -51,18 +51,20 @@ MLLM_MAIN({
     }
 
     auto cfg = mllm::models::qwen3_5::Qwen3_5Config(config_path.get());
-    auto tokenizer = mllm::models::qwen3_5::Qwen3_5Tokenizer(tokenizer_path.get());
-    auto model = mllm::models::qwen3_5::Qwen3_5ForCausalLM(cfg);
     int generation_limit = max_new_tokens.isSet() ? max_new_tokens.get() : 64;
     if (generation_limit <= 0 || generation_limit > cfg.max_cache_length) {
       throw std::invalid_argument("max_new_tokens must be between 1 and max_cache_length");
     }
     if (prompt.isSet() && prompt.get().empty()) { throw std::invalid_argument("prompt must not be empty"); }
 
-    fmt::print("Qwen3.5 0.8B: {} layers ({} full attention + {} GDN)\n", cfg.num_hidden_layers, cfg.numFullAttentionLayers(),
-               cfg.numGDNLayers());
-
     auto param = mllm::load(model_path.get(), file_version);
+    mllm::models::qwen3_5::validateModelConfigMatch(cfg, param);
+
+    auto tokenizer = mllm::models::qwen3_5::Qwen3_5Tokenizer(tokenizer_path.get());
+    auto model = mllm::models::qwen3_5::Qwen3_5ForCausalLM(cfg);
+    fmt::print("{}: {} layers ({} full attention + {} GDN)\n", mllm::models::qwen3_5::modelNameForConfig(cfg),
+               cfg.num_hidden_layers, cfg.numFullAttentionLayers(), cfg.numGDNLayers());
+
     model.load(param);
 
     fmt::print("\n{:*^60}\n", prompt.isSet() ? " Qwen3.5 One-shot CLI " : " Qwen3.5 Interactive CLI ");
