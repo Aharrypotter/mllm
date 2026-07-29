@@ -13,7 +13,7 @@
 namespace mllm::models::qwen3_5 {
 
 struct Qwen3_5Config : protected ConfigFile {
-  Qwen3_5Config() = default;
+  Qwen3_5Config() { populateLayerTypes(); }
 
   explicit Qwen3_5Config(const std::string& file_path) : ConfigFile(file_path) {
     // The Qwen3.5 config nests text params under "text_config"
@@ -53,14 +53,7 @@ struct Qwen3_5Config : protected ConfigFile {
     if (tc.contains("layer_types")) {
       for (auto& lt : tc["layer_types"]) { layer_types.push_back(lt.get<std::string>()); }
     } else {
-      if (full_attention_interval <= 0) { throw std::invalid_argument("Qwen3.5 full_attention_interval must be positive"); }
-      for (int i = 0; i < num_hidden_layers; ++i) {
-        if ((i + 1) % full_attention_interval == 0) {
-          layer_types.push_back("full_attention");
-        } else {
-          layer_types.push_back("linear_attention");
-        }
-      }
+      populateLayerTypes();
     }
 
     // Token IDs — Qwen3.5 uses different IDs than Qwen3
@@ -168,6 +161,17 @@ struct Qwen3_5Config : protected ConfigFile {
     return count;
   }
   [[nodiscard]] int32_t numGDNLayers() const { return num_hidden_layers - numFullAttentionLayers(); }
+
+ private:
+  void populateLayerTypes() {
+    if (full_attention_interval <= 0) { throw std::invalid_argument("Qwen3.5 full_attention_interval must be positive"); }
+    if (num_hidden_layers <= 0) { throw std::invalid_argument("Qwen3.5 num_hidden_layers must be positive"); }
+    layer_types.clear();
+    layer_types.reserve(static_cast<size_t>(num_hidden_layers));
+    for (int32_t layer_idx = 0; layer_idx < num_hidden_layers; ++layer_idx) {
+      layer_types.push_back((layer_idx + 1) % full_attention_interval == 0 ? "full_attention" : "linear_attention");
+    }
+  }
 };
 
 }  // namespace mllm::models::qwen3_5

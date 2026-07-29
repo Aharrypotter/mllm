@@ -90,12 +90,14 @@ MLLM_MAIN({
         }
 
         fmt::print("\nResponse: ");
+        mllm::models::qwen3_5::Qwen3_5StreamingUtf8Decoder utf8_decoder;
 
         for (auto& step : model.chat(inputs, {{"max_length", mllm::AnyValue(generation_limit)}})) {
           if (print_token_ids.isSet() && print_token_ids.get()) { fmt::print(stderr, "TOKEN_ID:{}\n", step.cur_token_id); }
-          fmt::print("{}", mllm::preprocessor::wideString2Utf8String(tokenizer.detokenize(step.cur_token_id)));
+          fmt::print("{}", utf8_decoder.append(tokenizer.detokenizeBytes(step.cur_token_id)));
           std::fflush(stdout);
         }
+        fmt::print("{}", utf8_decoder.finish());
 
         fmt::print("\n{}\n", std::string(60, '-'));
       } catch (const std::exception& e) {

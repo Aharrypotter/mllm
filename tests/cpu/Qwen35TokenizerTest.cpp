@@ -25,3 +25,19 @@ TEST(Qwen35TokenizerTest, PreservesRegexWhitespaceBacktracking) {
   };
   EXPECT_EQ(pieces, expected);
 }
+
+TEST(Qwen35TokenizerTest, StreamsUtf8SplitAcrossTokens) {
+  mllm::models::qwen3_5::Qwen3_5StreamingUtf8Decoder decoder;
+
+  EXPECT_EQ(decoder.append("\xC2"), "");
+  EXPECT_EQ(decoder.append("\xA1"), "\xC2\xA1");
+  EXPECT_EQ(decoder.finish(), "");
+}
+
+TEST(Qwen35TokenizerTest, ReplacesMalformedAndIncompleteUtf8) {
+  mllm::models::qwen3_5::Qwen3_5StreamingUtf8Decoder decoder;
+
+  EXPECT_EQ(decoder.append("\xE2("), "\xEF\xBF\xBD(");
+  EXPECT_EQ(decoder.append("\xF0\x9F"), "");
+  EXPECT_EQ(decoder.finish(), "\xEF\xBF\xBD");
+}
