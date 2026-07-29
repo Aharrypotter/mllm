@@ -39,6 +39,9 @@ The tied embedding matrix is retained for token lookup and separately packed as
 convolution weights, recurrent parameters, embeddings, and norms stay in
 float32.
 
+Linear uses dynamic INT8 activations with INT4 weights while retaining FP32
+operator inputs and outputs.
+
 Audit the resulting V2 descriptors without loading the tensor data:
 
 ```bash
