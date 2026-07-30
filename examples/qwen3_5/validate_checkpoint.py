@@ -314,7 +314,13 @@ def validate_kai_recipe_contract(
     checkpoint_size = resolve_model_size(text_config)
     if runtime_config.get("model_type") != "qwen3_5":
         raise AssertionError("KAI runtime config must declare model_type='qwen3_5'")
-    runtime_size = resolve_model_size(runtime_config["text_config"])
+    runtime_text_config = runtime_config.get("text_config")
+    if not isinstance(runtime_text_config, dict):
+        raise AssertionError(
+            "KAI runtime config must declare an object text_config, got "
+            f"{type(runtime_text_config).__name__}"
+        )
+    runtime_size = resolve_model_size(runtime_text_config)
     if runtime_size != checkpoint_size:
         raise AssertionError(
             f"KAI runtime config is for Qwen3.5-{runtime_size}, "

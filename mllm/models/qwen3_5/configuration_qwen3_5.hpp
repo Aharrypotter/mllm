@@ -179,6 +179,11 @@ struct Qwen3_5Config : protected ConfigFile {
   }
 };
 
+/// Checks that \p config uses the official Qwen3.5 hybrid layer schedule, i.e. a
+/// full-attention interval of 4 with every 4th layer marked "full_attention" and all
+/// other layers marked "linear_attention".
+/// \param config Qwen3.5 text-tower configuration to inspect.
+/// \return true when the layer-type list exactly matches the official schedule.
 inline auto hasOfficialLayerSchedule(const Qwen3_5Config& config) -> bool {
   if (config.full_attention_interval != 4 || config.layer_types.size() != static_cast<size_t>(config.num_hidden_layers)) {
     return false;
@@ -190,6 +195,12 @@ inline auto hasOfficialLayerSchedule(const Qwen3_5Config& config) -> bool {
   return true;
 }
 
+/// Checks the size-independent half of the supported mobile CPU runtime contract:
+/// attention/GDN flags, head and vocabulary geometry, activation and norm settings,
+/// RoPE parameters, special-token ids, tied embeddings, cache length, the official
+/// layer schedule, and the KleidiAI W4A32 Linear implementation.
+/// \param config Qwen3.5 text-tower configuration to inspect.
+/// \return true when every shared runtime-contract field matches the official value.
 inline auto hasOfficialCommonRuntimeContract(const Qwen3_5Config& config) -> bool {
   constexpr auto kKaiLinearImpl = aops::LinearImplTypes::kKaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_qai8dxp1x8_qsi4c32p8x8_1x8x32;
   return !config.attention_bias && config.attn_output_gate && config.head_dim == 256 && config.max_position_embeddings == 262144
@@ -201,28 +212,53 @@ inline auto hasOfficialCommonRuntimeContract(const Qwen3_5Config& config) -> boo
          && config.linear_impl_type == kKaiLinearImpl;
 }
 
+/// Checks whether \p config is the official Qwen3.5-0.8B runtime configuration: the
+/// shared contract plus the 0.8B hidden/intermediate sizes, layer count, and head counts.
+/// \param config Qwen3.5 text-tower configuration to inspect.
+/// \return true only for the supported 0.8B variant.
 inline auto isOfficialQwen35_08BRuntimeConfig(const Qwen3_5Config& config) -> bool {
   return hasOfficialCommonRuntimeContract(config) && config.hidden_size == 1024 && config.intermediate_size == 3584
          && config.num_hidden_layers == 24 && config.num_attention_heads == 8 && config.num_key_value_heads == 2
          && config.linear_num_value_heads == 16;
 }
 
+/// Checks whether \p config is the official Qwen3.5-4B runtime configuration: the shared
+/// contract plus the 4B hidden/intermediate sizes, layer count, and head counts.
+/// \param config Qwen3.5 text-tower configuration to inspect.
+/// \return true only for the supported 4B variant.
 inline auto isOfficialQwen35_4BRuntimeConfig(const Qwen3_5Config& config) -> bool {
   return hasOfficialCommonRuntimeContract(config) && config.hidden_size == 2560 && config.intermediate_size == 9216
          && config.num_hidden_layers == 32 && config.num_attention_heads == 16 && config.num_key_value_heads == 4
          && config.linear_num_value_heads == 32;
 }
 
+/// Checks whether \p config is one of the runtime contracts this CPU runner supports.
+/// \param config Qwen3.5 text-tower configuration to inspect.
+/// \return true when the configuration is the official 0.8B or 4B variant.
 inline auto matchesOfficialRuntimeContract(const Qwen3_5Config& config) -> bool {
   return isOfficialQwen35_08BRuntimeConfig(config) || isOfficialQwen35_4BRuntimeConfig(config);
 }
 
+/// Resolves a human-readable model name for diagnostics and error messages.
+/// \param config Qwen3.5 text-tower configuration to inspect.
+/// \return "Qwen3.5-0.8B" or "Qwen3.5-4B" for a supported variant, otherwise the generic
+/// fallback "Qwen3.5 text model".
 inline auto modelNameForConfig(const Qwen3_5Config& config) -> std::string {
   if (isOfficialQwen35_08BRuntimeConfig(config)) { return "Qwen3.5-0.8B"; }
   if (isOfficialQwen35_4BRuntimeConfig(config)) { return "Qwen3.5-4B"; }
   return "Qwen3.5 text model";
 }
 
+/// Verifies that a loaded parameter file matches the requested runtime configuration
+/// before the model is built, so a mismatched checkpoint fails early with a descriptive
+/// message instead of later during inference.
+/// \param config Qwen3.5 text-tower configuration to validate against.
+/// \param parameter_file Loaded V1 or V2 parameter file providing the embedding tensor.
+/// \throws std::invalid_argument when the runtime configuration is not a supported
+/// official contract; when \p parameter_file is null or lacks
+/// model.language_model.embed_tokens.weight; when the embedding dtype is not float32;
+/// when a V1 embedding has an element count other than vocab_size * hidden_size; or when
+/// a V2 embedding shape is not exactly [vocab_size, hidden_size].
 inline void validateModelConfigMatch(const Qwen3_5Config& config, const ParameterFile::ptr_t& parameter_file) {
   constexpr auto kEmbeddingWeight = "model.language_model.embed_tokens.weight";
   const auto model_name = modelNameForConfig(config);

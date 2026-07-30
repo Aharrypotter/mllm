@@ -24,13 +24,13 @@ from validate_converted_model import (
     FLOAT32,
     MODEL_HEADER,
     PARAMETER_DESCRIPTOR,
+    UINT32_LIMIT,
     _expected_descriptors,
     _validate_descriptor_table,
 )
 
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
-UINT32_LIMIT = 1 << 32
 
 
 def _load_json(name: str) -> dict:
@@ -212,6 +212,113 @@ class Qwen35ValidatorTest(unittest.TestCase):
             nested_only,
         )
         self.assertEqual(len(quantized_names), 249)
+
+    def test_kai_recipe_contract_rejects_missing_linear_coverage(self) -> None:
+        runtime_config = _load_json("config_4B_w4a32_kai.json")
+        quant_config = _load_json("quant_cfg_4B_w4a32_kai.json")
+        text_config = runtime_config["text_config"]
+
+        dropped_pattern = next(
+            pattern for pattern in quant_config if "down_proj" in pattern
+        )
+        mutated_quant_config = copy.deepcopy(quant_config)
+        del mutated_quant_config[dropped_pattern]
+        with self.assertRaisesRegex(
+            AssertionError,
+            "KAI quantization coverage mismatch",
+        ) as raised:
+            validate_kai_recipe_contract(
+                text_config,
+                mutated_quant_config,
+                runtime_config,
+            )
+        self.assertIn("down_proj", str(raised.exception))
+
+    def test_kai_recipe_contract_rejects_non_linear_coverage(self) -> None:
+        runtime_config = _load_json("config_4B_w4a32_kai.json")
+        quant_config = _load_json("quant_cfg_4B_w4a32_kai.json")
+        text_config = runtime_config["text_config"]
+        source_shapes = expected_text_shapes(text_config)
+        non_linear_name = "model.language_model.norm.weight"
+
+        template_pattern = next(
+            pattern for pattern in quant_config if "q_proj" in pattern
+        )
+        mutated_quant_config = copy.deepcopy(quant_config)
+        extra_entry = copy.deepcopy(mutated_quant_config[template_pattern])
+        extra_entry["hints"]["shape"] = source_shapes[non_linear_name]
+        mutated_quant_config[f"^{re.escape(non_linear_name)}$"] = extra_entry
+        with self.assertRaisesRegex(
+            AssertionError,
+            "KAI quantization coverage mismatch",
+        ) as raised:
+            validate_kai_recipe_contract(
+                text_config,
+                mutated_quant_config,
+                runtime_config,
+            )
+        self.assertIn(non_linear_name, str(raised.exception))
+
+    def test_kai_recipe_contract_rejects_invalid_tied_embedding_entry(self) -> None:
+        runtime_config = _load_json("config_4B_w4a32_kai.json")
+        quant_config = _load_json("quant_cfg_4B_w4a32_kai.json")
+        text_config = runtime_config["text_config"]
+
+        tied_pattern = next(
+            pattern for pattern in quant_config if "embed_tokens" in pattern
+        )
+        hint_mutations = (
+            ("replace", True),
+            ("rename", "wrong_name.weight"),
+            ("rename", None),
+        )
+        for field, value in hint_mutations:
+            with self.subTest(field=field, value=value):
+                mutated_quant_config = copy.deepcopy(quant_config)
+                mutated_quant_config[tied_pattern]["hints"][field] = value
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "Tied embedding KAI entry must retain embed_tokens.weight",
+                ):
+                    validate_kai_recipe_contract(
+                        text_config,
+                        mutated_quant_config,
+                        runtime_config,
+                    )
+
+        mutated_quant_config = copy.deepcopy(quant_config)
+        del mutated_quant_config[tied_pattern]["hints"]["rename"]
+        with self.assertRaisesRegex(
+            AssertionError,
+            "Tied embedding KAI entry must retain embed_tokens.weight",
+        ):
+            validate_kai_recipe_contract(
+                text_config,
+                mutated_quant_config,
+                runtime_config,
+            )
+
+    def test_kai_recipe_contract_rejects_malformed_runtime_text_config(self) -> None:
+        runtime_config = _load_json("config_4B_w4a32_kai.json")
+        quant_config = _load_json("quant_cfg_4B_w4a32_kai.json")
+        text_config = runtime_config["text_config"]
+
+        for mutation in ("missing", None, "not-an-object"):
+            with self.subTest(mutation=mutation):
+                mutated_runtime_config = copy.deepcopy(runtime_config)
+                if mutation == "missing":
+                    del mutated_runtime_config["text_config"]
+                else:
+                    mutated_runtime_config["text_config"] = mutation
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "KAI runtime config must declare an object text_config",
+                ):
+                    validate_kai_recipe_contract(
+                        text_config,
+                        quant_config,
+                        mutated_runtime_config,
+                    )
 
 
 if __name__ == "__main__":

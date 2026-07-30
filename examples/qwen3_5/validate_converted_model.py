@@ -31,6 +31,9 @@ MODEL_MAGIC = 0x519A
 MODEL_VERSION = 2
 FLOAT32 = 0
 BYTE = 134
+# Exclusive upper bound of the unsigned 32-bit range; offsets at or above this
+# value cannot be addressed by a 32-bit reader.
+UINT32_LIMIT = 1 << 32
 
 
 def _packed_size(out_channels: int, in_channels: int, tile_name: str) -> int:
@@ -230,7 +233,7 @@ def main() -> None:
         "float32_parameters": dtype_counts[FLOAT32],
         "kai_packed_parameters": dtype_counts[BYTE],
         "crosses_uint32_offset": any(
-            offset >= 1 << 32 for _, _, _, offset in actual.values()
+            offset >= UINT32_LIMIT for _, _, _, offset in actual.values()
         ),
         "has_lm_head_out": "lm_head_out.weight" in actual,
         "visual_or_mtp_parameters": sum(
