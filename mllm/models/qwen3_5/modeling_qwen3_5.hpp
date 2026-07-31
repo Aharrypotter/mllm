@@ -1,9 +1,10 @@
 // Copyright (c) MLLM Team.
 // Licensed under the MIT License.
 //
-// Qwen3.5 hybrid model: 18 GDN (Gated Delta Network) layers + 6 full attention layers.
-// GDN layers use linear attention with recurrent state; full attention layers use GQA
-// with partial RoPE and output gating.
+// Qwen3.5 hybrid text model. The configured layer schedule interleaves GDN
+// (Gated Delta Network) layers with full-attention layers. GDN layers use
+// linear attention with recurrent state; full-attention layers use GQA with
+// partial RoPE and output gating.
 
 #pragma once
 

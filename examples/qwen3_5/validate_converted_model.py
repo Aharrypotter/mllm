@@ -13,7 +13,16 @@ import struct
 from collections import Counter
 from pathlib import Path
 
-from validate_checkpoint import expected_text_shapes
+from validate_checkpoint import (
+    MODEL_VARIANTS,
+    default_quant_config_path,
+    default_runtime_config_path,
+    expected_text_shapes,
+    model_name_for_size,
+    resolve_model_size,
+    resolve_runtime_linear_impl_type,
+    validate_kai_recipe_contract,
+)
 
 
 MODEL_HEADER = struct.Struct("<II512sIQ")
@@ -22,6 +31,9 @@ MODEL_MAGIC = 0x519A
 MODEL_VERSION = 2
 FLOAT32 = 0
 BYTE = 134
+# Exclusive upper bound of the unsigned 32-bit range; offsets at or above this
+# value cannot be addressed by a 32-bit reader.
+UINT32_LIMIT = 1 << 32
 
 
 def _packed_size(out_channels: int, in_channels: int, tile_name: str) -> int:
@@ -81,22 +93,80 @@ def _expected_descriptors(
     return expected
 
 
+def _validate_descriptor_table(
+    actual: dict[str, tuple[int, list[int], int, int]],
+    expected: dict[str, tuple[int, list[int], int]],
+    data_start: int,
+    file_size: int,
+) -> Counter:
+    missing = sorted(set(expected) - set(actual))
+    extra = sorted(set(actual) - set(expected))
+    if missing or extra:
+        raise AssertionError(
+            f"Parameter-name mismatch: missing={missing}, extra={extra}"
+        )
+
+    for name, expected_descriptor in expected.items():
+        dtype, shape, size, _ = actual[name]
+        if (dtype, shape, size) != expected_descriptor:
+            raise AssertionError(
+                f"{name}: expected {expected_descriptor}, got {(dtype, shape, size)}"
+            )
+
+    next_offset = data_start
+    for name, (_, _, size, offset) in sorted(
+        actual.items(), key=lambda item: item[1][3]
+    ):
+        if offset != next_offset:
+            raise AssertionError(
+                f"{name}: expected contiguous offset {next_offset}, got {offset}"
+            )
+        next_offset += size
+    if next_offset != file_size:
+        raise AssertionError(
+            f"Tensor data ends at {next_offset}, but file size is {file_size}"
+        )
+
+    return Counter(dtype for dtype, _, _, _ in actual.values())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("model", type=Path)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument(
+        "--model-size",
+        choices=tuple(MODEL_VARIANTS),
+        help="Expected supported variant (default: detect 0.8B or 4B from config.json)",
+    )
+    parser.add_argument(
         "--quant-config",
         type=Path,
-        default=Path(__file__).with_name("quant_cfg_0.8B_w4a32_kai.json"),
+        help="Quantization recipe (default: recipe for the detected model size)",
     )
-    parser.add_argument("--model-name", default="Qwen3.5-0.8B")
+    parser.add_argument(
+        "--runtime-config",
+        type=Path,
+        help="Runtime config (default: config for the detected model size)",
+    )
+    parser.add_argument(
+        "--model-name",
+        help="Expected V2 header model name (default: Qwen3.5-<detected size>)",
+    )
     args = parser.parse_args()
 
     with (args.checkpoint / "config.json").open() as config_file:
-        text_config = json.load(config_file)["text_config"]
-    with args.quant_config.open() as quant_config_file:
+        checkpoint_config = json.load(config_file)
+    text_config = checkpoint_config["text_config"]
+    model_size = resolve_model_size(text_config, args.model_size)
+    quant_config_path = args.quant_config or default_quant_config_path(model_size)
+    runtime_config_path = args.runtime_config or default_runtime_config_path(model_size)
+    expected_model_name = args.model_name or model_name_for_size(model_size)
+    with quant_config_path.open() as quant_config_file:
         quant_config = json.load(quant_config_file)
+    with runtime_config_path.open() as runtime_config_file:
+        runtime_config = json.load(runtime_config_file)
+    validate_kai_recipe_contract(text_config, quant_config, runtime_config)
     expected = _expected_descriptors(text_config, quant_config)
 
     file_size = args.model.stat().st_size
@@ -111,7 +181,7 @@ def main() -> None:
         if (magic, version, model_name, descriptor_offset) != (
             MODEL_MAGIC,
             MODEL_VERSION,
-            args.model_name,
+            expected_model_name,
             MODEL_HEADER.size,
         ):
             raise AssertionError(
@@ -145,42 +215,26 @@ def main() -> None:
                 raise AssertionError(f"Duplicate parameter name: {name}")
             actual[name] = (dtype, shape[:shape_len], size, offset)
 
-    missing = sorted(set(expected) - set(actual))
-    extra = sorted(set(actual) - set(expected))
-    if missing or extra:
-        raise AssertionError(
-            f"Parameter-name mismatch: missing={missing}, extra={extra}"
-        )
-
-    for name, expected_descriptor in expected.items():
-        dtype, shape, size, _ = actual[name]
-        if (dtype, shape, size) != expected_descriptor:
-            raise AssertionError(
-                f"{name}: expected {expected_descriptor}, got {(dtype, shape, size)}"
-            )
-
     data_start = MODEL_HEADER.size + num_params * PARAMETER_DESCRIPTOR.size
-    next_offset = data_start
-    for name, (_, _, size, offset) in sorted(
-        actual.items(), key=lambda item: item[1][3]
-    ):
-        if offset != next_offset:
-            raise AssertionError(
-                f"{name}: expected contiguous offset {next_offset}, got {offset}"
-            )
-        next_offset += size
-    if next_offset != file_size:
-        raise AssertionError(
-            f"Tensor data ends at {next_offset}, but file size is {file_size}"
-        )
-
-    dtype_counts = Counter(dtype for dtype, _, _, _ in actual.values())
+    dtype_counts = _validate_descriptor_table(
+        actual,
+        expected,
+        data_start,
+        file_size,
+    )
     summary = {
         "model": str(args.model),
+        "model_size": model_size,
+        "quant_config": str(quant_config_path),
+        "runtime_config": str(runtime_config_path),
+        "linear_impl_type": resolve_runtime_linear_impl_type(runtime_config),
         "model_bytes": file_size,
         "parameters": num_params,
         "float32_parameters": dtype_counts[FLOAT32],
         "kai_packed_parameters": dtype_counts[BYTE],
+        "crosses_uint32_offset": any(
+            offset >= UINT32_LIMIT for _, _, _, offset in actual.values()
+        ),
         "has_lm_head_out": "lm_head_out.weight" in actual,
         "visual_or_mtp_parameters": sum(
             "visual" in name or "mtp" in name for name in actual

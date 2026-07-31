@@ -15,6 +15,166 @@ from pathlib import Path
 from safetensors import safe_open
 
 
+MODEL_VARIANTS = {
+    "0.8B": {
+        "model_name": "Qwen3.5-0.8B",
+        "quant_config": "quant_cfg_0.8B_w4a32_kai.json",
+        "runtime_config": "config_0.8B_w4a32_kai.json",
+        "contract": {
+            "attention_bias": False,
+            "attn_output_gate": True,
+            "eos_token_id": 248044,
+            "full_attention_interval": 4,
+            "head_dim": 256,
+            "hidden_act": "silu",
+            "hidden_size": 1024,
+            "intermediate_size": 3584,
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 16,
+            "linear_value_head_dim": 128,
+            "mamba_ssm_dtype": "float32",
+            "max_position_embeddings": 262144,
+            "num_attention_heads": 8,
+            "num_hidden_layers": 24,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-06,
+            "rope_parameters": {
+                "mrope_interleaved": True,
+                "mrope_section": [11, 11, 10],
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 10000000,
+                "rope_type": "default",
+            },
+            "tie_word_embeddings": True,
+            "vocab_size": 248320,
+        },
+    },
+    "4B": {
+        "model_name": "Qwen3.5-4B",
+        "quant_config": "quant_cfg_4B_w4a32_kai.json",
+        "runtime_config": "config_4B_w4a32_kai.json",
+        "contract": {
+            "attention_bias": False,
+            "attn_output_gate": True,
+            "eos_token_id": 248044,
+            "full_attention_interval": 4,
+            "head_dim": 256,
+            "hidden_act": "silu",
+            "hidden_size": 2560,
+            "intermediate_size": 9216,
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_value_head_dim": 128,
+            "mamba_ssm_dtype": "float32",
+            "max_position_embeddings": 262144,
+            "num_attention_heads": 16,
+            "num_hidden_layers": 32,
+            "num_key_value_heads": 4,
+            "rms_norm_eps": 1e-06,
+            "rope_parameters": {
+                "mrope_interleaved": True,
+                "mrope_section": [11, 11, 10],
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 10000000,
+                "rope_type": "default",
+            },
+            "tie_word_embeddings": True,
+            "vocab_size": 248320,
+        },
+    },
+}
+
+KAI_HINT_CONTRACT = {
+    "quant_method": "kai",
+    "kai_matmul_triplet": "f32_qai8dxp_qsi4c32p",
+    "kai_matmul_layout": "mxk_nxk",
+    "kai_matmul_tile_cfg": "qai8dxp1x8_qsi4c32p8x8_1x8x32",
+}
+KAI_LINEAR_IMPL_TYPE = (
+    "KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_" "qai8dxp1x8_qsi4c32p8x8_1x8x32"
+)
+TIED_EMBEDDING_WEIGHT = "model.language_model.embed_tokens.weight"
+
+
+def _expected_layer_types(num_hidden_layers: int, interval: int) -> list[str]:
+    return [
+        "full_attention" if (layer_index + 1) % interval == 0 else "linear_attention"
+        for layer_index in range(num_hidden_layers)
+    ]
+
+
+def _variant_mismatches(text_config: dict, model_size: str) -> list[str]:
+    contract = MODEL_VARIANTS[model_size]["contract"]
+    mismatches = [
+        f"{field}={text_config.get(field)!r} (expected {expected!r})"
+        for field, expected in contract.items()
+        if text_config.get(field) != expected
+    ]
+    expected_layer_types = _expected_layer_types(
+        contract["num_hidden_layers"],
+        contract["full_attention_interval"],
+    )
+    if text_config.get("layer_types") != expected_layer_types:
+        mismatches.append(
+            "layer_types does not match the official "
+            f"{contract['full_attention_interval']}-layer hybrid schedule"
+        )
+    return mismatches
+
+
+def resolve_model_size(text_config: dict, requested_size: str | None = None) -> str:
+    """Resolve and validate a supported official Qwen3.5 text configuration."""
+
+    if requested_size is not None:
+        mismatches = _variant_mismatches(text_config, requested_size)
+        if mismatches:
+            raise AssertionError(
+                f"Checkpoint does not match Qwen3.5-{requested_size}: "
+                + "; ".join(mismatches)
+            )
+        return requested_size
+
+    matches = [
+        model_size
+        for model_size in MODEL_VARIANTS
+        if not _variant_mismatches(text_config, model_size)
+    ]
+    if len(matches) != 1:
+        identity = {
+            field: text_config.get(field)
+            for field in (
+                "hidden_size",
+                "intermediate_size",
+                "num_hidden_layers",
+                "num_attention_heads",
+                "num_key_value_heads",
+                "linear_num_key_heads",
+                "linear_num_value_heads",
+            )
+        }
+        raise AssertionError(
+            "Checkpoint does not match a supported official Qwen3.5 text "
+            f"configuration (0.8B or 4B): {identity}"
+        )
+    return matches[0]
+
+
+def default_quant_config_path(model_size: str) -> Path:
+    return Path(__file__).with_name(MODEL_VARIANTS[model_size]["quant_config"])
+
+
+def default_runtime_config_path(model_size: str) -> Path:
+    return Path(__file__).with_name(MODEL_VARIANTS[model_size]["runtime_config"])
+
+
+def model_name_for_size(model_size: str) -> str:
+    return MODEL_VARIANTS[model_size]["model_name"]
+
+
 def expected_text_shapes(text_config: dict) -> dict[str, list[int]]:
     hidden_size = text_config["hidden_size"]
     intermediate_size = text_config["intermediate_size"]
@@ -122,13 +282,141 @@ def expected_text_shapes(text_config: dict) -> dict[str, list[int]]:
     return expected
 
 
+def _expected_kai_linear_names(source_names: set[str]) -> set[str]:
+    kai_linear_pattern = re.compile(
+        r"(?:"
+        r"model\.language_model\.embed_tokens\.weight|"
+        r".*\.mlp\.(?:gate_proj|up_proj|down_proj)\.weight|"
+        r".*\.self_attn\.(?:q_proj|k_proj|v_proj|o_proj)\.weight|"
+        r".*\.linear_attn\.(?:in_proj_qkv|in_proj_z|in_proj_a|in_proj_b|out_proj)\.weight"
+        r")"
+    )
+    return {name for name in source_names if kai_linear_pattern.fullmatch(name)}
+
+
+def resolve_runtime_linear_impl_type(runtime_config: dict) -> str | None:
+    """Mirror Qwen3_5Config's nested-then-top-level implementation lookup."""
+
+    text_config = runtime_config.get("text_config", runtime_config)
+    return text_config.get(
+        "linear_impl_type",
+        runtime_config.get("linear_impl_type"),
+    )
+
+
+def validate_kai_recipe_contract(
+    text_config: dict,
+    quant_config: dict,
+    runtime_config: dict,
+) -> tuple[set[str], dict[str, int]]:
+    """Validate that a quantization recipe matches the configured KAI runtime."""
+
+    checkpoint_size = resolve_model_size(text_config)
+    if runtime_config.get("model_type") != "qwen3_5":
+        raise AssertionError("KAI runtime config must declare model_type='qwen3_5'")
+    runtime_text_config = runtime_config.get("text_config")
+    if not isinstance(runtime_text_config, dict):
+        raise AssertionError(
+            "KAI runtime config must declare an object text_config, got "
+            f"{type(runtime_text_config).__name__}"
+        )
+    runtime_size = resolve_model_size(runtime_text_config)
+    if runtime_size != checkpoint_size:
+        raise AssertionError(
+            f"KAI runtime config is for Qwen3.5-{runtime_size}, "
+            f"checkpoint is Qwen3.5-{checkpoint_size}"
+        )
+    linear_impl_type = resolve_runtime_linear_impl_type(runtime_config)
+    if linear_impl_type != KAI_LINEAR_IMPL_TYPE:
+        raise AssertionError(
+            "KAI runtime linear_impl_type mismatch: "
+            f"{linear_impl_type!r} != {KAI_LINEAR_IMPL_TYPE!r}"
+        )
+
+    source_shapes = expected_text_shapes(text_config)
+    source_names = set(source_shapes)
+    quantized_names: set[str] = set()
+    pattern_counts: dict[str, int] = {}
+
+    for pattern, entry in quant_config.items():
+        hints = entry.get("hints")
+        if not isinstance(hints, dict):
+            raise AssertionError(
+                f"KAI quantization entry {pattern!r} must contain hints"
+            )
+        hint_mismatches = [
+            f"{field}={hints.get(field)!r} (expected {expected!r})"
+            for field, expected in KAI_HINT_CONTRACT.items()
+            if hints.get(field) != expected
+        ]
+        if hint_mismatches:
+            raise AssertionError(
+                f"KAI recipe contract mismatch for {pattern}: "
+                + "; ".join(hint_mismatches)
+            )
+
+        regex = re.compile(pattern)
+        matched_names = sorted(name for name in source_names if regex.fullmatch(name))
+        if not matched_names:
+            raise AssertionError(f"Quantization pattern matched no weights: {pattern}")
+        overlap = quantized_names.intersection(matched_names)
+        if overlap:
+            raise AssertionError(
+                f"Quantization pattern overlap for {pattern}: {sorted(overlap)}"
+            )
+        for name in matched_names:
+            if hints.get("shape") != source_shapes[name]:
+                raise AssertionError(
+                    f"{pattern} matched {name}: config shape "
+                    f"{hints.get('shape')}, expected shape {source_shapes[name]}"
+                )
+
+        if TIED_EMBEDDING_WEIGHT in matched_names:
+            if (
+                matched_names != [TIED_EMBEDDING_WEIGHT]
+                or hints.get("replace") is not False
+                or hints.get("rename") != "lm_head_out.weight"
+            ):
+                raise AssertionError(
+                    "Tied embedding KAI entry must retain embed_tokens.weight "
+                    "and rename its packed copy to lm_head_out.weight"
+                )
+        elif hints.get("replace") is not True or hints.get("rename") is not None:
+            raise AssertionError(
+                f"KAI Linear entry {pattern} must set replace=true without rename"
+            )
+
+        quantized_names.update(matched_names)
+        pattern_counts[pattern] = len(matched_names)
+
+    expected_quantized_names = _expected_kai_linear_names(source_names)
+    missing = sorted(expected_quantized_names - quantized_names)
+    unexpected = sorted(quantized_names - expected_quantized_names)
+    if missing or unexpected:
+        raise AssertionError(
+            "KAI quantization coverage mismatch: "
+            f"missing_linears={missing}, unexpected_parameters={unexpected}"
+        )
+    return quantized_names, pattern_counts
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument(
+        "--model-size",
+        choices=tuple(MODEL_VARIANTS),
+        help="Expected supported variant (default: detect 0.8B or 4B from config.json)",
+    )
+    parser.add_argument(
         "--quant-config",
         type=Path,
-        default=Path(__file__).with_name("quant_cfg_0.8B_w4a32_kai.json"),
+        help="Quantization recipe (default: recipe for the detected model size)",
+    )
+    parser.add_argument(
+        "--runtime-config",
+        type=Path,
+        help="Runtime config (default: config for the detected model size)",
     )
     args = parser.parse_args()
 
@@ -136,8 +424,6 @@ def main() -> None:
         config = json.load(config_file)
     with (args.checkpoint / "model.safetensors.index.json").open() as index_file:
         index = json.load(index_file)
-    with args.quant_config.open() as quant_config_file:
-        quant_config = json.load(quant_config_file)
 
     text_config = config["text_config"]
     if config.get("model_type") != "qwen3_5":
@@ -151,9 +437,20 @@ def main() -> None:
         raise AssertionError(
             "Qwen3.5 ARM CPU conversion currently requires tied word embeddings"
         )
-    if len(text_config["layer_types"]) != text_config["num_hidden_layers"]:
-        raise AssertionError("layer_types length must equal num_hidden_layers")
+    model_size = resolve_model_size(text_config, args.model_size)
+    quant_config_path = args.quant_config or default_quant_config_path(model_size)
+    runtime_config_path = args.runtime_config or default_runtime_config_path(model_size)
+    with quant_config_path.open() as quant_config_file:
+        quant_config = json.load(quant_config_file)
+    with runtime_config_path.open() as runtime_config_file:
+        runtime_config = json.load(runtime_config_file)
+
     expected_shapes = expected_text_shapes(text_config)
+    quantized_names, pattern_counts = validate_kai_recipe_contract(
+        text_config,
+        quant_config,
+        runtime_config,
+    )
     weight_map = index["weight_map"]
     actual_text_keys = {
         name for name in weight_map if name.startswith("model.language_model.")
@@ -189,22 +486,11 @@ def main() -> None:
                 )
             dtype_counts[str(tensor_slice.get_dtype())] += 1
 
-        quantized_names: set[str] = set()
-        pattern_counts: dict[str, int] = {}
         for pattern, entry in quant_config.items():
             regex = re.compile(pattern)
             matched_names = sorted(
                 name for name in actual_text_keys if regex.fullmatch(name)
             )
-            if not matched_names:
-                raise AssertionError(
-                    f"Quantization pattern matched no weights: {pattern}"
-                )
-            overlap = quantized_names.intersection(matched_names)
-            if overlap:
-                raise AssertionError(
-                    f"Quantization pattern overlap for {pattern}: {sorted(overlap)}"
-                )
             expected_shape = entry["hints"]["shape"]
             for name in matched_names:
                 actual_shape = list(
@@ -215,11 +501,13 @@ def main() -> None:
                         f"{pattern} matched {name}: config shape "
                         f"{expected_shape}, checkpoint shape {actual_shape}"
                     )
-            quantized_names.update(matched_names)
-            pattern_counts[pattern] = len(matched_names)
 
     summary = {
         "checkpoint": str(args.checkpoint),
+        "model_size": model_size,
+        "quant_config": str(quant_config_path),
+        "runtime_config": str(runtime_config_path),
+        "linear_impl_type": resolve_runtime_linear_impl_type(runtime_config),
         "text_parameters": len(actual_text_keys),
         "full_attention_layers": text_config["layer_types"].count("full_attention"),
         "linear_attention_layers": text_config["layer_types"].count("linear_attention"),
@@ -228,26 +516,7 @@ def main() -> None:
         "pattern_counts": pattern_counts,
     }
 
-    kai_linear_pattern = re.compile(
-        r"(?:"
-        r"model\.language_model\.embed_tokens\.weight|"
-        r".*\.mlp\.(?:gate_proj|up_proj|down_proj)\.weight|"
-        r".*\.self_attn\.(?:q_proj|k_proj|v_proj|o_proj)\.weight|"
-        r".*\.linear_attn\.(?:in_proj_qkv|in_proj_z|in_proj_a|in_proj_b|out_proj)\.weight"
-        r")"
-    )
-    expected_quantized_names = {
-        name for name in actual_text_keys if kai_linear_pattern.fullmatch(name)
-    }
-    missing_quantized_linears = sorted(expected_quantized_names - quantized_names)
-    unexpected_quantized_parameters = sorted(quantized_names - expected_quantized_names)
-    if missing_quantized_linears or unexpected_quantized_parameters:
-        raise AssertionError(
-            "KAI quantization coverage mismatch: "
-            f"missing_linears={missing_quantized_linears}, "
-            f"unexpected_parameters={unexpected_quantized_parameters}"
-        )
-
+    expected_quantized_names = _expected_kai_linear_names(actual_text_keys)
     summary["expected_kai_linear_parameters"] = len(expected_quantized_names)
     print(json.dumps(summary, indent=2, sort_keys=True))
     print("QWEN35_CHECKPOINT_AUDIT_OK")
