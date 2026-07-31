@@ -188,7 +188,45 @@ void depthwiseCausalConvF32(const float* input, const float* weight, float* stat
   const int state_width = kernel_size - 1;
   for (int batch = 0; batch < batch_size; ++batch) {
     for (int token = 0; token < sequence_length; ++token) {
-      for (int channel = 0; channel < channels; ++channel) {
+      int channel = 0;
+#if defined(__aarch64__)
+      // Production Qwen3.5 uses kernel_size 4, so the history is three taps
+      // wide and both the [C, K] weights and the [B, C, K - 1] history are
+      // contiguous across channels. vld3/vld4 deinterleave four adjacent
+      // channels into per-tap lanes, which lets the history shift happen in
+      // registers instead of two scalar loads and two scalar stores per
+      // element.
+      //
+      // The accumulation order matches the scalar body below exactly: a
+      // rounded multiply by the newest tap, then taps 0, 1, 2 fused in
+      // ascending order. Compilers contract the scalar `value += state * weight`
+      // into an FMA, so vfmaq_f32 reproduces it bitwise. The focused
+      // convolution oracle asserts that equality per toolchain rather than
+      // assuming it.
+      if (kernel_size == 4) {
+        const std::size_t token_base = (static_cast<std::size_t>(batch) * sequence_length + token) * channels;
+        const std::size_t batch_state_base = static_cast<std::size_t>(batch) * channels * state_width;
+        for (; channel + 4 <= channels; channel += 4) {
+          float* state_block = state + batch_state_base + static_cast<std::size_t>(channel) * state_width;
+          const float32x4x3_t history = vld3q_f32(state_block);
+          const float32x4x4_t taps = vld4q_f32(weight + static_cast<std::size_t>(channel) * kernel_size);
+          const float32x4_t current = vld1q_f32(input + token_base + channel);
+
+          float32x4_t value = vmulq_f32(current, taps.val[3]);
+          value = vfmaq_f32(value, history.val[0], taps.val[0]);
+          value = vfmaq_f32(value, history.val[1], taps.val[1]);
+          value = vfmaq_f32(value, history.val[2], taps.val[2]);
+          vst1q_f32(output + token_base + channel, value);
+
+          float32x4x3_t shifted;
+          shifted.val[0] = history.val[1];
+          shifted.val[1] = history.val[2];
+          shifted.val[2] = current;
+          vst3q_f32(state_block, shifted);
+        }
+      }
+#endif
+      for (; channel < channels; ++channel) {
         const std::size_t state_base = (static_cast<std::size_t>(batch) * channels + channel) * state_width;
         const std::size_t input_index = (static_cast<std::size_t>(batch) * sequence_length + token) * channels + channel;
         const std::size_t weight_base = static_cast<std::size_t>(channel) * kernel_size;
