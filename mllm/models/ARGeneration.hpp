@@ -80,6 +80,7 @@ class ARGenerationChatIterator {
   int top_k_;
   float top_p_;
   int max_length_;
+  int min_new_tokens_;
   int eos_token_id_;
   bool do_sample_;
 };
@@ -152,6 +153,8 @@ class ARGeneration {
   void generationEventEndTimePoint();
 
   [[nodiscard]] bool isEosToken(int64_t token_id, int64_t primary_eos_token_id) const;
+
+  void suppressEosLogits(Tensor& logits, int64_t primary_eos_token_id);
 
   bool do_sample_ = false;
   int eos_token_id_ = -1;

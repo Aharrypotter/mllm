@@ -3,6 +3,7 @@
 
 #include <random>
 #include <algorithm>
+#include <limits>
 
 #include <fmt/core.h>
 
@@ -31,8 +32,13 @@ ARGenerationChatIterator::ARGenerationChatIterator(ARGeneration& gen, const ARGe
   top_k_ = args.count("top_k") ? args.at("top_k").get<int>() : 0;
   top_p_ = args.count("top_p") ? args.at("top_p").get<float>() : 0.0f;
   max_length_ = args.count("max_length") ? args.at("max_length").get<int>() : gen.max_length_;
+  min_new_tokens_ = args.count("min_new_tokens") ? args.at("min_new_tokens").get<int>() : 0;
   eos_token_id_ = args.count("eos_token_id") ? args.at("eos_token_id").get<int>() : gen.eos_token_id_;
   do_sample_ = args.count("do_sample") ? args.at("do_sample").get<bool>() : gen.do_sample_;
+  if (max_length_ <= 0) { throw std::invalid_argument("max_length must be positive"); }
+  if (min_new_tokens_ < 0 || min_new_tokens_ > max_length_) {
+    throw std::invalid_argument("min_new_tokens must be between 0 and max_length");
+  }
 
   step();
 }
@@ -94,6 +100,7 @@ void ARGenerationChatIterator::step() {
   Tensor logits = output["sequence"];
   auto device = logits.device();
   logits = logits.to(kCPU);
+  if (step_count_ + 1 < min_new_tokens_) { gen_->suppressEosLogits(logits, eos_token_id_); }
   int64_t next_token_id;
   if (use_sampling) {
     if (top_k_ > 0) {
@@ -119,7 +126,7 @@ void ARGenerationChatIterator::step() {
   step_count_++;
   gen_->ar_steps_++;
 
-  if (gen_->isEosToken(next_token_id, eos_token_id_)) {
+  if (step_count_ >= min_new_tokens_ && gen_->isEosToken(next_token_id, eos_token_id_)) {
     gen_->generationEventEndTimePoint();
     finished_ = true;
     return;
@@ -144,8 +151,13 @@ ARGenerationOutputPast ARGeneration::generate(const ARGenerationOutputPast& inpu
   int top_k = args.count("top_k") ? args.at("top_k").get<int>() : 0;
   float top_p = args.count("top_p") ? args.at("top_p").get<float>() : 0.0f;
   int max_length = args.count("max_length") ? args.at("max_length").get<int>() : max_length_;
+  int min_new_tokens = args.count("min_new_tokens") ? args.at("min_new_tokens").get<int>() : 0;
   int eos_token_id = args.count("eos_token_id") ? args.at("eos_token_id").get<int>() : eos_token_id_;
   bool do_sample = args.count("do_sample") ? args.at("do_sample").get<bool>() : do_sample_;
+  if (max_length <= 0) { throw std::invalid_argument("max_length must be positive"); }
+  if (min_new_tokens < 0 || min_new_tokens > max_length) {
+    throw std::invalid_argument("min_new_tokens must be between 0 and max_length");
+  }
 
   bool use_sampling = do_sample || (temperature != 1.0f) || (top_k > 0) || (top_p > 0.0f);
 
@@ -164,6 +176,7 @@ ARGenerationOutputPast ARGeneration::generate(const ARGenerationOutputPast& inpu
     if (i == 0) { prefillEventEndTimePoint(); }
 
     Tensor logits = output["sequence"];
+    if (i + 1 < min_new_tokens) { suppressEosLogits(logits, eos_token_id); }
 
     int64_t next_token_id;
     if (use_sampling) {
@@ -187,7 +200,7 @@ ARGenerationOutputPast ARGeneration::generate(const ARGenerationOutputPast& inpu
       decodeEventEndTimePoint();
     }
 
-    if (isEosToken(next_token_id, eos_token_id)) { break; }
+    if (i + 1 >= min_new_tokens && isEosToken(next_token_id, eos_token_id)) { break; }
 
     // [B, S]
     past = output;
@@ -219,8 +232,13 @@ void ARGeneration::streamGenerate(const ARGenerationOutputPast& input, const ARG
   int top_k = args.count("top_k") ? args.at("top_k").get<int>() : 0;
   float top_p = args.count("top_p") ? args.at("top_p").get<float>() : 0.0f;
   int max_length = args.count("max_length") ? args.at("max_length").get<int>() : max_length_;
+  int min_new_tokens = args.count("min_new_tokens") ? args.at("min_new_tokens").get<int>() : 0;
   int eos_token_id = args.count("eos_token_id") ? args.at("eos_token_id").get<int>() : eos_token_id_;
   bool do_sample = args.count("do_sample") ? args.at("do_sample").get<bool>() : do_sample_;
+  if (max_length <= 0) { throw std::invalid_argument("max_length must be positive"); }
+  if (min_new_tokens < 0 || min_new_tokens > max_length) {
+    throw std::invalid_argument("min_new_tokens must be between 0 and max_length");
+  }
 
   bool use_sampling = do_sample || (temperature != 1.0f) || (top_k > 0) || (top_p > 0.0f);
 
@@ -243,6 +261,7 @@ void ARGeneration::streamGenerate(const ARGenerationOutputPast& input, const ARG
     Tensor logits = output["sequence"];
     auto device = logits.device();
     logits = logits.to(kCPU);
+    if (i + 1 < min_new_tokens) { suppressEosLogits(logits, eos_token_id); }
 
     int64_t next_token_id;
     if (use_sampling) {
@@ -266,7 +285,7 @@ void ARGeneration::streamGenerate(const ARGenerationOutputPast& input, const ARG
 
     callback(next_token_id);
 
-    if (isEosToken(next_token_id, eos_token_id)) { break; }
+    if (i + 1 >= min_new_tokens && isEosToken(next_token_id, eos_token_id)) { break; }
 
     // [B, S]
     past = output;
@@ -575,6 +594,19 @@ void ARGeneration::generationEventEndTimePoint() {
 
 bool ARGeneration::isEosToken(int64_t token_id, int64_t primary_eos_token_id) const {
   return token_id == primary_eos_token_id || additional_eos_token_ids_.contains(token_id);
+}
+
+void ARGeneration::suppressEosLogits(Tensor& logits, int64_t primary_eos_token_id) {
+  auto last_logits = getLastLogits(logits);
+  if (last_logits.dtype() != kFloat32) { throw std::runtime_error("min_new_tokens currently requires float32 logits"); }
+
+  const auto vocab_size = static_cast<int64_t>(last_logits.shape().back());
+  auto* logits_data = last_logits.ptr<float>();
+  const auto suppress = [&](int64_t token_id) {
+    if (token_id >= 0 && token_id < vocab_size) { logits_data[token_id] = std::numeric_limits<float>::lowest(); }
+  };
+  suppress(primary_eos_token_id);
+  for (const auto token_id : additional_eos_token_ids_) { suppress(token_id); }
 }
 
 void ARGeneration::customEventStartTimePoint(const std::string& name) {

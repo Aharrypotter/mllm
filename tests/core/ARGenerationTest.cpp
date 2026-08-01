@@ -53,11 +53,12 @@ Tensor makeInput(int sequence_length) {
   return input;
 }
 
-std::vector<int64_t> runChat(FakeGeneration& model, int max_length, int eos_token_id = 3) {
+std::vector<int64_t> runChat(FakeGeneration& model, int max_length, int eos_token_id = 3, int min_new_tokens = 0) {
   std::vector<int64_t> tokens;
   ARGenerationArgs args = {
       {"max_length", AnyValue(max_length)},
       {"eos_token_id", AnyValue(eos_token_id)},
+      {"min_new_tokens", AnyValue(min_new_tokens)},
   };
   for (const auto& step : model.chat({{"sequence", makeInput(3)}}, args)) { tokens.push_back(step.cur_token_id); }
   return tokens;
@@ -154,6 +155,77 @@ TEST(ARGenerationPerformanceTest, AdditionalEosTokenStopsChat) {
   const auto stats = model.perfStats();
   EXPECT_TRUE(stats.completed);
   EXPECT_EQ(stats.generated_tokens, 2);
+}
+
+TEST(ARGenerationPerformanceTest, ChatHonorsMinNewTokensForPrimaryEos) {
+  FakeGeneration model({3, 1, 3, 2});
+
+  EXPECT_EQ(runChat(model, 8, 3, 3), (std::vector<int64_t>{0, 1}));
+
+  const auto stats = model.perfStats();
+  EXPECT_TRUE(stats.completed);
+  EXPECT_EQ(stats.generated_tokens, 3);
+  EXPECT_EQ(stats.decode_steps, 2);
+}
+
+TEST(ARGenerationPerformanceTest, ChatHonorsMinNewTokensForAdditionalEos) {
+  FakeGeneration model({2, 1, 2, 0});
+  model.addEosToken(2);
+
+  EXPECT_EQ(runChat(model, 8, 3, 3), (std::vector<int64_t>{0, 1}));
+  EXPECT_EQ(model.perfStats().generated_tokens, 3);
+}
+
+TEST(ARGenerationPerformanceTest, BatchGenerateHonorsMinNewTokens) {
+  FakeGeneration model({3, 1, 3, 2});
+  ARGenerationArgs args = {
+      {"max_length", AnyValue(8)},
+      {"min_new_tokens", AnyValue(3)},
+      {"eos_token_id", AnyValue(3)},
+  };
+
+  const auto output = model.generate({{"sequence", makeInput(3)}}, args);
+  const auto& generated = output.at("generated_sequence");
+  EXPECT_EQ(std::vector<int64_t>(generated.ptr<int64_t>(), generated.ptr<int64_t>() + generated.numel()),
+            (std::vector<int64_t>{0, 1, 3}));
+  EXPECT_EQ(model.perfStats().generated_tokens, 3);
+}
+
+TEST(ARGenerationPerformanceTest, StreamGenerateHonorsMinNewTokens) {
+  FakeGeneration model({3, 1, 3, 2});
+  ARGenerationArgs args = {
+      {"max_length", AnyValue(8)},
+      {"min_new_tokens", AnyValue(3)},
+      {"eos_token_id", AnyValue(3)},
+  };
+  std::vector<int64_t> generated;
+
+  model.streamGenerate({{"sequence", makeInput(3)}}, args, [&](int64_t token) { generated.push_back(token); });
+
+  EXPECT_EQ(generated, (std::vector<int64_t>{0, 1, 3}));
+  EXPECT_EQ(model.perfStats().generated_tokens, 3);
+}
+
+TEST(ARGenerationPerformanceTest, RejectsMinNewTokensAboveMaxLength) {
+  FakeGeneration model({0});
+  EXPECT_THROW((void)runChat(model, 2, 3, 3), std::invalid_argument);
+}
+
+TEST(ARGenerationPerformanceTest, MinNewTokensEqualToMaxLengthSuppressesEveryEarlyEos) {
+  FakeGeneration model({3});
+
+  EXPECT_EQ(runChat(model, 4, 3, 4), (std::vector<int64_t>{0, 0, 0}));
+
+  const auto stats = model.perfStats();
+  EXPECT_TRUE(stats.completed);
+  EXPECT_EQ(stats.generated_tokens, 4);
+  EXPECT_EQ(stats.decode_steps, 3);
+}
+
+TEST(ARGenerationPerformanceTest, RejectsNonPositiveMaxLength) {
+  FakeGeneration model({0});
+  EXPECT_THROW((void)runChat(model, 0), std::invalid_argument);
+  EXPECT_THROW((void)runChat(model, -1), std::invalid_argument);
 }
 
 }  // namespace
