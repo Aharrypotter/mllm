@@ -37,9 +37,9 @@ std::vector<float> makeBuffer(std::size_t count, int salt) {
 
 // Independent scalar reference for the frozen contract:
 // input/output [B, S, C], weight [C, K], history [B, C, K - 1] updated in place.
-void referenceDepthwiseCausalConv(const std::vector<float>& input, const std::vector<float>& weight,
-                                  std::vector<float>& state, std::vector<float>& output, int batch_size,
-                                  int sequence_length, int channels, int kernel_size) {
+void referenceDepthwiseCausalConv(const std::vector<float>& input, const std::vector<float>& weight, std::vector<float>& state,
+                                  std::vector<float>& output, int batch_size, int sequence_length, int channels,
+                                  int kernel_size) {
   const int state_width = kernel_size - 1;
   for (int batch = 0; batch < batch_size; ++batch) {
     for (int token = 0; token < sequence_length; ++token) {
@@ -75,10 +75,8 @@ struct ConvCase {
 // Runs one case through the production kernel and the reference, and requires
 // bitwise agreement on both the output and the final history.
 void expectBitwiseAgreement(const ConvCase& test_case) {
-  const auto element_count =
-      static_cast<std::size_t>(test_case.batch) * test_case.sequence * test_case.channels;
-  const auto state_count =
-      static_cast<std::size_t>(test_case.batch) * test_case.channels * (test_case.kernel - 1);
+  const auto element_count = static_cast<std::size_t>(test_case.batch) * test_case.sequence * test_case.channels;
+  const auto state_count = static_cast<std::size_t>(test_case.batch) * test_case.channels * (test_case.kernel - 1);
 
   const std::vector<float> input = makeBuffer(element_count, test_case.channels + test_case.sequence);
   const std::vector<float> weight =
@@ -133,9 +131,7 @@ TEST(Qwen35GDNConvTest, MatchesScalarReferenceAtProductionChannelWidths) {
 TEST(Qwen35GDNConvTest, MatchesScalarReferenceWithChannelTailAtProductionScale) {
   // Production width minus one, two, and three channels: a full-width run plus
   // a tail of three, two, and one channel respectively.
-  for (int channels : {8189, 8190, 8191, 6141}) {
-    ASSERT_NO_FATAL_FAILURE(expectBitwiseAgreement({1, 69, channels, 4, true}));
-  }
+  for (int channels : {8189, 8190, 8191, 6141}) { ASSERT_NO_FATAL_FAILURE(expectBitwiseAgreement({1, 69, channels, 4, true})); }
 }
 
 TEST(Qwen35GDNConvTest, ChunkedPartitionsMatchOneShot) {
@@ -176,8 +172,8 @@ TEST(Qwen35GDNConvTest, ChunkedPartitionsMatchOneShot) {
     int consumed = 0;
     for (int chunk : partition.chunks) {
       const auto offset = static_cast<std::size_t>(consumed) * partition.channels;
-      depthwiseCausalConvF32(input.data() + offset, weight.data(), chunked_state.data(), chunked_output.data() + offset,
-                             1, chunk, partition.channels, partition.kernel);
+      depthwiseCausalConvF32(input.data() + offset, weight.data(), chunked_state.data(), chunked_output.data() + offset, 1,
+                             chunk, partition.channels, partition.kernel);
       consumed += chunk;
     }
 
@@ -200,22 +196,19 @@ TEST(Qwen35GDNConvTest, ResetBetweenRequestsReproducesFirstRequest) {
 
   std::vector<float> state(kStateCount, 0.0F);
   std::vector<float> first_output(kElements, 0.0F);
-  depthwiseCausalConvF32(input.data(), weight.data(), state.data(), first_output.data(), 1, kSequence, kChannels,
-                         kKernel);
+  depthwiseCausalConvF32(input.data(), weight.data(), state.data(), first_output.data(), 1, kSequence, kChannels, kKernel);
   const std::vector<float> first_state = state;
 
   // A second request that continues the history must differ, proving the
   // history is really being carried.
   std::vector<float> continued_output(kElements, 0.0F);
-  depthwiseCausalConvF32(input.data(), weight.data(), state.data(), continued_output.data(), 1, kSequence, kChannels,
-                         kKernel);
+  depthwiseCausalConvF32(input.data(), weight.data(), state.data(), continued_output.data(), 1, kSequence, kChannels, kKernel);
   ASSERT_NE(continued_output, first_output);
 
   // Resetting the history reproduces the first request bit for bit.
   std::fill(state.begin(), state.end(), 0.0F);
   std::vector<float> reset_output(kElements, 0.0F);
-  depthwiseCausalConvF32(input.data(), weight.data(), state.data(), reset_output.data(), 1, kSequence, kChannels,
-                         kKernel);
+  depthwiseCausalConvF32(input.data(), weight.data(), state.data(), reset_output.data(), 1, kSequence, kChannels, kKernel);
 
   ASSERT_EQ(reset_output, first_output);
   ASSERT_EQ(state, first_state);
@@ -232,9 +225,9 @@ TEST(Qwen35GDNConvTest, RejectsNullBuffersAndInvalidGeometry) {
   std::vector<float> state(static_cast<std::size_t>(kChannels) * (kKernel - 1), 0.0F);
   std::vector<float> output(input.size(), 0.0F);
 
-  EXPECT_THROW(depthwiseCausalConvF32(nullptr, weight.data(), state.data(), output.data(), kBatch, kSequence, kChannels,
-                                      kKernel),
-               std::invalid_argument);
+  EXPECT_THROW(
+      depthwiseCausalConvF32(nullptr, weight.data(), state.data(), output.data(), kBatch, kSequence, kChannels, kKernel),
+      std::invalid_argument);
   EXPECT_THROW(
       depthwiseCausalConvF32(input.data(), nullptr, state.data(), output.data(), kBatch, kSequence, kChannels, kKernel),
       std::invalid_argument);
@@ -245,15 +238,13 @@ TEST(Qwen35GDNConvTest, RejectsNullBuffersAndInvalidGeometry) {
       depthwiseCausalConvF32(input.data(), weight.data(), state.data(), nullptr, kBatch, kSequence, kChannels, kKernel),
       std::invalid_argument);
 
-  EXPECT_THROW(depthwiseCausalConvF32(input.data(), weight.data(), state.data(), output.data(), 0, kSequence, kChannels,
-                                      kKernel),
+  EXPECT_THROW(
+      depthwiseCausalConvF32(input.data(), weight.data(), state.data(), output.data(), 0, kSequence, kChannels, kKernel),
+      std::invalid_argument);
+  EXPECT_THROW(depthwiseCausalConvF32(input.data(), weight.data(), state.data(), output.data(), kBatch, 0, kChannels, kKernel),
                std::invalid_argument);
-  EXPECT_THROW(
-      depthwiseCausalConvF32(input.data(), weight.data(), state.data(), output.data(), kBatch, 0, kChannels, kKernel),
-      std::invalid_argument);
-  EXPECT_THROW(
-      depthwiseCausalConvF32(input.data(), weight.data(), state.data(), output.data(), kBatch, kSequence, 0, kKernel),
-      std::invalid_argument);
+  EXPECT_THROW(depthwiseCausalConvF32(input.data(), weight.data(), state.data(), output.data(), kBatch, kSequence, 0, kKernel),
+               std::invalid_argument);
   // kernel_size <= 1 leaves no history and is rejected by the frozen contract.
   EXPECT_THROW(
       depthwiseCausalConvF32(input.data(), weight.data(), state.data(), output.data(), kBatch, kSequence, kChannels, 1),
