@@ -80,7 +80,7 @@ MLLM_MAIN({
     }
     const bool benchmark_mode = benchmark_samples.isSet() || benchmark_jsonl.isSet() || benchmark_variant.isSet()
                                 || benchmark_source_sha.isSet() || prompt_file.isSet() || expected_prompt_tokens.isSet()
-                                || require_device_telemetry.isSet();
+                                || benchmark_warmup.isSet() || require_device_telemetry.isSet();
     if (prompt.isSet() && prompt_file.isSet()) { throw std::invalid_argument("prompt and prompt_file are mutually exclusive"); }
     if (prompt.isSet() && prompt.get().empty()) { throw std::invalid_argument("prompt must not be empty"); }
     if (benchmark_mode) {

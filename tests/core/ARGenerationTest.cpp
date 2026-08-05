@@ -228,6 +228,28 @@ TEST(ARGenerationPerformanceTest, RejectsNonPositiveMaxLength) {
   EXPECT_THROW((void)runChat(model, -1), std::invalid_argument);
 }
 
+TEST(ARGenerationPerformanceTest, BatchGenerateRejectsInvalidMinNewTokens) {
+  FakeGeneration model({0});
+  const auto run = [&](ARGenerationArgs args) {
+    (void)model.generate({{"sequence", makeInput(3)}}, args);
+  };
+  EXPECT_THROW(run({{"max_length", AnyValue(3)}, {"min_new_tokens", AnyValue(4)}}), std::invalid_argument);
+  EXPECT_THROW(run({{"max_length", AnyValue(3)}, {"min_new_tokens", AnyValue(-1)}}), std::invalid_argument);
+  EXPECT_THROW(run({{"max_length", AnyValue(0)}}), std::invalid_argument);
+  EXPECT_THROW(run({{"max_length", AnyValue(-1)}}), std::invalid_argument);
+}
+
+TEST(ARGenerationPerformanceTest, StreamGenerateRejectsInvalidMinNewTokens) {
+  FakeGeneration model({0});
+  const auto run = [&](ARGenerationArgs args) {
+    (void)model.streamGenerate({{"sequence", makeInput(3)}}, args, [](int64_t) {});
+  };
+  EXPECT_THROW(run({{"max_length", AnyValue(3)}, {"min_new_tokens", AnyValue(4)}}), std::invalid_argument);
+  EXPECT_THROW(run({{"max_length", AnyValue(3)}, {"min_new_tokens", AnyValue(-1)}}), std::invalid_argument);
+  EXPECT_THROW(run({{"max_length", AnyValue(0)}}), std::invalid_argument);
+  EXPECT_THROW(run({{"max_length", AnyValue(-1)}}), std::invalid_argument);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

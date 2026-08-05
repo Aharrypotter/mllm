@@ -78,6 +78,7 @@ inline nlohmann::json captureTelemetry() {
   for (const int cpu : affinity) {
     const auto base = std::filesystem::path("/sys/devices/system/cpu") / ("cpu" + std::to_string(cpu));
     const auto cpufreq = base / "cpufreq";
+    // Most kernels omit cpu0/online because CPU 0 cannot be offlined, so report it as online.
     const auto online = cpu == 0 ? std::optional<int64_t>(1) : readIntegerFile(base / "online");
     const auto cpuinfo_max = readIntegerFile(cpufreq / "cpuinfo_max_freq");
     const auto scaling_max = readIntegerFile(cpufreq / "scaling_max_freq");

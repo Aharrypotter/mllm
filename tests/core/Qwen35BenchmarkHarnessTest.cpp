@@ -3,6 +3,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 #include "benchmark_harness.hpp"
 
 namespace {
@@ -78,6 +80,8 @@ TEST(Qwen35BenchmarkHarnessTest, MacCaptureFailsClosedWhenTelemetryIsRequired) {
   const auto errors =
       mllm::examples::qwen3_5::benchmark::validateRequiredTelemetry(mllm::examples::qwen3_5::benchmark::captureTelemetry());
   EXPECT_NE(std::find(errors.begin(), errors.end(), "unsupported_telemetry_platform"), errors.end());
+#else
+  GTEST_SKIP() << "macOS-only telemetry rejection check";
 #endif
 }
 

@@ -105,8 +105,21 @@ class ARGeneration {
 
   virtual ARGenerationOutputPast forward(const ARGenerationOutputPast& input, const ARGenerationArgs& args) = 0;
 
+  // Runs autoregressive generation over `input`, honoring the ARGenerationArgs
+  // contract. Supported keys include:
+  //   - "max_length": maximum total new tokens (must be positive);
+  //   - "min_new_tokens": minimum number of new tokens to generate. Valid
+  //     bounds are 0 <= min_new_tokens <= max_length, enforced with
+  //     std::invalid_argument. Before min_new_tokens is reached the EOS logit
+  //     is suppressed and EOS does not terminate generation; afterwards EOS
+  //     terminates as usual. Default 0 preserves legacy behavior.
+  // Throws std::invalid_argument when max_length <= 0 or min_new_tokens is out
+  // of [0, max_length].
   virtual ARGenerationOutputPast generate(const ARGenerationOutputPast& input, const ARGenerationArgs& args);
 
+  // Streaming variant of generate: each newly generated token is passed to
+  // `callback`. The same min_new_tokens/max_length contract and validation
+  // apply as in generate.
   virtual void streamGenerate(const ARGenerationOutputPast& input, const ARGenerationArgs& args,
                               const std::function<void(int64_t)>& callback);
 
@@ -125,6 +138,9 @@ class ARGeneration {
 
   int64_t sampleTopP(Tensor& logits, float p, float temperature);
 
+  // Iterator-based generation context. Stepping the returned context generates
+  // one token per step under the same ARGenerationArgs contract documented for
+  // generate, including min_new_tokens validation and EOS suppression.
   ARGenerationChatContext chat(const ARGenerationOutputPast& input, const ARGenerationArgs& args = {});
 
   int64_t categoricalSample(const Tensor& probs);
