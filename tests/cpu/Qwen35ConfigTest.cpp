@@ -5,6 +5,7 @@
 
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #include "mllm/models/qwen3_5/configuration_qwen3_5.hpp"
 
@@ -19,17 +20,25 @@ auto loadConfig(const std::string& model_size) -> mllm::models::qwen3_5::Qwen3_5
   return mllm::models::qwen3_5::Qwen3_5Config(exampleDir() + "/config_" + model_size + "_w4a32_kai.json");
 }
 
+auto loadMultimodalConfig() -> mllm::models::qwen3_5::Qwen3_5Config {
+  return mllm::models::qwen3_5::Qwen3_5Config(exampleDir() + "/config_0.8B_multimodal_w4a32_kai.json");
+}
+
 constexpr auto kKaiLinearImpl =
     mllm::aops::LinearImplTypes::kKaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_qai8dxp1x8_qsi4c32p8x8_1x8x32;
+
+void pushDescriptor(const mllm::ParameterFile::ptr_t& parameter_file, const std::string& name,
+                    const std::vector<int32_t>& shape, mllm::DataTypes dtype = mllm::kFloat32) {
+  auto tensor = mllm::Tensor::empty(shape, dtype, mllm::kCPU);
+  tensor.impl()->storage()->mem_type_ = mllm::kManual;
+  parameter_file->push(name, tensor);
+}
 
 auto parameterFileWithEmbedding(mllm::ModelFileVersion version, const std::vector<int32_t>& shape,
                                 mllm::DataTypes dtype = mllm::kFloat32) -> mllm::ParameterFile::ptr_t {
   auto parameter_file = mllm::ParameterFile::create(version);
-  // Tensor::empty creates only a descriptor here; the test does not allocate
-  // storage for the official embedding dimensions.
-  auto embedding = mllm::Tensor::empty(shape, dtype, mllm::kCPU);
-  embedding.impl()->storage()->mem_type_ = mllm::kManual;
-  parameter_file->push("model.language_model.embed_tokens.weight", embedding);
+  // These tests validate descriptors without allocating official-size weights.
+  pushDescriptor(parameter_file, "model.language_model.embed_tokens.weight", shape, dtype);
   return parameter_file;
 }
 
@@ -77,6 +86,26 @@ TEST(Qwen35ConfigTest, Official4BConfigBuildsGroupedHeadHybridSchedule) {
   }
 }
 
+TEST(Qwen35ConfigTest, Official08BMultimodalConfigBuildsVisionContract) {
+  const auto config = loadMultimodalConfig();
+
+  EXPECT_EQ(mllm::models::qwen3_5::modelNameForConfig(config), "Qwen3.5-0.8B Multimodal");
+  EXPECT_TRUE(mllm::models::qwen3_5::isOfficialQwen35_08BMultimodalRuntimeConfig(config));
+  EXPECT_TRUE(config.vision_enabled);
+  EXPECT_EQ(config.vision_depth, 12);
+  EXPECT_EQ(config.vision_hidden_size, 768);
+  EXPECT_EQ(config.vision_intermediate_size, 3072);
+  EXPECT_EQ(config.vision_num_heads, 12);
+  EXPECT_EQ(config.vision_num_position_embeddings, 2304);
+  EXPECT_EQ(config.vision_patch_size, 16);
+  EXPECT_EQ(config.vision_temporal_patch_size, 2);
+  EXPECT_EQ(config.vision_spatial_merge_size, 2);
+  EXPECT_EQ(config.vision_out_hidden_size, config.hidden_size);
+  EXPECT_EQ(config.mrope_section, (std::vector<int32_t>{11, 11, 10}));
+  EXPECT_EQ(config.image_min_pixels, 256 * 256);
+  EXPECT_EQ(config.image_max_pixels, 512 * 512);
+}
+
 TEST(Qwen35ConfigTest, RejectsModelConfigEmbeddingMismatchWithoutAllocatingWeights) {
   const auto config = loadConfig("0.8B");
   const auto expected_numel =
@@ -102,6 +131,22 @@ TEST(Qwen35ConfigTest, RejectsModelConfigEmbeddingMismatchWithoutAllocatingWeigh
   const auto mismatched_dtype =
       parameterFileWithEmbedding(mllm::ModelFileVersion::kV2, {config.vocab_size, config.hidden_size}, mllm::kFloat16);
   EXPECT_THROW(mllm::models::qwen3_5::validateModelConfigMatch(config, mismatched_dtype), std::invalid_argument);
+}
+
+TEST(Qwen35ConfigTest, MultimodalConfigRequiresMatchingV2VisionDescriptors) {
+  const auto config = loadMultimodalConfig();
+  auto parameter_file = parameterFileWithEmbedding(mllm::ModelFileVersion::kV2, {config.vocab_size, config.hidden_size});
+
+  EXPECT_THROW(mllm::models::qwen3_5::validateModelConfigMatch(config, parameter_file), std::invalid_argument);
+  pushDescriptor(parameter_file, "model.visual.patch_embed.proj.weight",
+                 {config.vision_hidden_size, config.vision_in_channels, config.vision_temporal_patch_size,
+                  config.vision_patch_size, config.vision_patch_size});
+  pushDescriptor(parameter_file, "model.visual.pos_embed.weight",
+                 {config.vision_num_position_embeddings, config.vision_hidden_size});
+  EXPECT_NO_THROW(mllm::models::qwen3_5::validateModelConfigMatch(config, parameter_file));
+
+  const auto v1 = parameterFileWithEmbedding(mllm::ModelFileVersion::kV1, {config.vocab_size * config.hidden_size});
+  EXPECT_THROW(mllm::models::qwen3_5::validateModelConfigMatch(config, v1), std::invalid_argument);
 }
 
 TEST(Qwen35ConfigTest, RejectsNonOfficialRuntimeContractWithMatchingEmbedding) {

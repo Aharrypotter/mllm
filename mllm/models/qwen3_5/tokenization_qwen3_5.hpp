@@ -6,11 +6,14 @@
 #include <cwctype>
 #include <stdexcept>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
 #include "mllm/preprocessor/tokenizers/BPE.hpp"
 #include "mllm/models/ARGeneration.hpp"
+#include "mllm/models/qwen3_5/image_preprocessor_qwen3_5.hpp"
+#include "mllm/models/qwen3_5/multimodal_qwen3_5.hpp"
 #include "mllm/preprocessor/tokenizers/Unicode.hpp"
 #include "mllm/preprocessor/tokenizers/AutoTokenizer.hpp"
 
@@ -241,13 +244,22 @@ inline bool qwen3_5Regex(const std::string& str, std::vector<std::wstring>& spli
 
 struct Qwen3_5Message {
   std::string prompt;
+  std::string image_path;
   static inline std::string message_template =
       "<|im_start|>user\n{{{prompt}}}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+  static inline std::string image_message_template =
+      "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{{{prompt}}}<|im_end|>\n"
+      "<|im_start|>assistant\n<think>\n\n</think>\n\n";
 };
 
 class Qwen3_5Tokenizer final : public mllm::preprocessor::AutoTokenizer {
  public:
-  explicit Qwen3_5Tokenizer(const std::string& file_path) {
+  explicit Qwen3_5Tokenizer(const std::string& file_path, int32_t image_min_pixels = 256 * 256,
+                            int32_t image_max_pixels = 512 * 512, int32_t vision_patch_size = 16,
+                            int32_t vision_temporal_patch_size = 2, int32_t vision_spatial_merge_size = 2)
+      : image_preprocessor_(image_min_pixels, image_max_pixels, vision_patch_size, vision_temporal_patch_size,
+                            vision_spatial_merge_size),
+        vision_spatial_merge_size_(vision_spatial_merge_size) {
     preprocessor::initLocal();
     preprocessor::makeBytes2UnicodeMap(bytes_2_unicode_dict_);
     for (auto& kv : bytes_2_unicode_dict_) { bytes_2_unicode_dict_inverse_.insert({kv.second, kv.first}); }
@@ -343,7 +355,18 @@ class Qwen3_5Tokenizer final : public mllm::preprocessor::AutoTokenizer {
   }
 
   ARGenerationOutputPast convertMessage(const Qwen3_5Message& message) {
-    auto applied_string = Qwen3_5Message::message_template;
+    if (message.prompt.empty()) { throw std::invalid_argument("Qwen3.5 prompt must not be empty"); }
+    static constexpr std::string_view kReservedMarkers[] = {
+        "<|vision_start|>", "<|vision_end|>", "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>",
+    };
+    for (const auto marker : kReservedMarkers) {
+      if (message.prompt.find(marker) != std::string::npos) {
+        throw std::invalid_argument("Qwen3.5 prompt must not inject reserved multimodal markers");
+      }
+    }
+
+    const bool has_image = !message.image_path.empty();
+    auto applied_string = has_image ? Qwen3_5Message::image_message_template : Qwen3_5Message::message_template;
     static constexpr char kPromptPlaceholder[] = "{{{prompt}}}";
     size_t pos = applied_string.find(kPromptPlaceholder);
     if (pos == std::string::npos) { throw std::runtime_error("Qwen3.5 message template is missing the prompt placeholder"); }
@@ -354,19 +377,40 @@ class Qwen3_5Tokenizer final : public mllm::preprocessor::AutoTokenizer {
     ids.reserve(sequence_str.size());
     for (const auto& str : sequence_str) { ids.emplace_back(bpe_._lookup_vocab(str)); }
 
-    Tensor sequence = Tensor::empty({/*batch*/ 1, /*seq*/ (int32_t)ids.size()}, kInt64, kCPU)
+    Tensor pixel_values = Tensor::nil();
+    Tensor image_grid_thw = Tensor::nil();
+    std::vector<int32_t> token_types;
+    if (has_image) {
+      std::tie(pixel_values, image_grid_thw) = image_preprocessor_(message.image_path);
+      const auto* grid = image_grid_thw.ptr<int32_t>();
+      const int32_t image_token_count = grid[0] * grid[1] * grid[2] / (vision_spatial_merge_size_ * vision_spatial_merge_size_);
+      const int64_t image_token_id = bpe_._lookup_vocab(L"<|image_pad|>");
+      std::tie(ids, token_types) = expandQwen3_5SingleImagePlaceholders(ids, image_token_id, image_token_count);
+    }
+
+    Tensor sequence = Tensor::empty({/*batch*/ 1, /*seq*/ static_cast<int32_t>(ids.size())}, kInt64, kCPU)
                           .setMemType(kNormal)
                           .setName("qwen3_5-tokenizer-i0")
                           .alloc();
     auto ptr = sequence.ptr<int64_t>();
     for (size_t i = 0; i < ids.size(); ++i) { ptr[i] = ids[i]; }
 
+    if (!has_image) { return {{"sequence", sequence}}; }
+
+    auto mm_token_type_ids =
+        Tensor::empty({1, static_cast<int32_t>(token_types.size())}, kInt32, kCPU).setMemType(kNormal).alloc();
+    std::copy(token_types.begin(), token_types.end(), mm_token_type_ids.ptr<int32_t>());
     return {
         {"sequence", sequence},
+        {"pixel_values", pixel_values},
+        {"image_grid_thw", image_grid_thw},
+        {"mm_token_type_ids", mm_token_type_ids},
     };
   }
 
  private:
+  Qwen3_5ImagePreprocessor image_preprocessor_;
+  int32_t vision_spatial_merge_size_ = 2;
   preprocessor::BPE bpe_;
   std::unordered_map<std::wint_t, wchar_t> bytes_2_unicode_dict_;
   std::unordered_map<wchar_t, std::wint_t> bytes_2_unicode_dict_inverse_;

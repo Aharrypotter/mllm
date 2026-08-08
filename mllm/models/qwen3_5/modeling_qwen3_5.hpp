@@ -18,6 +18,8 @@
 #include "mllm/nn/Functional.hpp"
 #include "mllm/nn/lmcache/StaticCache.hpp"
 #include "mllm/models/qwen3_5/configuration_qwen3_5.hpp"
+#include "mllm/models/qwen3_5/modeling_qwen3_5_vision.hpp"
+#include "mllm/models/qwen3_5/multimodal_qwen3_5.hpp"
 #include "mllm/backends/cpu/kernels/common/gdn/gated_delta_net.hpp"
 #include "mllm/utils/Enumerate.hpp"
 #include "mllm/models/ARGeneration.hpp"
@@ -35,8 +37,8 @@ inline auto makeRoPEInvFreq(int output_dim, float rope_theta) -> Tensor {
   return inv_freq;
 }
 
-inline auto makeRotaryPosEmbedding(Tensor& position_ids, const Tensor& inv_freq,
-                                   float attention_scaling = 1.0f) -> std::pair<Tensor, Tensor> {
+inline auto makeRotaryPosEmbedding(Tensor& position_ids, const Tensor& inv_freq, float attention_scaling = 1.0f)
+    -> std::pair<Tensor, Tensor> {
   auto batch_size = position_ids.shape()[0];
   auto seq_len = position_ids.shape()[1];
   auto inv_freq_len = inv_freq.shape()[0];
@@ -327,6 +329,7 @@ class Qwen3_5GDNLayer final : public nn::Module {
   }
 
   void resetState(int batch_size) {
+    if (batch_size <= 0) { throw std::invalid_argument("Qwen3.5 GDN reset batch size must be positive"); }
     int conv_dim = key_dim_ * 2 + value_dim_;
     recurrent_state_ = Tensor::empty({batch_size, num_v_heads_, head_v_dim_, head_k_dim_}, kFloat32, kCPU).alloc();
     conv_state_ = Tensor::empty({batch_size, conv_dim, conv_kernel_size_ - 1}, kFloat32, kCPU).alloc();
@@ -509,10 +512,22 @@ class Qwen3_5Text final : public nn::Module {
     for (auto& gdn : gdn_layers_) { gdn.linear_attn_.resetState(batch_size); }
   }
 
+  Tensor embed(Tensor input_ids) { return embedding_(input_ids); }
+
+  std::vector<Tensor> forwardEmbeddings(Tensor x, Tensor llm_embedding_sin, Tensor llm_embedding_cos,
+                                        const AnyValue& kv_cache) {
+    std::vector<AnyValue> args = {kv_cache};
+    return forwardEmbeddingsImpl(x, llm_embedding_sin, llm_embedding_cos, args);
+  }
+
   std::vector<Tensor> forward(const std::vector<Tensor>& inputs, const std::vector<AnyValue>& args) override {
     auto x = embedding_(inputs[0]);
-    auto llm_embedding_sin = inputs[1];
-    auto llm_embedding_cos = inputs[2];
+    return forwardEmbeddingsImpl(x, inputs[1], inputs[2], args);
+  }
+
+ private:
+  std::vector<Tensor> forwardEmbeddingsImpl(Tensor x, Tensor llm_embedding_sin, Tensor llm_embedding_cos,
+                                            const std::vector<AnyValue>& args) {
     auto& kv_cache = args[0];
 
     for (size_t i = 0; i < layer_type_.size(); ++i) {
@@ -534,15 +549,27 @@ class Qwen3_5Text final : public nn::Module {
 
 class Qwen3_5Model final : public nn::Module {
   Qwen3_5Text language_model_;
+  Qwen3_5VisionModel visual_;
+  bool vision_enabled_ = false;
 
  public:
   Qwen3_5Model() = default;
 
   Qwen3_5Model(const std::string& name, const Qwen3_5Config& cfg) : nn::Module(name) {
     language_model_ = reg<Qwen3_5Text>("language_model", cfg);
+    vision_enabled_ = cfg.vision_enabled;
+    if (vision_enabled_) { visual_ = reg<Qwen3_5VisionModel>("visual", cfg); }
   }
 
   void resetGDNStates(int batch_size) { language_model_.resetGDNStates(batch_size); }
+  Tensor embed(Tensor input_ids) { return language_model_.embed(input_ids); }
+  Tensor encodeImage(Tensor pixel_values, Tensor image_grid_thw) {
+    if (!vision_enabled_) { throw std::invalid_argument("Qwen3.5 model was built without a vision tower"); }
+    return visual_(pixel_values, image_grid_thw)[0];
+  }
+  Tensor forwardEmbeddings(Tensor embeddings, Tensor sin, Tensor cos, const AnyValue& kv_cache) {
+    return language_model_.forwardEmbeddings(embeddings, sin, cos, kv_cache)[0];
+  }
 
   std::vector<Tensor> forward(const std::vector<Tensor>& inputs, const std::vector<AnyValue>& args) override {
     return language_model_(inputs[0], inputs[1], inputs[2], args[0]);
@@ -568,6 +595,11 @@ class Qwen3_5ForCausalLM : public ARGeneration, public nn::Module {
     // RoPE inv_freq uses rotary_dim (partial_rotary_factor * head_dim)
     auto inv = makeRoPEInvFreq(cfg.rotary_dim(), cfg.rope_theta);
     registerBuffer("inv_freq", inv);
+    vision_enabled_ = cfg.vision_enabled;
+    image_token_id_ = cfg.image_token_id;
+    video_token_id_ = cfg.video_token_id;
+    vision_spatial_merge_size_ = cfg.vision_spatial_merge_size;
+    mrope_section_ = cfg.mrope_section;
   }
 
   ARGenerationOutputPast forward(const ARGenerationOutputPast& input, const ARGenerationArgs& args) override {
@@ -586,14 +618,24 @@ class Qwen3_5ForCausalLM : public ARGeneration, public nn::Module {
       }
     }
 
+    const bool has_pixel_values = input.count("pixel_values") != 0;
+    const bool has_image_grid = input.count("image_grid_thw") != 0;
+    const bool has_token_types = input.count("mm_token_type_ids") != 0;
+    if (has_pixel_values != has_image_grid || has_pixel_values != has_token_types) {
+      throw std::invalid_argument(
+          "Qwen3.5 image prefill requires pixel_values, image_grid_thw, and mm_token_type_ids together");
+    }
+    if (has_pixel_values && !vision_enabled_) {
+      throw std::invalid_argument("Qwen3.5 image input requires a multimodal config with vision_config");
+    }
+
     Tensor position_ids = Tensor::nil();
     if (input.count("position_ids")) {
       position_ids = input.at("position_ids");
-      if (seq_len == 1) {
-        auto last_pos = *position_ids.offsettedPtr<int64_t>({0, position_ids.shape()[1] - 1});
-        position_ids = Tensor::empty({batch_size, 1}, kInt64, kCPU).alloc();
-        *position_ids.offsettedPtr<int64_t>({0, 0}) = last_pos + 1;
-      }
+      if (seq_len == 1) { position_ids = advanceQwen3_5PositionIds(position_ids); }
+    } else if (has_pixel_values) {
+      position_ids = makeQwen3_5SingleImagePositionIds(input.at("mm_token_type_ids"), input.at("image_grid_thw"),
+                                                       vision_spatial_merge_size_);
     } else {
       position_ids = Tensor::empty({batch_size, seq_len}, kInt64, kCPU).alloc();
       auto position_ids_ptr = position_ids.ptr<int64_t>();
@@ -602,9 +644,48 @@ class Qwen3_5ForCausalLM : public ARGeneration, public nn::Module {
       }
     }
 
-    auto [llm_embedding_sin, llm_embedding_cos] = makeRotaryPosEmbedding(position_ids, getBuffer("inv_freq"), 1.0f);
+    std::pair<Tensor, Tensor> rotary_embeddings;
+    if (position_ids.shape().size() == 3) {
+      rotary_embeddings = makeQwen3_5InterleavedRotaryEmbedding(position_ids, getBuffer("inv_freq"), mrope_section_, 1.0F);
+    } else {
+      rotary_embeddings = makeRotaryPosEmbedding(position_ids, getBuffer("inv_freq"), 1.0F);
+    }
+    auto& [llm_embedding_sin, llm_embedding_cos] = rotary_embeddings;
 
-    sequence = llm(sequence, llm_embedding_sin, llm_embedding_cos, AnyValue(&kv_cache_))[0];
+    if (has_pixel_values) {
+      auto token_types = input.at("mm_token_type_ids");
+      if (token_types.shape() != sequence.shape() || token_types.dtype() != kInt32 || token_types.device() != kCPU) {
+        throw std::invalid_argument("Qwen3.5 mm_token_type_ids must match the input sequence");
+      }
+      const auto* input_ids = sequence.ptr<int64_t>();
+      const auto* types = token_types.ptr<int32_t>();
+      int32_t image_begin = -1;
+      int32_t image_count = 0;
+      for (int32_t s = 0; s < seq_len; ++s) {
+        if (input_ids[s] == video_token_id_ || types[s] == 2) {
+          throw std::invalid_argument("Qwen3.5 CPU single-image support does not accept video tokens");
+        }
+        if ((input_ids[s] == image_token_id_) != (types[s] == 1)) {
+          throw std::invalid_argument("Qwen3.5 image token IDs and modality token types disagree");
+        }
+        if (types[s] == 1) {
+          if (image_begin < 0) image_begin = s;
+          ++image_count;
+        }
+      }
+
+      auto input_embeddings = llm.embed(sequence);
+      auto image_embeddings = llm.encodeImage(input.at("pixel_values"), input.at("image_grid_thw"));
+      if (image_begin < 0 || image_embeddings.shape().size() != 2 || image_embeddings.shape()[0] != image_count
+          || input_embeddings.shape().size() != 3 || image_embeddings.shape()[1] != input_embeddings.shape()[2]
+          || image_embeddings.dtype() != input_embeddings.dtype()) {
+        throw std::invalid_argument("Qwen3.5 image features and image placeholders do not match");
+      }
+      image_embeddings.copy2(input_embeddings[{kAll, {image_begin, image_begin + image_count}, kAll}]);
+      sequence = llm.forwardEmbeddings(input_embeddings, llm_embedding_sin, llm_embedding_cos, AnyValue(&kv_cache_));
+    } else {
+      sequence = llm(sequence, llm_embedding_sin, llm_embedding_cos, AnyValue(&kv_cache_))[0];
+    }
 
     {
       auto S = sequence.shape()[1];
@@ -630,6 +711,11 @@ class Qwen3_5ForCausalLM : public ARGeneration, public nn::Module {
   Qwen3_5Model llm;
   nn::Linear lm_head_;
   nn::StaticCache kv_cache_;
+  bool vision_enabled_ = false;
+  int64_t image_token_id_ = 248056;
+  int64_t video_token_id_ = 248057;
+  int32_t vision_spatial_merge_size_ = 2;
+  std::vector<int32_t> mrope_section_ = {11, 11, 10};
 };
 
 }  // namespace mllm::models::qwen3_5

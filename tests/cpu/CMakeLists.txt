@@ -29,3 +29,7 @@ target_link_libraries(Mllm-Test-CPUContiguousOp PRIVATE gtest_main MllmRT MllmCP
 target_include_directories(Mllm-Test-CPUContiguousOp PRIVATE ${MLLM_INCLUDE_DIR})
 
 include(GoogleTest)
+
+add_executable(Mllm-Test-Qwen35-Multimodal Qwen35MultimodalTest.cpp)
+target_link_libraries(Mllm-Test-Qwen35-Multimodal PRIVATE gtest_main MllmCPUBackend)
+target_include_directories(Mllm-Test-Qwen35-Multimodal PRIVATE ${MLLM_INCLUDE_DIR})

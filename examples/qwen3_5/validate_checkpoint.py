@@ -1,7 +1,7 @@
 # Copyright (c) MLLM Team.
 # Licensed under the MIT License.
 
-"""Validate a Qwen3.5 text checkpoint and its mobile quantization recipe."""
+"""Validate a Qwen3.5 checkpoint selection and its mobile quantization recipe."""
 
 from __future__ import annotations
 
@@ -98,6 +98,34 @@ KAI_LINEAR_IMPL_TYPE = (
     "KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_" "qai8dxp1x8_qsi4c32p8x8_1x8x32"
 )
 TIED_EMBEDDING_WEIGHT = "model.language_model.embed_tokens.weight"
+OFFICIAL_08B_VISION_CONTRACT = {
+    "deepstack_visual_indexes": [],
+    "depth": 12,
+    "hidden_act": "gelu_pytorch_tanh",
+    "hidden_size": 768,
+    "in_channels": 3,
+    "intermediate_size": 3072,
+    "num_heads": 12,
+    "num_position_embeddings": 2304,
+    "out_hidden_size": 1024,
+    "patch_size": 16,
+    "spatial_merge_size": 2,
+    "temporal_patch_size": 2,
+}
+MULTIMODAL_TOKEN_CONTRACT = {
+    "image_token_id": 248056,
+    "video_token_id": 248057,
+    "vision_start_token_id": 248053,
+    "vision_end_token_id": 248054,
+}
+
+
+def _vision_contract_mismatches(vision_config: dict) -> list[str]:
+    return [
+        f"{field}={vision_config.get(field)!r} (expected {expected!r})"
+        for field, expected in OFFICIAL_08B_VISION_CONTRACT.items()
+        if vision_config.get(field) != expected
+    ]
 
 
 def _expected_layer_types(num_hidden_layers: int, interval: int) -> list[str]:
@@ -288,7 +316,10 @@ def _expected_kai_linear_names(source_names: set[str]) -> set[str]:
         r"model\.language_model\.embed_tokens\.weight|"
         r".*\.mlp\.(?:gate_proj|up_proj|down_proj)\.weight|"
         r".*\.self_attn\.(?:q_proj|k_proj|v_proj|o_proj)\.weight|"
-        r".*\.linear_attn\.(?:in_proj_qkv|in_proj_z|in_proj_a|in_proj_b|out_proj)\.weight"
+        r".*\.linear_attn\.(?:in_proj_qkv|in_proj_z|in_proj_a|in_proj_b|out_proj)\.weight|"
+        r"model\.visual\.(?:"
+        r"blocks\.\d+\.(?:attn\.(?:qkv|proj)|mlp\.linear_fc[12])|"
+        r"merger\.linear_fc[12])\.(?:bias|weight)"
         r")"
     )
     return {name for name in source_names if kai_linear_pattern.fullmatch(name)}
@@ -308,6 +339,7 @@ def validate_kai_recipe_contract(
     text_config: dict,
     quant_config: dict,
     runtime_config: dict,
+    vision_config: dict | None = None,
 ) -> tuple[set[str], dict[str, int]]:
     """Validate that a quantization recipe matches the configured KAI runtime."""
 
@@ -333,7 +365,37 @@ def validate_kai_recipe_contract(
             f"{linear_impl_type!r} != {KAI_LINEAR_IMPL_TYPE!r}"
         )
 
+    include_vision = any("visual" in pattern for pattern in quant_config)
+    runtime_vision_config = runtime_config.get("vision_config")
+    if include_vision != isinstance(runtime_vision_config, dict):
+        raise AssertionError(
+            "KAI recipe and runtime config must either both include vision or both be text-only"
+        )
+    if include_vision:
+        if checkpoint_size != "0.8B":
+            raise AssertionError(
+                "Qwen3.5 multimodal conversion currently supports only 0.8B"
+            )
+        if not isinstance(vision_config, dict):
+            raise AssertionError(
+                "Multimodal KAI validation requires checkpoint vision_config"
+            )
+        checkpoint_vision_mismatches = _vision_contract_mismatches(vision_config)
+        if checkpoint_vision_mismatches:
+            raise AssertionError(
+                "Checkpoint vision_config does not match official Qwen3.5-0.8B: "
+                + "; ".join(checkpoint_vision_mismatches)
+            )
+        runtime_vision_mismatches = _vision_contract_mismatches(runtime_vision_config)
+        if runtime_vision_mismatches:
+            raise AssertionError(
+                "Runtime vision_config does not match official Qwen3.5-0.8B: "
+                + "; ".join(runtime_vision_mismatches)
+            )
+
     source_shapes = expected_text_shapes(text_config)
+    if include_vision:
+        source_shapes.update(expected_vision_shapes(vision_config))
     source_names = set(source_shapes)
     quantized_names: set[str] = set()
     pattern_counts: dict[str, int] = {}
@@ -364,11 +426,21 @@ def validate_kai_recipe_contract(
             raise AssertionError(
                 f"Quantization pattern overlap for {pattern}: {sorted(overlap)}"
             )
+        configured_shape = hints.get("shape")
         for name in matched_names:
-            if hints.get("shape") != source_shapes[name]:
+            expected_shape = source_shapes[name]
+            if name.endswith(".bias"):
+                shape_matches = (
+                    isinstance(configured_shape, list)
+                    and len(configured_shape) == 2
+                    and [configured_shape[0]] == expected_shape
+                )
+            else:
+                shape_matches = configured_shape == expected_shape
+            if not shape_matches:
                 raise AssertionError(
                     f"{pattern} matched {name}: config shape "
-                    f"{hints.get('shape')}, expected shape {source_shapes[name]}"
+                    f"{configured_shape}, expected source shape {expected_shape}"
                 )
 
         if TIED_EMBEDDING_WEIGHT in matched_names:
@@ -398,6 +470,105 @@ def validate_kai_recipe_contract(
             f"missing_linears={missing}, unexpected_parameters={unexpected}"
         )
     return quantized_names, pattern_counts
+
+
+def expected_vision_shapes(vision_config: dict) -> dict[str, list[int]]:
+    hidden_size = vision_config["hidden_size"]
+    intermediate_size = vision_config["intermediate_size"]
+    out_hidden_size = vision_config["out_hidden_size"]
+    patch_size = vision_config["patch_size"]
+    temporal_patch_size = vision_config["temporal_patch_size"]
+    merge_size = vision_config["spatial_merge_size"]
+
+    expected = {
+        "model.visual.patch_embed.proj.weight": [
+            hidden_size,
+            vision_config["in_channels"],
+            temporal_patch_size,
+            patch_size,
+            patch_size,
+        ],
+        "model.visual.patch_embed.proj.bias": [hidden_size],
+        "model.visual.pos_embed.weight": [
+            vision_config["num_position_embeddings"],
+            hidden_size,
+        ],
+        "model.visual.merger.norm.weight": [hidden_size],
+        "model.visual.merger.norm.bias": [hidden_size],
+        "model.visual.merger.linear_fc1.weight": [
+            hidden_size * merge_size * merge_size,
+            hidden_size * merge_size * merge_size,
+        ],
+        "model.visual.merger.linear_fc1.bias": [hidden_size * merge_size * merge_size],
+        "model.visual.merger.linear_fc2.weight": [
+            out_hidden_size,
+            hidden_size * merge_size * merge_size,
+        ],
+        "model.visual.merger.linear_fc2.bias": [out_hidden_size],
+    }
+    for layer_index in range(vision_config["depth"]):
+        prefix = f"model.visual.blocks.{layer_index}"
+        expected.update(
+            {
+                f"{prefix}.norm1.weight": [hidden_size],
+                f"{prefix}.norm1.bias": [hidden_size],
+                f"{prefix}.norm2.weight": [hidden_size],
+                f"{prefix}.norm2.bias": [hidden_size],
+                f"{prefix}.attn.qkv.weight": [hidden_size * 3, hidden_size],
+                f"{prefix}.attn.qkv.bias": [hidden_size * 3],
+                f"{prefix}.attn.proj.weight": [hidden_size, hidden_size],
+                f"{prefix}.attn.proj.bias": [hidden_size],
+                f"{prefix}.mlp.linear_fc1.weight": [
+                    intermediate_size,
+                    hidden_size,
+                ],
+                f"{prefix}.mlp.linear_fc1.bias": [intermediate_size],
+                f"{prefix}.mlp.linear_fc2.weight": [
+                    hidden_size,
+                    intermediate_size,
+                ],
+                f"{prefix}.mlp.linear_fc2.bias": [hidden_size],
+            }
+        )
+    return expected
+
+
+def validate_multimodal_config_contract(
+    checkpoint_config: dict, runtime_config: dict
+) -> None:
+    """Validate the official 0.8B single-image checkpoint/runtime boundary."""
+
+    for field, expected in MULTIMODAL_TOKEN_CONTRACT.items():
+        if checkpoint_config.get(field) != expected:
+            raise AssertionError(
+                f"Checkpoint {field}={checkpoint_config.get(field)!r}, expected {expected}"
+            )
+        if runtime_config.get(field) != expected:
+            raise AssertionError(
+                f"Runtime {field}={runtime_config.get(field)!r}, expected {expected}"
+            )
+    checkpoint_vision_config = checkpoint_config.get("vision_config")
+    if not isinstance(checkpoint_vision_config, dict):
+        raise AssertionError("Checkpoint must declare vision_config")
+    checkpoint_vision_mismatches = _vision_contract_mismatches(checkpoint_vision_config)
+    if checkpoint_vision_mismatches:
+        raise AssertionError(
+            "Checkpoint vision_config does not match official Qwen3.5-0.8B: "
+            + "; ".join(checkpoint_vision_mismatches)
+        )
+    runtime_vision_config = runtime_config.get("vision_config")
+    if not isinstance(runtime_vision_config, dict):
+        raise AssertionError("Runtime must declare vision_config")
+    runtime_vision_mismatches = _vision_contract_mismatches(runtime_vision_config)
+    if runtime_vision_mismatches:
+        raise AssertionError(
+            "Runtime vision_config does not match official Qwen3.5-0.8B: "
+            + "; ".join(runtime_vision_mismatches)
+        )
+    if runtime_config.get("image_min_pixels") != 256 * 256:
+        raise AssertionError("Runtime image_min_pixels must be 256*256")
+    if runtime_config.get("image_max_pixels") != 512 * 512:
+        raise AssertionError("Runtime image_max_pixels must be 512*512")
 
 
 def main() -> None:
@@ -445,25 +616,36 @@ def main() -> None:
     with runtime_config_path.open() as runtime_config_file:
         runtime_config = json.load(runtime_config_file)
 
+    include_vision = any("visual" in pattern for pattern in quant_config)
+    if include_vision:
+        validate_multimodal_config_contract(config, runtime_config)
     expected_shapes = expected_text_shapes(text_config)
+    if include_vision:
+        expected_shapes.update(expected_vision_shapes(config["vision_config"]))
     quantized_names, pattern_counts = validate_kai_recipe_contract(
         text_config,
         quant_config,
         runtime_config,
+        config.get("vision_config"),
     )
     weight_map = index["weight_map"]
     actual_text_keys = {
         name for name in weight_map if name.startswith("model.language_model.")
     }
-    expected_text_keys = set(expected_shapes)
-    missing = sorted(expected_text_keys - actual_text_keys)
-    extra = sorted(actual_text_keys - expected_text_keys)
+    actual_selected_keys = set(actual_text_keys)
+    if include_vision:
+        actual_selected_keys.update(
+            name for name in weight_map if name.startswith("model.visual.")
+        )
+    expected_selected_keys = set(expected_shapes)
+    missing = sorted(expected_selected_keys - actual_selected_keys)
+    extra = sorted(actual_selected_keys - expected_selected_keys)
     if missing or extra:
         raise AssertionError(
-            f"Text weight-name mismatch: missing={missing}, extra={extra}"
+            f"Selected weight-name mismatch: missing={missing}, extra={extra}"
         )
 
-    shard_names = sorted({weight_map[name] for name in actual_text_keys})
+    shard_names = sorted({weight_map[name] for name in actual_selected_keys})
     dtype_counts: Counter[str] = Counter()
     with ExitStack() as stack:
         shards = {
@@ -489,17 +671,20 @@ def main() -> None:
         for pattern, entry in quant_config.items():
             regex = re.compile(pattern)
             matched_names = sorted(
-                name for name in actual_text_keys if regex.fullmatch(name)
+                name for name in actual_selected_keys if regex.fullmatch(name)
             )
             expected_shape = entry["hints"]["shape"]
             for name in matched_names:
                 actual_shape = list(
                     shards[weight_map[name]].get_slice(name).get_shape()
                 )
-                if actual_shape != expected_shape:
+                shape_for_entry = (
+                    expected_shape if name.endswith(".weight") else [expected_shape[0]]
+                )
+                if actual_shape != shape_for_entry:
                     raise AssertionError(
                         f"{pattern} matched {name}: config shape "
-                        f"{expected_shape}, checkpoint shape {actual_shape}"
+                        f"{shape_for_entry}, checkpoint shape {actual_shape}"
                     )
 
     summary = {
@@ -509,6 +694,8 @@ def main() -> None:
         "runtime_config": str(runtime_config_path),
         "linear_impl_type": resolve_runtime_linear_impl_type(runtime_config),
         "text_parameters": len(actual_text_keys),
+        "selected_parameters": len(actual_selected_keys),
+        "includes_vision": include_vision,
         "full_attention_layers": text_config["layer_types"].count("full_attention"),
         "linear_attention_layers": text_config["layer_types"].count("linear_attention"),
         "quantized_parameters": len(quantized_names),
@@ -516,7 +703,15 @@ def main() -> None:
         "pattern_counts": pattern_counts,
     }
 
-    expected_quantized_names = _expected_kai_linear_names(actual_text_keys)
+    expected_quantized_names = _expected_kai_linear_names(actual_selected_keys)
+    missing_quantized_linears = sorted(expected_quantized_names - quantized_names)
+    unexpected_quantized_parameters = sorted(quantized_names - expected_quantized_names)
+    if missing_quantized_linears or unexpected_quantized_parameters:
+        raise AssertionError(
+            "KAI quantization coverage mismatch: "
+            f"missing_linears={missing_quantized_linears}, "
+            f"unexpected_parameters={unexpected_quantized_parameters}"
+        )
     summary["expected_kai_linear_parameters"] = len(expected_quantized_names)
     print(json.dumps(summary, indent=2, sort_keys=True))
     print("QWEN35_CHECKPOINT_AUDIT_OK")
