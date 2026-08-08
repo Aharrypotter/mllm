@@ -50,7 +50,7 @@ void HpcThreadPool::wakeup() {
 
 int HpcThreadPool::acquireTaskSlot() {
   std::lock_guard<std::mutex> _l(queue_mutex_);
-  for (int i = 0; i < MLLM_HPC_THREAD_POOL_TASK_LIMITS; ++i) {
+  for (int i = 0; i < kHpcThreadPoolTaskLimit; ++i) {
     if (task_available_[i]) {
       task_available_[i] = false;
       return i;
@@ -60,7 +60,7 @@ int HpcThreadPool::acquireTaskSlot() {
 }
 
 void HpcThreadPool::releaseTaskSlot(int task_slot_idx) {
-  if (task_slot_idx < 0 || task_slot_idx >= MLLM_HPC_THREAD_POOL_TASK_LIMITS) { return; }
+  if (task_slot_idx < 0 || task_slot_idx >= kHpcThreadPoolTaskLimit) { return; }
   std::lock_guard<std::mutex> _l(queue_mutex_);
   task_available_[task_slot_idx] = true;
 }
@@ -95,9 +95,14 @@ void HpcThreadPool::splitTask(HpcThreadPoolTask&& task, int task_slot_idx) {
   // e.g.: threads is 4, tiles_name is 12.
   //  0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3
   if (tiles_num > thread_cnt_) {
+    // Capture task and true_idx BY VALUE: splitTask's parameters (a moved-in
+    // rvalue task and a stack vector) die when this function returns, but the
+    // worker threads execute this lambda asynchronously — capturing by
+    // reference leaves a dangling reference (use-after-free). This was latent
+    // with 4 lanes and became reachable at 8 lanes.
     tasks_[task_slot_idx].first = {
         .func =
-            [tiles_num, &task, &true_idx, this](int thread_idx) {
+            [tiles_num, task, true_idx, this](int thread_idx) {
               for (int v = thread_idx; v < tiles_num; v += thread_cnt_) { task.func(true_idx[v]); }
             },
         .start = 0,
@@ -107,7 +112,7 @@ void HpcThreadPool::splitTask(HpcThreadPoolTask&& task, int task_slot_idx) {
     tiles_num = thread_cnt_;
   } else {
     tasks_[task_slot_idx].first = {
-        .func = [tiles_num, &task, &true_idx, this](int thread_idx) { task.func(true_idx[thread_idx]); },
+        .func = [tiles_num, task, true_idx, this](int thread_idx) { task.func(true_idx[thread_idx]); },
         .start = 0,
         .end = tiles_num,
         .step = 1,
@@ -140,11 +145,11 @@ HpcThreadPool::HpcThreadPool(int thread_cnt) {
   thread_cnt_ = thread_cnt;
   available_task_slots_ = 0;
   available_task_slots_old_ = 0;
-  task_available_.resize(MLLM_HPC_THREAD_POOL_TASK_LIMITS);
-  tasks_.resize(MLLM_HPC_THREAD_POOL_TASK_LIMITS);
+  task_available_.resize(kHpcThreadPoolTaskLimit);
+  tasks_.resize(kHpcThreadPoolTaskLimit);
 
   // Each task should hold some thread ok flag that mark this thread's work is done.
-  for (int t = 0; t < MLLM_HPC_THREAD_POOL_TASK_LIMITS; ++t) {
+  for (int t = 0; t < kHpcThreadPoolTaskLimit; ++t) {
     task_available_[t] = true;
     for (int i = 0; i < thread_cnt_; ++i) { tasks_[t].second.emplace_back(new std::atomic_bool{false}); }
   }
@@ -154,7 +159,7 @@ HpcThreadPool::HpcThreadPool(int thread_cnt) {
     workers_.emplace_back([this, thread_idx]() {
       while (!stop_) {
         while (available_task_slots_ > 0) {
-          for (int i = 0; i < MLLM_HPC_THREAD_POOL_TASK_LIMITS; ++i) {
+          for (int i = 0; i < kHpcThreadPoolTaskLimit; ++i) {
             if (*tasks_[i].second[thread_idx]) {
               tasks_[i].first.func(thread_idx);
               { *tasks_[i].second[thread_idx] = false; }

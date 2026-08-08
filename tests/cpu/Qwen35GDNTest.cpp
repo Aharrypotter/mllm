@@ -18,8 +18,11 @@ using mllm::cpu::gdn::gatedDeltaRuleF32;
 class ScopedCpuOpThreads {
  public:
   explicit ScopedCpuOpThreads(int32_t thread_count) : original_thread_count_(mllm::Context::instance().getCpuOpThreads()) {
+    // initializeContext() registers the CPU backend; SymbolTable::reg aborts on
+    // a duplicate key, so call it exactly once (the tests have no fixture init).
+    static const bool kContextInitialized = [] { mllm::initializeContext(); return true; }();
+    (void)kContextInitialized;
     mllm::Context::instance().setCpuOpThreads(thread_count);
-    mllm::initializeContext();
   }
 
   ~ScopedCpuOpThreads() { mllm::Context::instance().setCpuOpThreads(original_thread_count_); }
@@ -218,7 +221,10 @@ TEST(Qwen35GDNTest, ParallelBatchValueHeadsMatchSerialBitwise) {
   constexpr int kValueHeads = 32;
   constexpr int kKeyDim = 128;
   constexpr int kValueDim = 128;
-  constexpr int kThreadCount = 4;
+  // Exercises the parallel lane partition up to the 8-lane cap
+  // (kMaxParallelGDNLanes); tasks are disjoint so output must be bitwise
+  // identical regardless of how many lanes the scheduler picks.
+  constexpr int kThreadCount = 8;
 
   std::vector<float> q(kBatch * kSequence * kKeyHeads * kKeyDim);
   std::vector<float> k(q.size());
@@ -263,6 +269,80 @@ TEST(Qwen35GDNTest, ParallelBatchValueHeadsMatchSerialBitwise) {
   }
   for (std::size_t i = 0; i < serial_state.size(); ++i) {
     ASSERT_FLOAT_EQ(serial_state[i], parallel_state[i]) << "state index " << i;
+  }
+}
+
+// 4B real geometry (B=1, S=69, 16 key heads, 32 value heads, 128 dims) at the
+// 8-lane cap — exercises the full task fan-out (32 tasks) that the small
+// geometry above does not. Guards against the device crash observed on
+// OnePlus with the 8-lane product build.
+TEST(Qwen35GDNTest, FourBGeometry8LaneDoesNotCrash) {
+  constexpr int kBatch = 1;
+  constexpr int kSequence = 69;
+  constexpr int kKeyHeads = 16;
+  constexpr int kValueHeads = 32;
+  constexpr int kKeyDim = 128;
+  constexpr int kValueDim = 128;
+  constexpr int kThreadCount = 8;
+
+  std::vector<float> q(kBatch * kSequence * kKeyHeads * kKeyDim);
+  std::vector<float> k(q.size());
+  std::vector<float> v(kBatch * kSequence * kValueHeads * kValueDim);
+  std::vector<float> a(kBatch * kSequence * kValueHeads);
+  std::vector<float> b(a.size());
+  std::vector<float> a_log(kValueHeads);
+  std::vector<float> dt_bias(kValueHeads);
+
+  for (std::size_t i = 0; i < q.size(); ++i) {
+    q[i] = 0.01F * static_cast<float>(static_cast<int>(i % 7) - 3);
+    k[i] = 0.01F * static_cast<float>(static_cast<int>(i % 5) - 2);
+  }
+  for (std::size_t i = 0; i < v.size(); ++i) { v[i] = 0.01F * static_cast<float>(static_cast<int>(i % 11) - 5); }
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    a[i] = 0.001F * static_cast<float>(static_cast<int>(i % 3));
+    b[i] = 0.001F * static_cast<float>(static_cast<int>(i % 9));
+  }
+  for (int i = 0; i < kValueHeads; ++i) { a_log[i] = -1.0F; dt_bias[i] = 0.0F; }
+
+  std::vector<float> state(kBatch * kValueHeads * kValueDim * kKeyDim, 0.0F);
+  std::vector<float> output(v.size());
+  std::vector<float> ref_output(v.size());
+  std::vector<float> ref_state = state;
+
+  // Serial reference, then 8-lane parallel — must be bitwise identical.
+  gatedDeltaRuleF32(q.data(), k.data(), v.data(), a.data(), b.data(), a_log.data(), dt_bias.data(), ref_state.data(),
+                    ref_output.data(), kBatch, kSequence, kKeyHeads, kValueHeads, kKeyDim, kValueDim,
+                    /*thread_count=*/1);
+  const ScopedCpuOpThreads scoped_threads(kThreadCount);
+  gatedDeltaRuleF32(q.data(), k.data(), v.data(), a.data(), b.data(), a_log.data(), dt_bias.data(), state.data(),
+                    output.data(), kBatch, kSequence, kKeyHeads, kValueHeads, kKeyDim, kValueDim, kThreadCount);
+
+  for (std::size_t i = 0; i < output.size(); ++i) {
+    ASSERT_EQ(ref_output[i], output[i]) << "output index " << i;
+  }
+  for (std::size_t i = 0; i < state.size(); ++i) {
+    ASSERT_EQ(ref_state[i], state[i]) << "state index " << i;
+  }
+
+  // Repeat the full 4B GDN pass 24 times (one per layer) to mimic the real
+  // model's layer loop, which interleaves the recurrence with other parallel
+  // ops on the shared thread pool. Context init is now once-only (see
+  // ScopedCpuOpThreads), so this exercises multi-call thread-pool reuse.
+  // Run the recurrence 24 times on a FRESH copy of the initial state each
+  // time (mirroring one GDN layer per model layer from the same prefill input),
+  // and compare each run's output to the serial reference for that same input.
+  // This exercises repeated thread-pool push/acquire/release cycles — the
+  // multi-call reuse pattern that crashed on device.
+  for (int layer = 0; layer < 24; ++layer) {
+    std::vector<float> layer_state(state.size(), 0.0F);
+    std::vector<float> layer_ref_state(state.size(), 0.0F);
+    gatedDeltaRuleF32(q.data(), k.data(), v.data(), a.data(), b.data(), a_log.data(), dt_bias.data(), layer_ref_state.data(),
+                      ref_output.data(), kBatch, kSequence, kKeyHeads, kValueHeads, kKeyDim, kValueDim, /*thread_count=*/1);
+    gatedDeltaRuleF32(q.data(), k.data(), v.data(), a.data(), b.data(), a_log.data(), dt_bias.data(), layer_state.data(),
+                      output.data(), kBatch, kSequence, kKeyHeads, kValueHeads, kKeyDim, kValueDim, kThreadCount);
+    for (std::size_t i = 0; i < output.size(); ++i) {
+      ASSERT_EQ(ref_output[i], output[i]) << "layer " << layer << " output index " << i;
+    }
   }
 }
 
