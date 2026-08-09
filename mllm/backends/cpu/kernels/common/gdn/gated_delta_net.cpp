@@ -23,10 +23,11 @@ namespace mllm::cpu::gdn {
 namespace {
 
 constexpr int kMaxStackNormalizedHeadDim = 256;
-// GDN state updates are bandwidth-heavy on heterogeneous mobile CPUs. A small
-// fixed lane cap avoids making every efficiency core part of the per-layer
-// completion barrier.
-constexpr int kMaxParallelGDNLanes = 4;
+// GDN state updates are bandwidth-heavy on heterogeneous mobile CPUs. The lane
+// cap bounds how many tasks share the per-layer completion barrier. 8 lanes
+// matches the 8-core phones this kernel targets (4B has 32 recurrence tasks,
+// so all 8 cores participate); bitwise-safe because tasks are disjoint.
+constexpr int kMaxParallelGDNLanes = 8;
 // Scalar state elements updated across all [batch, value_head] tasks.
 constexpr std::size_t kMinParallelGDNWork = 65536;
 

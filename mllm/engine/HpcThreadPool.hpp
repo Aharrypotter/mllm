@@ -13,9 +13,12 @@
 #include <functional>
 #include <condition_variable>
 
-#define MLLM_HPC_THREAD_POOL_TASK_LIMITS 2
-
 namespace mllm {
+
+// One task slot per expected concurrent op. 8 covers the GDN recurrence
+// 8-lane cap plus sibling parallel ops; too small a limit makes splitTask fall
+// back to serial on the main thread under multi-layer concurrency.
+inline constexpr int kHpcThreadPoolTaskLimit = 8;
 
 struct HpcThreadPoolTask {
   std::function<void(int)> func;
