@@ -5,6 +5,8 @@
 
 #include <array>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <vector>
 
@@ -16,7 +18,10 @@
 namespace {
 
 using mllm::models::qwen3_5::advanceQwen3_5PositionIds;
+using mllm::models::qwen3_5::expandQwen3_5ImagePlaceholders;
 using mllm::models::qwen3_5::expandQwen3_5SingleImagePlaceholders;
+using mllm::models::qwen3_5::injectQwen3_5ImageEmbeddings;
+using mllm::models::qwen3_5::makeQwen3_5ImagePositionIds;
 using mllm::models::qwen3_5::makeQwen3_5InterleavedRotaryEmbedding;
 using mllm::models::qwen3_5::makeQwen3_5SingleImagePositionIds;
 using mllm::models::qwen3_5::makeQwen3_5VisionBilinearPositionEmbedding;
@@ -89,6 +94,33 @@ TEST_F(Qwen35MultimodalTest, FlattenPatchesMatchesOfficialBlockMajorLayout) {
   EXPECT_FLOAT_EQ(patches.ptr<float>()[4 * 1536], normalized(32.0F));
 }
 
+TEST_F(Qwen35MultimodalTest, PreprocessesAndConcatenatesDifferentImagesInOrder) {
+  const auto temp_dir = std::filesystem::temp_directory_path();
+  const auto first_path = temp_dir / "mllm_qwen35_multi_image_first.ppm";
+  const auto second_path = temp_dir / "mllm_qwen35_multi_image_second.ppm";
+  const auto write_ppm = [](const std::filesystem::path& path, int32_t width, int32_t height, char value) {
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    stream << "P6\n" << width << ' ' << height << "\n255\n";
+    const std::string row(static_cast<size_t>(width) * 3, value);
+    for (int32_t h = 0; h < height; ++h) stream.write(row.data(), static_cast<std::streamsize>(row.size()));
+    if (!stream) throw std::runtime_error("failed to write Qwen3.5 image fixture");
+  };
+  write_ppm(first_path, 32, 32, static_cast<char>(0));
+  write_ppm(second_path, 32, 64, static_cast<char>(255));
+
+  const Qwen3_5ImagePreprocessor preprocessor(/*min_pixels=*/1, /*max_pixels=*/1 << 20);
+  auto [patches, grids] = preprocessor(std::vector<std::string>{first_path.string(), second_path.string()});
+  EXPECT_EQ(patches.shape(), (mllm::Tensor::shape_t{12, 1536}));
+  EXPECT_EQ(grids.shape(), (mllm::Tensor::shape_t{2, 3}));
+  const std::array<int32_t, 6> expected_grids = {1, 2, 2, 1, 4, 2};
+  EXPECT_TRUE(std::equal(expected_grids.begin(), expected_grids.end(), grids.ptr<int32_t>()));
+  EXPECT_FLOAT_EQ(patches.ptr<float>()[0], -1.0F);
+  EXPECT_FLOAT_EQ(patches.ptr<float>()[4 * 1536], 1.0F);
+
+  std::filesystem::remove(first_path);
+  std::filesystem::remove(second_path);
+}
+
 TEST_F(Qwen35MultimodalTest, ExpandsExactlyOneImagePlaceholderAndMarksItsSpan) {
   const std::vector<int64_t> input = {10, 248053, 248056, 248054, 11};
   auto [expanded, token_types] = expandQwen3_5SingleImagePlaceholders(input, 248056, 4);
@@ -97,6 +129,39 @@ TEST_F(Qwen35MultimodalTest, ExpandsExactlyOneImagePlaceholderAndMarksItsSpan) {
   EXPECT_EQ(token_types, (std::vector<int32_t>{0, 0, 1, 1, 1, 1, 0, 0}));
   EXPECT_THROW(expandQwen3_5SingleImagePlaceholders({1, 2, 3}, 248056, 4), std::invalid_argument);
   EXPECT_THROW(expandQwen3_5SingleImagePlaceholders({248056, 248056}, 248056, 4), std::invalid_argument);
+}
+
+TEST_F(Qwen35MultimodalTest, ExpandsMultipleImagePlaceholdersInOrder) {
+  const std::vector<int64_t> input = {10, 248053, 248056, 248054, 11, 248053, 248056, 248054, 12};
+  auto [expanded, token_types] = expandQwen3_5ImagePlaceholders(input, 248056, {2, 3});
+
+  EXPECT_EQ(expanded,
+            (std::vector<int64_t>{10, 248053, 248056, 248056, 248054, 11, 248053, 248056, 248056, 248056, 248054, 12}));
+  EXPECT_EQ(token_types, (std::vector<int32_t>{0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0}));
+  EXPECT_THROW(expandQwen3_5ImagePlaceholders(input, 248056, {2}), std::invalid_argument);
+  EXPECT_THROW(expandQwen3_5ImagePlaceholders(input, 248056, {2, 3, 4}), std::invalid_argument);
+  EXPECT_THROW(expandQwen3_5ImagePlaceholders(input, 248056, {2, 0}), std::invalid_argument);
+}
+
+TEST_F(Qwen35MultimodalTest, InjectsDistinctImageEmbeddingsIntoEverySpanInOrder) {
+  auto input = mllm::Tensor::empty({1, 8, 3}, mllm::kFloat32, mllm::kCPU).alloc();
+  std::fill(input.ptr<float>(), input.ptr<float>() + input.numel(), -1.0F);
+  auto images = mllm::Tensor::empty({4, 3}, mllm::kFloat32, mllm::kCPU).alloc();
+  for (int32_t row = 0; row < 4; ++row) {
+    for (int32_t column = 0; column < 3; ++column) { images.ptr<float>()[row * 3 + column] = row * 10 + column; }
+  }
+  auto types = mllm::Tensor::empty({1, 8}, mllm::kInt32, mllm::kCPU).alloc();
+  const std::array<int32_t, 8> type_values = {0, 1, 1, 0, 0, 1, 1, 0};
+  std::copy(type_values.begin(), type_values.end(), types.ptr<int32_t>());
+
+  injectQwen3_5ImageEmbeddings(input, images, types);
+  for (int32_t position = 0; position < 8; ++position) {
+    for (int32_t column = 0; column < 3; ++column) {
+      const int32_t image_row = position == 1 ? 0 : position == 2 ? 1 : position == 5 ? 2 : position == 6 ? 3 : -1;
+      const float expected = image_row < 0 ? -1.0F : image_row * 10 + column;
+      EXPECT_FLOAT_EQ(input.ptr<float>()[position * 3 + column], expected);
+    }
+  }
 }
 
 TEST_F(Qwen35MultimodalTest, InterleavesTemporalHeightAndWidthFrequencies) {
@@ -180,6 +245,28 @@ TEST_F(Qwen35MultimodalTest, BuildsOfficialSingleImagePositionsAndDecodeStep) {
   EXPECT_EQ(next.ptr<int64_t>()[0], 6);
   EXPECT_EQ(next.ptr<int64_t>()[1], 6);
   EXPECT_EQ(next.ptr<int64_t>()[2], 6);
+}
+
+TEST_F(Qwen35MultimodalTest, BuildsOfficialMultipleImagePositionsWithDifferentGeometries) {
+  auto token_types = mllm::Tensor::empty({1, 12}, mllm::kInt32, mllm::kCPU).alloc();
+  const std::array<int32_t, 12> types = {0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0};
+  std::copy(types.begin(), types.end(), token_types.ptr<int32_t>());
+  auto grids = mllm::Tensor::empty({2, 3}, mllm::kInt32, mllm::kCPU).alloc();
+  const std::array<int32_t, 6> dimensions = {1, 4, 4, 1, 2, 4};
+  std::copy(dimensions.begin(), dimensions.end(), grids.ptr<int32_t>());
+
+  auto positions = makeQwen3_5ImagePositionIds(token_types, grids, 2);
+  const std::array<int64_t, 12> expected_t = {0, 1, 2, 2, 2, 2, 4, 5, 6, 6, 8, 9};
+  const std::array<int64_t, 12> expected_h = {0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 8, 9};
+  const std::array<int64_t, 12> expected_w = {0, 1, 2, 3, 2, 3, 4, 5, 6, 7, 8, 9};
+  EXPECT_TRUE(std::equal(expected_t.begin(), expected_t.end(), positions.ptr<int64_t>()));
+  EXPECT_TRUE(std::equal(expected_h.begin(), expected_h.end(), positions.ptr<int64_t>() + 12));
+  EXPECT_TRUE(std::equal(expected_w.begin(), expected_w.end(), positions.ptr<int64_t>() + 24));
+
+  auto missing_span_types = token_types.clone();
+  missing_span_types.ptr<int32_t>()[8] = 0;
+  missing_span_types.ptr<int32_t>()[9] = 0;
+  EXPECT_THROW(makeQwen3_5ImagePositionIds(missing_span_types, grids, 2), std::invalid_argument);
 }
 
 TEST_F(Qwen35MultimodalTest, RejectsPlaceholderCountMismatchAndVideoTypes) {

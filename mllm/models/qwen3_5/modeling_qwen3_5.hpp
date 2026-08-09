@@ -634,8 +634,8 @@ class Qwen3_5ForCausalLM : public ARGeneration, public nn::Module {
       position_ids = input.at("position_ids");
       if (seq_len == 1) { position_ids = advanceQwen3_5PositionIds(position_ids); }
     } else if (has_pixel_values) {
-      position_ids = makeQwen3_5SingleImagePositionIds(input.at("mm_token_type_ids"), input.at("image_grid_thw"),
-                                                       vision_spatial_merge_size_);
+      position_ids =
+          makeQwen3_5ImagePositionIds(input.at("mm_token_type_ids"), input.at("image_grid_thw"), vision_spatial_merge_size_);
     } else {
       position_ids = Tensor::empty({batch_size, seq_len}, kInt64, kCPU).alloc();
       auto position_ids_ptr = position_ids.ptr<int64_t>();
@@ -659,29 +659,25 @@ class Qwen3_5ForCausalLM : public ARGeneration, public nn::Module {
       }
       const auto* input_ids = sequence.ptr<int64_t>();
       const auto* types = token_types.ptr<int32_t>();
-      int32_t image_begin = -1;
       int32_t image_count = 0;
       for (int32_t s = 0; s < seq_len; ++s) {
         if (input_ids[s] == video_token_id_ || types[s] == 2) {
-          throw std::invalid_argument("Qwen3.5 CPU single-image support does not accept video tokens");
+          throw std::invalid_argument("Qwen3.5 CPU image support does not accept video tokens");
         }
         if ((input_ids[s] == image_token_id_) != (types[s] == 1)) {
           throw std::invalid_argument("Qwen3.5 image token IDs and modality token types disagree");
         }
-        if (types[s] == 1) {
-          if (image_begin < 0) image_begin = s;
-          ++image_count;
-        }
+        if (types[s] == 1) { ++image_count; }
       }
 
       auto input_embeddings = llm.embed(sequence);
       auto image_embeddings = llm.encodeImage(input.at("pixel_values"), input.at("image_grid_thw"));
-      if (image_begin < 0 || image_embeddings.shape().size() != 2 || image_embeddings.shape()[0] != image_count
+      if (image_count <= 0 || image_embeddings.shape().size() != 2 || image_embeddings.shape()[0] != image_count
           || input_embeddings.shape().size() != 3 || image_embeddings.shape()[1] != input_embeddings.shape()[2]
           || image_embeddings.dtype() != input_embeddings.dtype()) {
         throw std::invalid_argument("Qwen3.5 image features and image placeholders do not match");
       }
-      image_embeddings.copy2(input_embeddings[{kAll, {image_begin, image_begin + image_count}, kAll}]);
+      injectQwen3_5ImageEmbeddings(input_embeddings, image_embeddings, token_types);
       sequence = llm.forwardEmbeddings(input_embeddings, llm_embedding_sin, llm_embedding_cos, AnyValue(&kv_cache_));
     } else {
       sequence = llm(sequence, llm_embedding_sin, llm_embedding_cos, AnyValue(&kv_cache_))[0];
