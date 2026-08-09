@@ -18,10 +18,12 @@ from validate_checkpoint import (
     default_quant_config_path,
     default_runtime_config_path,
     expected_text_shapes,
+    expected_vision_shapes,
     model_name_for_size,
     resolve_model_size,
     resolve_runtime_linear_impl_type,
     validate_kai_recipe_contract,
+    validate_multimodal_config_contract,
 )
 
 
@@ -55,40 +57,63 @@ def _decode_c_string(value: bytes) -> str:
 
 
 def _expected_descriptors(
-    text_config: dict, quant_config: dict
+    config: dict, quant_config: dict
 ) -> dict[str, tuple[int, list[int], int]]:
+    text_config = config.get("text_config", config)
     source_shapes = expected_text_shapes(text_config)
+    if any("visual" in pattern for pattern in quant_config):
+        vision_config = config.get("vision_config")
+        if not isinstance(vision_config, dict):
+            raise AssertionError(
+                "Multimodal converted-model validation requires vision_config"
+            )
+        source_shapes.update(expected_vision_shapes(vision_config))
     patterns = [
         (re.compile(pattern), entry["hints"]) for pattern, entry in quant_config.items()
     ]
-    expected: dict[str, tuple[int, list[int], int]] = {}
+    expected: dict[str, tuple[int, list[int], int]] = {
+        name: (FLOAT32, shape, math.prod(shape) * 4)
+        for name, shape in source_shapes.items()
+    }
 
-    for name, shape in source_shapes.items():
-        matches = [hints for pattern, hints in patterns if pattern.fullmatch(name)]
-        if len(matches) > 1:
-            raise AssertionError(f"Multiple quantization patterns matched {name}")
-
-        if not matches:
-            expected[name] = (FLOAT32, shape, math.prod(shape) * 4)
-            continue
-
-        hints = matches[0]
-        if list(hints["shape"]) != shape:
+    matched_sources: set[str] = set()
+    for pattern, hints in patterns:
+        matched = sorted(name for name in source_shapes if pattern.fullmatch(name))
+        if not matched:
             raise AssertionError(
-                f"Quantization config shape mismatch for {name}: "
-                f"{hints['shape']} != {shape}"
+                f"Quantization pattern matched no selected tensors: {pattern.pattern}"
             )
-        packed_size = _packed_size(
-            out_channels=shape[0],
-            in_channels=shape[1],
-            tile_name=hints["kai_matmul_tile_cfg"],
-        )
-        packed_descriptor = (BYTE, [packed_size], packed_size)
-        if hints["replace"]:
-            expected[name] = packed_descriptor
-        else:
-            expected[name] = (FLOAT32, shape, math.prod(shape) * 4)
-            expected[hints["rename"]] = packed_descriptor
+        overlap = matched_sources.intersection(matched)
+        if overlap:
+            raise AssertionError(
+                f"Multiple quantization patterns matched: {sorted(overlap)}"
+            )
+        weights = [name for name in matched if name.endswith(".weight")]
+        if not weights:
+            raise AssertionError(
+                f"Quantization pattern matched no weight tensor: {pattern.pattern}"
+            )
+        for weight_name in weights:
+            shape = source_shapes[weight_name]
+            if list(hints["shape"]) != shape:
+                raise AssertionError(
+                    f"Quantization config shape mismatch for {weight_name}: "
+                    f"{hints['shape']} != {shape}"
+                )
+            packed_size = _packed_size(
+                out_channels=shape[0],
+                in_channels=shape[1],
+                tile_name=hints["kai_matmul_tile_cfg"],
+            )
+            packed_descriptor = (BYTE, [packed_size], packed_size)
+            bias_name = weight_name.removesuffix(".weight") + ".bias"
+            if hints["replace"]:
+                expected[weight_name] = packed_descriptor
+                if bias_name in matched:
+                    expected.pop(bias_name)
+            else:
+                expected[hints["rename"]] = packed_descriptor
+        matched_sources.update(matched)
 
     return expected
 
@@ -166,8 +191,17 @@ def main() -> None:
         quant_config = json.load(quant_config_file)
     with runtime_config_path.open() as runtime_config_file:
         runtime_config = json.load(runtime_config_file)
-    validate_kai_recipe_contract(text_config, quant_config, runtime_config)
-    expected = _expected_descriptors(text_config, quant_config)
+    include_vision = any("visual" in pattern for pattern in quant_config)
+    if include_vision:
+        validate_multimodal_config_contract(checkpoint_config, runtime_config)
+        expected_model_name = args.model_name or f"Qwen3.5-{model_size}-Multimodal"
+    validate_kai_recipe_contract(
+        text_config,
+        quant_config,
+        runtime_config,
+        checkpoint_config.get("vision_config"),
+    )
+    expected = _expected_descriptors(checkpoint_config, quant_config)
 
     file_size = args.model.stat().st_size
     with args.model.open("rb") as model_file:
@@ -236,9 +270,8 @@ def main() -> None:
             offset >= UINT32_LIMIT for _, _, _, offset in actual.values()
         ),
         "has_lm_head_out": "lm_head_out.weight" in actual,
-        "visual_or_mtp_parameters": sum(
-            "visual" in name or "mtp" in name for name in actual
-        ),
+        "visual_parameters": sum(name.startswith("model.visual.") for name in actual),
+        "mtp_parameters": sum("mtp" in name for name in actual),
     }
     print(json.dumps(summary, indent=2, sort_keys=True))
     print("QWEN35_CONVERTED_MODEL_AUDIT_OK")

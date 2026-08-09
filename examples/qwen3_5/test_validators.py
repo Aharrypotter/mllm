@@ -9,15 +9,18 @@ import copy
 import json
 import re
 import unittest
+from collections import Counter
 from pathlib import Path
 
 from validate_checkpoint import (
     default_quant_config_path,
     default_runtime_config_path,
     expected_text_shapes,
+    expected_vision_shapes,
     model_name_for_size,
     resolve_model_size,
     validate_kai_recipe_contract,
+    validate_multimodal_config_contract,
 )
 from validate_converted_model import (
     BYTE,
@@ -129,6 +132,52 @@ class Qwen35ValidatorTest(unittest.TestCase):
         )
         self.assertEqual(dtype_counts[BYTE], 249)
         self.assertEqual(dtype_counts[FLOAT32], 178)
+
+    def test_official_08b_multimodal_recipe_and_descriptors(self) -> None:
+        config = _load_json("config_0.8B_multimodal_w4a32_kai.json")
+        quant_config = _load_json("quant_cfg_0.8B_multimodal_w4a32_kai.json")
+
+        checkpoint_config = copy.deepcopy(config)
+        checkpoint_config["vision_config"].update(
+            {"initializer_range": 0.02, "model_type": "qwen3_5"}
+        )
+        validate_multimodal_config_contract(checkpoint_config, config)
+        quantized_names, _ = validate_kai_recipe_contract(
+            checkpoint_config["text_config"],
+            quant_config,
+            config,
+            checkpoint_config["vision_config"],
+        )
+        self.assertEqual(len(quantized_names), 287)
+        self.assertEqual(len(expected_vision_shapes(config["vision_config"])), 153)
+
+        expected = _expected_descriptors(config, quant_config)
+        dtype_counts = Counter(dtype for dtype, _, _ in expected.values())
+        self.assertEqual(len(expected), 424)
+        self.assertEqual(dtype_counts[BYTE], 237)
+        self.assertEqual(dtype_counts[FLOAT32], 187)
+        self.assertEqual(
+            sum(name.startswith("model.visual.") for name in expected),
+            103,
+        )
+
+    def test_multimodal_recipe_rejects_text_runtime_and_contract_drift(self) -> None:
+        config = _load_json("config_0.8B_multimodal_w4a32_kai.json")
+        text_runtime = _load_json("config_0.8B_w4a32_kai.json")
+        quant_config = _load_json("quant_cfg_0.8B_multimodal_w4a32_kai.json")
+
+        with self.assertRaisesRegex(AssertionError, "both include vision"):
+            validate_kai_recipe_contract(
+                config["text_config"],
+                quant_config,
+                text_runtime,
+                config["vision_config"],
+            )
+
+        mutated = copy.deepcopy(config)
+        mutated["image_max_pixels"] = 1024 * 1024
+        with self.assertRaisesRegex(AssertionError, "image_max_pixels"):
+            validate_multimodal_config_contract(config, mutated)
 
     def test_variant_resolution_rejects_runtime_semantic_mismatches(self) -> None:
         text_config = _load_json("config_4B_w4a32_kai.json")["text_config"]

@@ -30,6 +30,8 @@ MLLM_MAIN({
   auto& config_path = Argparse::add<std::string>("-c|--config_path").help("Config path").required(true);
   auto& prompt = Argparse::add<std::string>("-p|--prompt").help("Run one prompt non-interactively").required(false);
   auto& prompt_file = Argparse::add<std::string>("--prompt_file").help("Read one benchmark prompt from a file").required(false);
+  auto& image_path =
+      Argparse::add<std::string>("-i|--image_path").help("Optional still image for single-image inference").required(false);
   auto& max_new_tokens = Argparse::add<int>("-g|--max_new_tokens").help("Maximum generated tokens per prompt").required(false);
   auto& print_token_ids = Argparse::add<bool>("--print_token_ids").help("Print generated token IDs to stderr").required(false);
   auto& benchmark_warmup =
@@ -83,6 +85,11 @@ MLLM_MAIN({
                                 || benchmark_warmup.isSet() || require_device_telemetry.isSet();
     if (prompt.isSet() && prompt_file.isSet()) { throw std::invalid_argument("prompt and prompt_file are mutually exclusive"); }
     if (prompt.isSet() && prompt.get().empty()) { throw std::invalid_argument("prompt must not be empty"); }
+    if (image_path.isSet() && image_path.get().empty()) { throw std::invalid_argument("image_path must not be empty"); }
+    if (image_path.isSet() && !cfg.vision_enabled) {
+      throw std::invalid_argument("image_path requires a config with vision_config");
+    }
+    if (image_path.isSet() && benchmark_mode) { throw std::invalid_argument("image_path is not supported in benchmark mode"); }
     if (benchmark_mode) {
       if (!prompt_file.isSet() || !benchmark_samples.isSet() || !benchmark_jsonl.isSet() || !benchmark_variant.isSet()
           || !benchmark_source_sha.isSet() || !expected_prompt_tokens.isSet()) {
@@ -107,7 +114,9 @@ MLLM_MAIN({
     auto param = mllm::load(model_path.get(), file_version);
     mllm::models::qwen3_5::validateModelConfigMatch(cfg, param);
 
-    auto tokenizer = mllm::models::qwen3_5::Qwen3_5Tokenizer(tokenizer_path.get());
+    auto tokenizer = mllm::models::qwen3_5::Qwen3_5Tokenizer(tokenizer_path.get(), cfg.image_min_pixels, cfg.image_max_pixels,
+                                                             cfg.vision_patch_size, cfg.vision_temporal_patch_size,
+                                                             cfg.vision_spatial_merge_size);
     auto model = mllm::models::qwen3_5::Qwen3_5ForCausalLM(cfg);
     fmt::print("{}: {} layers ({} full attention + {} GDN)\n", mllm::models::qwen3_5::modelNameForConfig(cfg),
                cfg.num_hidden_layers, cfg.numFullAttentionLayers(), cfg.numGDNLayers());
@@ -228,7 +237,8 @@ MLLM_MAIN({
           // KV cache and every GDN recurrent/conv state must start empty.
           model.resetState();
           fmt::print("Processing...\n");
-          auto inputs = tokenizer.convertMessage({.prompt = prompt_text});
+          auto inputs =
+              tokenizer.convertMessage({.prompt = prompt_text, .image_path = image_path.isSet() ? image_path.get() : ""});
           const auto prompt_length = inputs.at("sequence").shape()[1];
           if (prompt_length + generation_limit - 1 > cfg.max_cache_length) {
             throw std::invalid_argument(fmt::format("prompt token count ({}) plus max_new_tokens ({}) exceeds "
