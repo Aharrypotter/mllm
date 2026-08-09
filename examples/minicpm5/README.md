@@ -1,0 +1,41 @@
+# MiniCPM5-1B on ARM CPU
+
+This example supports the text-only [`openbmb/MiniCPM5-1B`](https://huggingface.co/openbmb/MiniCPM5-1B) checkpoint.
+The runtime contract is batch 1, a 2048-token mobile cache, 16 query heads, 2 native KV heads, and explicit
+`head_dim=128`. The implementation keeps KV history at KV-head count and uses a correctness-first eager GQA path;
+it does not materialize a persistent 16-head KV cache.
+
+The runner implements the official no-tool chat-template branch, including optional system text and
+`enable_thinking=true|false`. Tool schemas, tool calls, and multi-turn history are outside this first product surface.
+
+## Convert
+
+Keep embeddings and norms in FP32; the supplied configuration packs transformer Linear weights and the independent
+`lm_head` for the KAI W4A32 runtime.
+
+```bash
+python -m pymllm.mobile.utils.mllm_convertor \
+  --input_path /path/to/MiniCPM5-1B \
+  --output_path /path/to/minicpm5-1b-w4a32-kai.mllm \
+  --model_name MiniCPM5-1B \
+  --cfg_path examples/minicpm5/quant_cfg_1B_w4a32_kai.json \
+  --pipeline w4a32_kai_pipeline \
+  --format v2 \
+  --verbose
+```
+
+## Run
+
+```bash
+mllm-minicpm5-runner \
+  --model_path /path/to/minicpm5-1b-w4a32-kai.mllm \
+  --model_version v2 \
+  --tokenizer_path /path/to/MiniCPM5-1B/tokenizer.json \
+  --config_path examples/minicpm5/config_1B_w4a32_kai.json \
+  --prompt "用一句话介绍你自己。" \
+  --max_new_tokens 32
+```
+
+Omit `--prompt` for the interactive loop. Each prompt is an independent conversation and clears all logical cache
+slots before inference. Add `--enable_thinking` to open the official thinking prefix; the default emits the official
+closed empty thinking block.
