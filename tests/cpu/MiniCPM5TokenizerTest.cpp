@@ -4,6 +4,8 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -63,4 +65,16 @@ TEST(MiniCPM5TokenizerTest, MatchesPinnedOfficialTokenizerWhenProvided) {
   const auto digits = tokenizer.convert2Ids(tokenizer.tokenize("1234567"));
   EXPECT_EQ(std::vector<int64_t>(digits.ptr<int64_t>(), digits.ptr<int64_t>() + digits.numel()),
             (std::vector<int64_t>{5645, 12740, 44}));
+
+  const char* demo_prompt_path = std::getenv("MLLM_MINICPM5_DEMO_PROMPT_FILE");
+  if (demo_prompt_path != nullptr) {
+    std::ifstream prompt_stream(demo_prompt_path, std::ios::binary);
+    ASSERT_TRUE(prompt_stream) << "unable to read MiniCPM5 demo prompt";
+    std::string prompt;
+    prompt.assign(std::istreambuf_iterator<char>(prompt_stream), std::istreambuf_iterator<char>());
+    while (!prompt.empty() && (prompt.back() == '\n' || prompt.back() == '\r')) prompt.pop_back();
+    ASSERT_FALSE(prompt.empty());
+    const auto demo_input = tokenizer.convertMessage({.prompt = prompt});
+    EXPECT_EQ(demo_input.at("sequence").shape()[1], 200);
+  }
 }

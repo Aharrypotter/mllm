@@ -39,3 +39,32 @@ mllm-minicpm5-runner \
 Omit `--prompt` for the interactive loop. Each prompt is an independent conversation and clears all logical cache
 slots before inference. Add `--enable_thinking` to open the official thinking prefix; the default emits the official
 closed empty thinking block.
+
+## Reproducible 200-token demo
+
+`demo_prompt_200.txt` is exactly 200 input tokens after the official no-tool chat template is applied with no system
+message and `enable_thinking=false`. Benchmark mode checks that count before inference, resets model state before every
+request, forces a fixed output length, and writes one JSON object per request rather than relying on console timing.
+
+```bash
+mllm-minicpm5-runner \
+  --model_path /path/to/minicpm5-1b-w4a32-kai.mllm \
+  --model_version v2 \
+  --tokenizer_path /path/to/MiniCPM5-1B/tokenizer.json \
+  --config_path examples/minicpm5/config_1B_w4a32_kai.json \
+  --prompt_file examples/minicpm5/demo_prompt_200.txt \
+  --expected_prompt_tokens 200 \
+  --max_new_tokens 32 \
+  --benchmark_warmup 1 \
+  --benchmark_samples 5 \
+  --benchmark_jsonl /path/to/fresh-results.jsonl \
+  --benchmark_variant minicpm5-1b-w4a32-kai \
+  --benchmark_source_sha SOURCE_COMMIT_SHA \
+  --engine_cpu_op_thread 4 \
+  --engine_dispatcher_thread 4
+```
+
+The runner uses greedy decoding with `min_new_tokens=max_new_tokens`, so every valid record contains 32 generated
+tokens and 31 decode steps. Compute prefill throughput from `prefill_tokens / prefill_duration_us`, and decode
+throughput from `decode_steps / decode_duration_us`; the first generated token belongs to TTFT and is not counted as a
+decode step. The JSONL also retains wall time, token IDs, process affinity, and visible CPU/thermal telemetry.
