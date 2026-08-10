@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -19,6 +20,9 @@
 #include <mllm/utils/AnyValue.hpp>
 
 #include "benchmark_harness.hpp"
+#ifdef MLLM_QWEN35_VIDEO_DECODER_BACKEND_PORTABLE
+#include "video_decoder.hpp"
+#endif
 
 using mllm::Argparse;
 
@@ -34,6 +38,20 @@ MLLM_MAIN({
   auto& image_paths = Argparse::add<std::vector<std::string>>("-i|--image_path")
                           .help("Optional still image; repeat in prompt order for multi-image inference")
                           .required(false);
+  auto& video_path = Argparse::add<std::string>("--video_path").help("Optional local H.264 MP4 video").required(false);
+  auto& video_fps = Argparse::add<float>("--video_fps").help("Target sampled video frames per second").required(false);
+  auto& video_max_frames =
+      Argparse::add<int>("--video_max_frames").help("Maximum sampled video frames (default 64)").required(false);
+  auto& video_max_bytes =
+      Argparse::add<int>("--video_max_bytes").help("Maximum MP4 input bytes (default 268435456)").required(false);
+  auto& video_max_tokens =
+      Argparse::add<int>("--video_max_tokens").help("Maximum projected video tokens (default 4096)").required(false);
+  auto& video_max_decoded_pixels = Argparse::add<int64_t>("--video_max_decoded_pixels")
+                                       .help("Maximum total decoded source pixels (default 536870912)")
+                                       .required(false);
+  auto& video_max_selected_pixels = Argparse::add<int64_t>("--video_max_selected_pixels")
+                                        .help("Maximum selected source-frame pixels (default 16777216)")
+                                        .required(false);
   auto& max_new_tokens = Argparse::add<int>("-g|--max_new_tokens").help("Maximum generated tokens per prompt").required(false);
   auto& print_token_ids = Argparse::add<bool>("--print_token_ids").help("Print generated token IDs to stderr").required(false);
   auto& benchmark_warmup =
@@ -79,6 +97,7 @@ MLLM_MAIN({
 
     auto cfg = mllm::models::qwen3_5::Qwen3_5Config(config_path.get());
     const auto configured_image_paths = image_paths.get();
+    const bool has_video = video_path.isSet();
     int generation_limit = max_new_tokens.isSet() ? max_new_tokens.get() : 64;
     if (generation_limit <= 0 || generation_limit > cfg.max_cache_length) {
       throw std::invalid_argument("max_new_tokens must be between 1 and max_cache_length");
@@ -96,7 +115,41 @@ MLLM_MAIN({
     if (image_paths.isSet() && !cfg.vision_enabled) {
       throw std::invalid_argument("image_path requires a config with vision_config");
     }
+    if (has_video && video_path.get().empty()) { throw std::invalid_argument("video_path must not be empty"); }
+    if (has_video && image_paths.isSet()) {
+      throw std::invalid_argument("image_path and video_path are mutually exclusive in the bounded video contract");
+    }
+    if (has_video && !cfg.vision_enabled) { throw std::invalid_argument("video_path requires a config with vision_config"); }
     if (image_paths.isSet() && benchmark_mode) { throw std::invalid_argument("image_path is not supported in benchmark mode"); }
+    if (has_video && benchmark_mode) { throw std::invalid_argument("video_path is not supported in benchmark mode"); }
+    const double configured_video_fps = video_fps.isSet() ? video_fps.get() : 2.0;
+    constexpr int kVideoFrameCeiling = 64;
+    constexpr int kVideoByteCeiling = 268435456;
+    constexpr int kVideoTokenCeiling = 4096;
+    const int configured_video_max_frames = video_max_frames.isSet() ? video_max_frames.get() : kVideoFrameCeiling;
+    const int configured_video_max_bytes = video_max_bytes.isSet() ? video_max_bytes.get() : kVideoByteCeiling;
+    const int configured_video_max_tokens = video_max_tokens.isSet() ? video_max_tokens.get() : kVideoTokenCeiling;
+    constexpr int64_t kVideoDecodedPixelCeiling = 512LL * 1024 * 1024;
+    constexpr int64_t kVideoSelectedPixelCeiling = 16LL * 1024 * 1024;
+    const int64_t configured_video_max_decoded_pixels =
+        video_max_decoded_pixels.isSet() ? video_max_decoded_pixels.get() : kVideoDecodedPixelCeiling;
+    const int64_t configured_video_max_selected_pixels =
+        video_max_selected_pixels.isSet() ? video_max_selected_pixels.get() : kVideoSelectedPixelCeiling;
+    if (!(configured_video_fps > 0.0) || configured_video_max_frames < 4 || configured_video_max_frames > kVideoFrameCeiling
+        || configured_video_max_bytes <= 0 || configured_video_max_bytes > kVideoByteCeiling || configured_video_max_tokens <= 0
+        || configured_video_max_tokens > kVideoTokenCeiling || configured_video_max_decoded_pixels <= 0
+        || configured_video_max_decoded_pixels > kVideoDecodedPixelCeiling || configured_video_max_selected_pixels <= 0
+        || configured_video_max_selected_pixels > kVideoSelectedPixelCeiling) {
+      throw std::invalid_argument("video sampling or resource limits are outside the bounded contract");
+    }
+    if (!has_video
+        && (video_fps.isSet() || video_max_frames.isSet() || video_max_bytes.isSet() || video_max_tokens.isSet()
+            || video_max_decoded_pixels.isSet() || video_max_selected_pixels.isSet())) {
+      throw std::invalid_argument("video sampling and resource limits require video_path");
+    }
+#ifndef MLLM_QWEN35_VIDEO_DECODER_BACKEND_PORTABLE
+    if (has_video) { throw std::invalid_argument("video_path requires MLLM_QWEN35_VIDEO_DECODER_BACKEND=portable"); }
+#endif
     if (benchmark_mode) {
       if (!prompt_file.isSet() || !benchmark_samples.isSet() || !benchmark_jsonl.isSet() || !benchmark_variant.isSet()
           || !benchmark_source_sha.isSet() || !expected_prompt_tokens.isSet()) {
@@ -117,6 +170,41 @@ MLLM_MAIN({
         throw std::invalid_argument("benchmark_jsonl must be new or empty");
       }
     }
+
+#ifdef MLLM_QWEN35_VIDEO_DECODER_BACKEND_PORTABLE
+    std::optional<mllm::examples::qwen3_5::DecodedVideo> decoded_video;
+    if (has_video) {
+      decoded_video = mllm::examples::qwen3_5::decodeH264Mp4Portable(
+          video_path.get(), configured_video_fps, 4, configured_video_max_frames,
+          static_cast<size_t>(configured_video_max_bytes), configured_video_max_decoded_pixels,
+          configured_video_max_selected_pixels);
+      const mllm::models::qwen3_5::Qwen3_5VideoPreprocessor video_preprocessor(
+          4 * 32 * 32, 24 * 32 * 32 * 1024, cfg.vision_patch_size, cfg.vision_temporal_patch_size,
+          cfg.vision_spatial_merge_size);
+      const auto [resized_height, resized_width] = video_preprocessor.smartResize(
+          decoded_video->source_frame_indices.size(), decoded_video->source_height, decoded_video->source_width);
+      const int64_t grid_t =
+          (decoded_video->source_frame_indices.size() + cfg.vision_temporal_patch_size - 1) / cfg.vision_temporal_patch_size;
+      const int64_t projected_video_tokens = grid_t * (resized_height / cfg.vision_patch_size)
+                                             * (resized_width / cfg.vision_patch_size)
+                                             / (cfg.vision_spatial_merge_size * cfg.vision_spatial_merge_size);
+      if (projected_video_tokens > configured_video_max_tokens) {
+        throw std::invalid_argument(fmt::format("projected video tokens ({}) exceed video_max_tokens ({})",
+                                                projected_video_tokens, configured_video_max_tokens));
+      }
+      fmt::print("Video: {} source frames at {:.6g} fps, {}x{}, selected indices=", decoded_video->source_frame_count,
+                 decoded_video->source_frames_per_second, decoded_video->source_width, decoded_video->source_height);
+      for (size_t index = 0; index < decoded_video->source_frame_indices.size(); ++index) {
+        if (index != 0) fmt::print(",");
+        fmt::print("{}", decoded_video->source_frame_indices[index]);
+      }
+      fmt::print("; target_fps={:.6g}; max_frames={}; max_bytes={}; max_decoded_pixels={}; max_selected_pixels={}; "
+                 "projected_tokens={}; max_tokens={}\n",
+                 configured_video_fps, configured_video_max_frames, configured_video_max_bytes,
+                 configured_video_max_decoded_pixels, configured_video_max_selected_pixels, projected_video_tokens,
+                 configured_video_max_tokens);
+    }
+#endif
 
     auto param = mllm::load(model_path.get(), file_version);
     mllm::models::qwen3_5::validateModelConfigMatch(cfg, param);
@@ -244,7 +332,15 @@ MLLM_MAIN({
           // KV cache and every GDN recurrent/conv state must start empty.
           model.resetState();
           fmt::print("Processing...\n");
-          auto inputs = tokenizer.convertMessage({.prompt = prompt_text, .image_paths = configured_image_paths});
+          mllm::models::qwen3_5::Qwen3_5Message message{.prompt = prompt_text, .image_paths = configured_image_paths};
+#ifdef MLLM_QWEN35_VIDEO_DECODER_BACKEND_PORTABLE
+          if (decoded_video.has_value()) {
+            message.video_frames_thwc = decoded_video->frames_thwc;
+            message.video_frame_indices = decoded_video->source_frame_indices;
+            message.video_frames_per_second = decoded_video->source_frames_per_second;
+          }
+#endif
+          auto inputs = tokenizer.convertMessage(message);
           const auto prompt_length = inputs.at("sequence").shape()[1];
           if (prompt_length + generation_limit - 1 > cfg.max_cache_length) {
             throw std::invalid_argument(fmt::format("prompt token count ({}) plus max_new_tokens ({}) exceeds "

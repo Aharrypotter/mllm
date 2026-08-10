@@ -276,6 +276,7 @@ set_target_properties(flatbuffers PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_subdirectory(mllm)
 
 if(MLLM_ENABLE_TEST)
+  enable_testing()
   add_subdirectory(third_party/googletest EXCLUDE_FROM_ALL)
   add_subdirectory(tests)
 endif()

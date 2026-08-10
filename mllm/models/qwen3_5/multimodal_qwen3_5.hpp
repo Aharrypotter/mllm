@@ -53,36 +53,82 @@ inline auto expandQwen3_5SingleImagePlaceholders(const std::vector<int64_t>& tok
   return expandQwen3_5ImagePlaceholders(token_ids, image_token_id, {image_token_count});
 }
 
-inline void injectQwen3_5ImageEmbeddings(Tensor& input_embeddings, const Tensor& image_embeddings,
-                                         const Tensor& token_type_ids) {
+inline auto expandQwen3_5VideoPlaceholders(const std::vector<int64_t>& token_ids, int64_t video_token_id,
+                                           const std::vector<int32_t>& video_token_counts)
+    -> std::pair<std::vector<int64_t>, std::vector<int32_t>> {
+  if (video_token_counts.empty()
+      || std::any_of(video_token_counts.begin(), video_token_counts.end(), [](int32_t count) { return count <= 0; })) {
+    throw std::invalid_argument("Qwen3.5 video token counts must be non-empty and positive");
+  }
+  std::vector<int64_t> expanded;
+  std::vector<int32_t> token_types;
+  expanded.reserve(token_ids.size() + std::accumulate(video_token_counts.begin(), video_token_counts.end(), 0)
+                   - video_token_counts.size());
+  token_types.reserve(expanded.capacity());
+  size_t video_index = 0;
+  for (const auto token_id : token_ids) {
+    if (token_id != video_token_id) {
+      expanded.push_back(token_id);
+      token_types.push_back(0);
+      continue;
+    }
+    if (video_index >= video_token_counts.size()) {
+      throw std::invalid_argument("Qwen3.5 template contains more video placeholders than temporal patches");
+    }
+    expanded.insert(expanded.end(), video_token_counts[video_index], video_token_id);
+    token_types.insert(token_types.end(), video_token_counts[video_index], 2);
+    ++video_index;
+  }
+  if (video_index != video_token_counts.size()) {
+    throw std::invalid_argument("Qwen3.5 template contains fewer video placeholders than temporal patches");
+  }
+  return {expanded, token_types};
+}
+
+inline void injectQwen3_5ModalityEmbeddings(Tensor& input_embeddings, const Tensor& modality_embeddings,
+                                            const Tensor& token_type_ids, int32_t modality_type) {
   const auto& input_shape = input_embeddings.shape();
-  const auto& image_shape = image_embeddings.shape();
+  const auto& modality_shape = modality_embeddings.shape();
+  if (modality_type != 1 && modality_type != 2) {
+    throw std::invalid_argument("Qwen3.5 embedding injection requires image or video modality");
+  }
   if (input_embeddings.dtype() != kFloat32 || input_embeddings.device() != kCPU || !input_embeddings.isContiguous()
       || input_shape.size() != 3 || input_shape[0] != 1 || input_shape[1] <= 0 || input_shape[2] <= 0
-      || image_embeddings.dtype() != kFloat32 || image_embeddings.device() != kCPU || !image_embeddings.isContiguous()
-      || image_shape.size() != 2 || image_shape[0] <= 0 || image_shape[1] != input_shape[2] || token_type_ids.dtype() != kInt32
-      || token_type_ids.device() != kCPU || token_type_ids.shape() != Tensor::shape_t({1, input_shape[1]})) {
-    throw std::invalid_argument("Qwen3.5 image embedding injection received invalid inputs");
+      || modality_embeddings.dtype() != kFloat32 || modality_embeddings.device() != kCPU || !modality_embeddings.isContiguous()
+      || modality_shape.size() != 2 || modality_shape[0] <= 0 || modality_shape[1] != input_shape[2]
+      || token_type_ids.dtype() != kInt32 || token_type_ids.device() != kCPU
+      || token_type_ids.shape() != Tensor::shape_t({1, input_shape[1]})) {
+    throw std::invalid_argument("Qwen3.5 multimodal embedding injection received invalid inputs");
   }
 
   const auto* types = token_type_ids.ptr<int32_t>();
-  const auto* image_values = image_embeddings.ptr<float>();
+  const auto* modality_values = modality_embeddings.ptr<float>();
   auto* input_values = input_embeddings.ptr<float>();
   const int32_t sequence = input_shape[1];
   const int32_t hidden = input_shape[2];
   int32_t feature_offset = 0;
   for (int32_t position = 0; position < sequence; ++position) {
-    if (types[position] != 1) continue;
-    if (feature_offset >= image_shape[0]) {
-      throw std::invalid_argument("Qwen3.5 image placeholders outnumber image embeddings");
+    if (types[position] != modality_type) continue;
+    if (feature_offset >= modality_shape[0]) {
+      throw std::invalid_argument("Qwen3.5 modality placeholders outnumber modality embeddings");
     }
-    std::copy_n(image_values + static_cast<int64_t>(feature_offset) * hidden, hidden,
+    std::copy_n(modality_values + static_cast<int64_t>(feature_offset) * hidden, hidden,
                 input_values + static_cast<int64_t>(position) * hidden);
     ++feature_offset;
   }
-  if (feature_offset != image_shape[0]) {
-    throw std::invalid_argument("Qwen3.5 image embeddings outnumber image placeholders");
+  if (feature_offset != modality_shape[0]) {
+    throw std::invalid_argument("Qwen3.5 modality embeddings outnumber modality placeholders");
   }
+}
+
+inline void injectQwen3_5ImageEmbeddings(Tensor& input_embeddings, const Tensor& image_embeddings,
+                                         const Tensor& token_type_ids) {
+  injectQwen3_5ModalityEmbeddings(input_embeddings, image_embeddings, token_type_ids, 1);
+}
+
+inline void injectQwen3_5VideoEmbeddings(Tensor& input_embeddings, const Tensor& video_embeddings,
+                                         const Tensor& token_type_ids) {
+  injectQwen3_5ModalityEmbeddings(input_embeddings, video_embeddings, token_type_ids, 2);
 }
 
 inline auto makeQwen3_5InterleavedRotaryEmbedding(const Tensor& position_ids, const Tensor& inv_freq,
@@ -201,6 +247,105 @@ inline auto makeQwen3_5ImagePositionIds(const Tensor& token_type_ids, const Tens
     ++image_index;
   }
   if (image_index != grid_shape[0]) { throw std::invalid_argument("Qwen3.5 image grids outnumber image token spans"); }
+  return position_ids;
+}
+
+inline auto makeQwen3_5MultimodalPositionIds(const Tensor& token_type_ids, const Tensor& image_grid_thw,
+                                             const Tensor& video_grid_thw, int32_t spatial_merge_size) -> Tensor {
+  const auto& type_shape = token_type_ids.shape();
+  if (token_type_ids.dtype() != kInt32 || token_type_ids.device() != kCPU || type_shape.size() != 2 || type_shape[0] != 1
+      || type_shape[1] <= 0 || spatial_merge_size <= 0) {
+    throw std::invalid_argument("Qwen3.5 token_type_ids must be non-empty rank-2 int32 CPU with batch size 1");
+  }
+  const auto valid_grid = [](const Tensor& grid) {
+    return grid.isNil()
+           || (grid.dtype() == kInt32 && grid.device() == kCPU && grid.shape().size() == 2 && grid.shape()[0] > 0
+               && grid.shape()[1] == 3);
+  };
+  if (!valid_grid(image_grid_thw) || !valid_grid(video_grid_thw)) {
+    throw std::invalid_argument("Qwen3.5 multimodal grids must contain valid THW rows");
+  }
+
+  const int32_t sequence = type_shape[1];
+  const auto* token_types = token_type_ids.ptr<int32_t>();
+  const auto* image_grids = image_grid_thw.isNil() ? nullptr : image_grid_thw.ptr<int32_t>();
+  const auto* video_grids = video_grid_thw.isNil() ? nullptr : video_grid_thw.ptr<int32_t>();
+  const int32_t image_rows = image_grid_thw.isNil() ? 0 : image_grid_thw.shape()[0];
+  const int32_t video_rows = video_grid_thw.isNil() ? 0 : video_grid_thw.shape()[0];
+  auto position_ids = Tensor::empty({3, 1, sequence}, kInt64, kCPU).alloc();
+  auto* positions = position_ids.ptr<int64_t>();
+
+  int64_t current_position = 0;
+  int32_t image_index = 0;
+  int32_t video_index = 0;
+  int32_t video_temporal_index = 0;
+  int32_t s = 0;
+  while (s < sequence) {
+    const int32_t token_type = token_types[s];
+    if (token_type < 0 || token_type > 2) {
+      throw std::invalid_argument("Qwen3.5 multimodal support only accepts text, image, and video token types");
+    }
+    int32_t end = s + 1;
+    while (end < sequence && token_types[end] == token_type) ++end;
+    if (token_type == 0) {
+      for (; s < end; ++s) {
+        for (int32_t axis = 0; axis < 3; ++axis) { positions[axis * sequence + s] = current_position; }
+        ++current_position;
+      }
+      continue;
+    }
+
+    const int32_t* grid = nullptr;
+    int32_t grid_t = 0;
+    if (token_type == 1) {
+      if (image_index >= image_rows) { throw std::invalid_argument("Qwen3.5 image token spans outnumber image grids"); }
+      grid = image_grids + image_index * 3;
+      grid_t = grid[0];
+      ++image_index;
+    } else {
+      while (video_index < video_rows && video_temporal_index >= video_grids[video_index * 3]) {
+        ++video_index;
+        video_temporal_index = 0;
+      }
+      if (video_index >= video_rows) {
+        throw std::invalid_argument("Qwen3.5 video token spans outnumber temporal video grids");
+      }
+      grid = video_grids + video_index * 3;
+      grid_t = 1;
+      ++video_temporal_index;
+    }
+
+    const int32_t grid_h = grid[1];
+    const int32_t grid_w = grid[2];
+    if (grid_t <= 0 || grid_h <= 0 || grid_w <= 0 || grid_h % spatial_merge_size != 0 || grid_w % spatial_merge_size != 0) {
+      throw std::invalid_argument("Qwen3.5 multimodal grid is incompatible with the spatial merge size");
+    }
+    const int32_t llm_h = grid_h / spatial_merge_size;
+    const int32_t llm_w = grid_w / spatial_merge_size;
+    if (end - s != grid_t * llm_h * llm_w) {
+      throw std::invalid_argument("Qwen3.5 multimodal features and placeholders do not match");
+    }
+    int32_t visual_offset = 0;
+    for (int32_t t = 0; t < grid_t; ++t) {
+      for (int32_t h = 0; h < llm_h; ++h) {
+        for (int32_t w = 0; w < llm_w; ++w) {
+          const int32_t sequence_offset = s + visual_offset++;
+          positions[sequence_offset] = current_position + t;
+          positions[sequence + sequence_offset] = current_position + h;
+          positions[2 * sequence + sequence_offset] = current_position + w;
+        }
+      }
+    }
+    current_position += std::max(grid_h, grid_w) / spatial_merge_size;
+    s = end;
+  }
+
+  if (image_index != image_rows) { throw std::invalid_argument("Qwen3.5 image grids outnumber image token spans"); }
+  while (video_index < video_rows && video_temporal_index >= video_grids[video_index * 3]) {
+    ++video_index;
+    video_temporal_index = 0;
+  }
+  if (video_index != video_rows) { throw std::invalid_argument("Qwen3.5 temporal video grids outnumber video token spans"); }
   return position_ids;
 }
 
