@@ -129,6 +129,17 @@ mllm-qwen3-5-runner \
   --prompt "Describe the image." \
   --max_new_tokens 32
 
+# Qwen3.5-0.8B multi-image (image order is preserved)
+mllm-qwen3-5-runner \
+  --model_path /path/to/qwen3.5-0.8b-multimodal-w4a32-kai.mllm \
+  --model_version v2 \
+  --tokenizer_path /path/to/Qwen3.5-0.8B/tokenizer.json \
+  --config_path examples/qwen3_5/config_0.8B_multimodal_w4a32_kai.json \
+  --image_path /path/to/first.jpg \
+  --image_path /path/to/second.jpg \
+  --prompt "Compare the first and second images." \
+  --max_new_tokens 32
+
 # Qwen3.5-4B text-only
 mllm-qwen3-5-runner \
   --model_path /path/to/qwen3.5-4b-w4a32-kai.mllm \
@@ -139,6 +150,8 @@ mllm-qwen3-5-runner \
   --max_new_tokens 32
 ```
 
-Omit `--prompt` for the interactive loop. The same optional image is used for
-each independent prompt in that process. Omit `--image_path` to run text-only
-inference with either the text-only or multimodal 0.8B model.
+Omit `--prompt` for the interactive loop. Repeat `--image_path` to attach
+multiple still images in order; the same ordered image list is used for each
+independent prompt in that process. Omit `--image_path` to run text-only
+inference with either the text-only or multimodal 0.8B model. Video input is
+not supported.

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <numeric>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -14,26 +15,74 @@
 
 namespace mllm::models::qwen3_5 {
 
+inline auto expandQwen3_5ImagePlaceholders(const std::vector<int64_t>& token_ids, int64_t image_token_id,
+                                           const std::vector<int32_t>& image_token_counts)
+    -> std::pair<std::vector<int64_t>, std::vector<int32_t>> {
+  if (image_token_counts.empty()
+      || std::any_of(image_token_counts.begin(), image_token_counts.end(), [](int32_t count) { return count <= 0; })) {
+    throw std::invalid_argument("Qwen3.5 image token counts must be non-empty and positive");
+  }
+  std::vector<int64_t> expanded;
+  std::vector<int32_t> token_types;
+  expanded.reserve(token_ids.size() + std::accumulate(image_token_counts.begin(), image_token_counts.end(), 0)
+                   - image_token_counts.size());
+  token_types.reserve(expanded.capacity());
+  size_t image_index = 0;
+  for (const auto token_id : token_ids) {
+    if (token_id != image_token_id) {
+      expanded.push_back(token_id);
+      token_types.push_back(0);
+      continue;
+    }
+    if (image_index >= image_token_counts.size()) {
+      throw std::invalid_argument("Qwen3.5 template contains more image placeholders than images");
+    }
+    expanded.insert(expanded.end(), image_token_counts[image_index], image_token_id);
+    token_types.insert(token_types.end(), image_token_counts[image_index], 1);
+    ++image_index;
+  }
+  if (image_index != image_token_counts.size()) {
+    throw std::invalid_argument("Qwen3.5 template contains fewer image placeholders than images");
+  }
+  return {expanded, token_types};
+}
+
 inline auto expandQwen3_5SingleImagePlaceholders(const std::vector<int64_t>& token_ids, int64_t image_token_id,
                                                  int32_t image_token_count)
     -> std::pair<std::vector<int64_t>, std::vector<int32_t>> {
-  if (image_token_count <= 0) { throw std::invalid_argument("Qwen3.5 image token count must be positive"); }
-  const auto first = std::find(token_ids.begin(), token_ids.end(), image_token_id);
-  if (first == token_ids.end() || std::find(first + 1, token_ids.end(), image_token_id) != token_ids.end()) {
-    throw std::invalid_argument("Qwen3.5 single-image template must contain exactly one image placeholder");
+  return expandQwen3_5ImagePlaceholders(token_ids, image_token_id, {image_token_count});
+}
+
+inline void injectQwen3_5ImageEmbeddings(Tensor& input_embeddings, const Tensor& image_embeddings,
+                                         const Tensor& token_type_ids) {
+  const auto& input_shape = input_embeddings.shape();
+  const auto& image_shape = image_embeddings.shape();
+  if (input_embeddings.dtype() != kFloat32 || input_embeddings.device() != kCPU || !input_embeddings.isContiguous()
+      || input_shape.size() != 3 || input_shape[0] != 1 || input_shape[1] <= 0 || input_shape[2] <= 0
+      || image_embeddings.dtype() != kFloat32 || image_embeddings.device() != kCPU || !image_embeddings.isContiguous()
+      || image_shape.size() != 2 || image_shape[0] <= 0 || image_shape[1] != input_shape[2] || token_type_ids.dtype() != kInt32
+      || token_type_ids.device() != kCPU || token_type_ids.shape() != Tensor::shape_t({1, input_shape[1]})) {
+    throw std::invalid_argument("Qwen3.5 image embedding injection received invalid inputs");
   }
 
-  const auto image_offset = static_cast<size_t>(std::distance(token_ids.begin(), first));
-  std::vector<int64_t> expanded;
-  expanded.reserve(token_ids.size() + image_token_count - 1);
-  expanded.insert(expanded.end(), token_ids.begin(), first);
-  expanded.insert(expanded.end(), image_token_count, image_token_id);
-  expanded.insert(expanded.end(), first + 1, token_ids.end());
-
-  std::vector<int32_t> token_types(expanded.size(), 0);
-  std::fill(token_types.begin() + static_cast<std::ptrdiff_t>(image_offset),
-            token_types.begin() + static_cast<std::ptrdiff_t>(image_offset + image_token_count), 1);
-  return {expanded, token_types};
+  const auto* types = token_type_ids.ptr<int32_t>();
+  const auto* image_values = image_embeddings.ptr<float>();
+  auto* input_values = input_embeddings.ptr<float>();
+  const int32_t sequence = input_shape[1];
+  const int32_t hidden = input_shape[2];
+  int32_t feature_offset = 0;
+  for (int32_t position = 0; position < sequence; ++position) {
+    if (types[position] != 1) continue;
+    if (feature_offset >= image_shape[0]) {
+      throw std::invalid_argument("Qwen3.5 image placeholders outnumber image embeddings");
+    }
+    std::copy_n(image_values + static_cast<int64_t>(feature_offset) * hidden, hidden,
+                input_values + static_cast<int64_t>(position) * hidden);
+    ++feature_offset;
+  }
+  if (feature_offset != image_shape[0]) {
+    throw std::invalid_argument("Qwen3.5 image embeddings outnumber image placeholders");
+  }
 }
 
 inline auto makeQwen3_5InterleavedRotaryEmbedding(const Tensor& position_ids, const Tensor& inv_freq,
@@ -89,79 +138,78 @@ inline auto makeQwen3_5InterleavedRotaryEmbedding(const Tensor& position_ids, co
   return {sin, cos};
 }
 
-inline auto makeQwen3_5SingleImagePositionIds(const Tensor& token_type_ids, const Tensor& image_grid_thw,
-                                              int32_t spatial_merge_size) -> Tensor {
+inline auto makeQwen3_5ImagePositionIds(const Tensor& token_type_ids, const Tensor& image_grid_thw, int32_t spatial_merge_size)
+    -> Tensor {
   const auto& type_shape = token_type_ids.shape();
   const auto& grid_shape = image_grid_thw.shape();
   if (token_type_ids.dtype() != kInt32 || token_type_ids.device() != kCPU || type_shape.size() != 2 || type_shape[0] != 1
       || type_shape[1] <= 0) {
     throw std::invalid_argument("Qwen3.5 token_type_ids must be non-empty rank-2 int32 CPU with batch size 1");
   }
-  if (image_grid_thw.dtype() != kInt32 || image_grid_thw.device() != kCPU || grid_shape.size() != 2 || grid_shape[0] != 1
+  if (image_grid_thw.dtype() != kInt32 || image_grid_thw.device() != kCPU || grid_shape.size() != 2 || grid_shape[0] <= 0
       || grid_shape[1] != 3 || spatial_merge_size <= 0) {
-    throw std::invalid_argument("Qwen3.5 image_grid_thw must contain exactly one valid image grid");
+    throw std::invalid_argument("Qwen3.5 image_grid_thw must contain one valid row per image");
   }
-
-  const auto* grid = image_grid_thw.ptr<int32_t>();
-  const int32_t grid_t = grid[0];
-  const int32_t grid_h = grid[1];
-  const int32_t grid_w = grid[2];
-  if (grid_t <= 0 || grid_h <= 0 || grid_w <= 0 || grid_h % spatial_merge_size != 0 || grid_w % spatial_merge_size != 0) {
-    throw std::invalid_argument("Qwen3.5 image grid is incompatible with the spatial merge size");
-  }
-  const int32_t llm_t = grid_t;
-  const int32_t llm_h = grid_h / spatial_merge_size;
-  const int32_t llm_w = grid_w / spatial_merge_size;
-  const int32_t expected_image_tokens = llm_t * llm_h * llm_w;
-
   const int32_t sequence = type_shape[1];
   const auto* token_types = token_type_ids.ptr<int32_t>();
-  int32_t image_begin = -1;
-  int32_t image_end = -1;
-  bool left_image_span = false;
-  for (int32_t s = 0; s < sequence; ++s) {
-    if (token_types[s] != 0 && token_types[s] != 1) {
-      throw std::invalid_argument("Qwen3.5 single-image support only accepts text and image token types");
-    }
-    if (token_types[s] == 1) {
-      if (left_image_span) { throw std::invalid_argument("Qwen3.5 supports exactly one contiguous image token span"); }
-      if (image_begin < 0) image_begin = s;
-      image_end = s + 1;
-    } else if (image_begin >= 0) {
-      left_image_span = true;
-    }
-  }
-  if (image_begin < 0 || image_end - image_begin != expected_image_tokens) {
-    throw std::invalid_argument("Qwen3.5 image features and image placeholders do not match");
-  }
-
+  const auto* grids = image_grid_thw.ptr<int32_t>();
   auto position_ids = Tensor::empty({3, 1, sequence}, kInt64, kCPU).alloc();
   auto* positions = position_ids.ptr<int64_t>();
   int64_t current_position = 0;
-
-  for (int32_t s = 0; s < image_begin; ++s) {
-    for (int32_t axis = 0; axis < 3; ++axis) { positions[axis * sequence + s] = current_position; }
-    ++current_position;
-  }
-
-  int32_t image_offset = 0;
-  for (int32_t t = 0; t < llm_t; ++t) {
-    for (int32_t h = 0; h < llm_h; ++h) {
-      for (int32_t w = 0; w < llm_w; ++w) {
-        const int32_t sequence_offset = image_begin + image_offset++;
-        positions[sequence_offset] = current_position + t;
-        positions[sequence + sequence_offset] = current_position + h;
-        positions[2 * sequence + sequence_offset] = current_position + w;
+  int32_t image_index = 0;
+  int32_t s = 0;
+  while (s < sequence) {
+    const int32_t token_type = token_types[s];
+    if (token_type != 0 && token_type != 1) {
+      throw std::invalid_argument("Qwen3.5 image support only accepts text and image token types");
+    }
+    int32_t end = s + 1;
+    while (end < sequence && token_types[end] == token_type) ++end;
+    if (token_type == 0) {
+      for (; s < end; ++s) {
+        for (int32_t axis = 0; axis < 3; ++axis) { positions[axis * sequence + s] = current_position; }
+        ++current_position;
+      }
+      continue;
+    }
+    if (image_index >= grid_shape[0]) { throw std::invalid_argument("Qwen3.5 image token spans outnumber image grids"); }
+    const auto* grid = grids + image_index * 3;
+    const int32_t grid_t = grid[0];
+    const int32_t grid_h = grid[1];
+    const int32_t grid_w = grid[2];
+    if (grid_t <= 0 || grid_h <= 0 || grid_w <= 0 || grid_h % spatial_merge_size != 0 || grid_w % spatial_merge_size != 0) {
+      throw std::invalid_argument("Qwen3.5 image grid is incompatible with the spatial merge size");
+    }
+    const int32_t llm_h = grid_h / spatial_merge_size;
+    const int32_t llm_w = grid_w / spatial_merge_size;
+    if (end - s != grid_t * llm_h * llm_w) {
+      throw std::invalid_argument("Qwen3.5 image features and image placeholders do not match");
+    }
+    int32_t image_offset = 0;
+    for (int32_t t = 0; t < grid_t; ++t) {
+      for (int32_t h = 0; h < llm_h; ++h) {
+        for (int32_t w = 0; w < llm_w; ++w) {
+          const int32_t sequence_offset = s + image_offset++;
+          positions[sequence_offset] = current_position + t;
+          positions[sequence + sequence_offset] = current_position + h;
+          positions[2 * sequence + sequence_offset] = current_position + w;
+        }
       }
     }
+    current_position += std::max(grid_h, grid_w) / spatial_merge_size;
+    s = end;
+    ++image_index;
   }
-  current_position += std::max(grid_h, grid_w) / spatial_merge_size;
-
-  for (int32_t s = image_end; s < sequence; ++s) {
-    for (int32_t axis = 0; axis < 3; ++axis) { positions[axis * sequence + s] = current_position; }
-    ++current_position;
-  }
+  if (image_index != grid_shape[0]) { throw std::invalid_argument("Qwen3.5 image grids outnumber image token spans"); }
   return position_ids;
+}
+
+inline auto makeQwen3_5SingleImagePositionIds(const Tensor& token_type_ids, const Tensor& image_grid_thw,
+                                              int32_t spatial_merge_size) -> Tensor {
+  if (image_grid_thw.shape().size() != 2 || image_grid_thw.shape()[0] != 1) {
+    throw std::invalid_argument("Qwen3.5 single-image positions require exactly one image grid");
+  }
+  return makeQwen3_5ImagePositionIds(token_type_ids, image_grid_thw, spatial_merge_size);
 }
 
 inline auto advanceQwen3_5PositionIds(const Tensor& previous_position_ids) -> Tensor {

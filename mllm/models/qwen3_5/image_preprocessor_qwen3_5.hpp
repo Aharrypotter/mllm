@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "mllm/core/Tensor.hpp"
 #include "mllm/preprocessor/visual/Image.hpp"
@@ -66,6 +67,35 @@ class Qwen3_5ImagePreprocessor {
     auto [height, width] = smartResize(image.h(), image.w());
     image = image.resize(width, height, "bicubic");
     return flattenNormalizedPatches(image.tensor());
+  }
+
+  std::pair<Tensor, Tensor> operator()(const std::vector<std::string>& image_paths) const {
+    if (image_paths.empty()) { throw std::invalid_argument("Qwen3.5 image path list must not be empty"); }
+    std::vector<std::pair<Tensor, Tensor>> processed_images;
+    processed_images.reserve(image_paths.size());
+    int32_t total_patches = 0;
+    int32_t patch_features = -1;
+    for (const auto& image_path : image_paths) {
+      auto processed = (*this)(image_path);
+      if (patch_features < 0) patch_features = processed.first.shape()[1];
+      if (processed.first.shape().size() != 2 || processed.first.shape()[1] != patch_features) {
+        throw std::runtime_error("Qwen3.5 preprocessed images have incompatible patch features");
+      }
+      total_patches += processed.first.shape()[0];
+      processed_images.push_back(std::move(processed));
+    }
+
+    auto patches = Tensor::empty({total_patches, patch_features}, kFloat32, kCPU).alloc();
+    auto grids = Tensor::empty({static_cast<int32_t>(image_paths.size()), 3}, kInt32, kCPU).alloc();
+    int64_t patch_offset = 0;
+    for (size_t image_index = 0; image_index < processed_images.size(); ++image_index) {
+      const auto& [image_patches, image_grid] = processed_images[image_index];
+      std::copy(image_patches.ptr<float>(), image_patches.ptr<float>() + image_patches.numel(),
+                patches.ptr<float>() + patch_offset);
+      std::copy(image_grid.ptr<int32_t>(), image_grid.ptr<int32_t>() + 3, grids.ptr<int32_t>() + image_index * 3);
+      patch_offset += image_patches.numel();
+    }
+    return {patches, grids};
   }
 
   // Exposed for focused tests and reference-oracle comparisons. Input is an

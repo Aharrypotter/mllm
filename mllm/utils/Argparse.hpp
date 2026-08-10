@@ -79,7 +79,9 @@ class Argument : public ArgumentBase, public ArgArgument<Argument<T>> {
         MLLM_ERROR_EXIT(ExitCode::kCoreError, "Invalid boolean value");
       }
     } else {
-      if constexpr (std::is_same<T, std::string>()) {
+      if constexpr (std::is_same_v<T, std::vector<std::string>>) {
+        value_.push_back(value);
+      } else if constexpr (std::is_same<T, std::string>()) {
         value_ = iss.str();
       } else {
         iss >> value_;

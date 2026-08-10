@@ -244,12 +244,9 @@ inline bool qwen3_5Regex(const std::string& str, std::vector<std::wstring>& spli
 
 struct Qwen3_5Message {
   std::string prompt;
-  std::string image_path;
+  std::vector<std::string> image_paths;
   static inline std::string message_template =
       "<|im_start|>user\n{{{prompt}}}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
-  static inline std::string image_message_template =
-      "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{{{prompt}}}<|im_end|>\n"
-      "<|im_start|>assistant\n<think>\n\n</think>\n\n";
 };
 
 class Qwen3_5Tokenizer final : public mllm::preprocessor::AutoTokenizer {
@@ -365,8 +362,18 @@ class Qwen3_5Tokenizer final : public mllm::preprocessor::AutoTokenizer {
       }
     }
 
-    const bool has_image = !message.image_path.empty();
-    auto applied_string = has_image ? Qwen3_5Message::image_message_template : Qwen3_5Message::message_template;
+    const bool has_image = !message.image_paths.empty();
+    auto applied_string = Qwen3_5Message::message_template;
+    if (has_image) {
+      const auto user_content = applied_string.find("user\n");
+      if (user_content == std::string::npos) { throw std::runtime_error("Qwen3.5 message template is malformed"); }
+      std::string image_markers;
+      image_markers.reserve(message.image_paths.size() * 48);
+      for (size_t i = 0; i < message.image_paths.size(); ++i) {
+        image_markers += "<|vision_start|><|image_pad|><|vision_end|>";
+      }
+      applied_string.insert(user_content + 5, image_markers);
+    }
     static constexpr char kPromptPlaceholder[] = "{{{prompt}}}";
     size_t pos = applied_string.find(kPromptPlaceholder);
     if (pos == std::string::npos) { throw std::runtime_error("Qwen3.5 message template is missing the prompt placeholder"); }
@@ -381,11 +388,16 @@ class Qwen3_5Tokenizer final : public mllm::preprocessor::AutoTokenizer {
     Tensor image_grid_thw = Tensor::nil();
     std::vector<int32_t> token_types;
     if (has_image) {
-      std::tie(pixel_values, image_grid_thw) = image_preprocessor_(message.image_path);
+      std::tie(pixel_values, image_grid_thw) = image_preprocessor_(message.image_paths);
       const auto* grid = image_grid_thw.ptr<int32_t>();
-      const int32_t image_token_count = grid[0] * grid[1] * grid[2] / (vision_spatial_merge_size_ * vision_spatial_merge_size_);
+      std::vector<int32_t> image_token_counts(message.image_paths.size());
+      for (size_t image_index = 0; image_index < message.image_paths.size(); ++image_index) {
+        const auto* image_grid = grid + image_index * 3;
+        image_token_counts[image_index] =
+            image_grid[0] * image_grid[1] * image_grid[2] / (vision_spatial_merge_size_ * vision_spatial_merge_size_);
+      }
       const int64_t image_token_id = bpe_._lookup_vocab(L"<|image_pad|>");
-      std::tie(ids, token_types) = expandQwen3_5SingleImagePlaceholders(ids, image_token_id, image_token_count);
+      std::tie(ids, token_types) = expandQwen3_5ImagePlaceholders(ids, image_token_id, image_token_counts);
     }
 
     Tensor sequence = Tensor::empty({/*batch*/ 1, /*seq*/ static_cast<int32_t>(ids.size())}, kInt64, kCPU)

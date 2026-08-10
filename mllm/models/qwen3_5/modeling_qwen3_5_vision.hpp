@@ -327,20 +327,48 @@ class Qwen3_5VisionModel final : public nn::Module {
   std::vector<Tensor> forward(const std::vector<Tensor>& inputs, const std::vector<AnyValue>& args) override {
     const auto& pixel_values = inputs[0];
     const auto& grid_thw = inputs[1];
+    if (pixel_values.shape().size() != 2 || grid_thw.dtype() != kInt32 || grid_thw.device() != kCPU
+        || grid_thw.shape().size() != 2 || grid_thw.shape()[0] <= 0 || grid_thw.shape()[1] != 3) {
+      throw std::invalid_argument("Qwen3.5 vision model requires patches and one grid row per image");
+    }
+    const auto* grids = grid_thw.ptr<int32_t>();
+    int32_t patch_offset = 0;
+    std::vector<Tensor> image_outputs;
+    image_outputs.reserve(grid_thw.shape()[0]);
+    for (int32_t image_index = 0; image_index < grid_thw.shape()[0]; ++image_index) {
+      const auto* grid = grids + image_index * 3;
+      if (grid[0] <= 0 || grid[1] <= 0 || grid[2] <= 0) {
+        throw std::invalid_argument("Qwen3.5 vision image grids must be positive");
+      }
+      const int32_t patch_count = grid[0] * grid[1] * grid[2];
+      if (patch_count > pixel_values.shape()[0] - patch_offset) {
+        throw std::invalid_argument("Qwen3.5 image grids exceed the supplied patch rows");
+      }
+      auto image_pixels = pixel_values[{{patch_offset, patch_offset + patch_count}, kAll}].contiguous();
+      auto image_grid = grid_thw[{{image_index, image_index + 1}, kAll}].contiguous();
+      image_outputs.push_back(forwardImage(image_pixels, image_grid));
+      patch_offset += patch_count;
+    }
+    if (patch_offset != pixel_values.shape()[0]) {
+      throw std::invalid_argument("Qwen3.5 supplied patch rows exceed the image grids");
+    }
+    return {image_outputs.size() == 1 ? image_outputs[0] : nn::functional::concat(image_outputs, 0)};
+  }
+
+ private:
+  Tensor forwardImage(const Tensor& pixel_values, const Tensor& grid_thw) {
     auto hidden_states = patch_embed_(pixel_values)[0];
     auto position_embedding = makeQwen3_5VisionBilinearPositionEmbedding(pos_embed_.weight(), grid_thw, spatial_merge_size_);
     if (hidden_states.shape() != position_embedding.shape()) {
       throw std::invalid_argument("Qwen3.5 patch embeddings do not match the image grid");
     }
     hidden_states = hidden_states + position_embedding;
-
     auto position_ids = makeQwen3_5VisionPositionIds(grid_thw, spatial_merge_size_);
     auto [sin, cos] = makeQwen3_5VisionRotaryEmbedding(position_ids, hidden_size_ / num_heads_);
     for (auto& block : blocks_.list()) { hidden_states = block(hidden_states, sin, cos)[0]; }
-    return {merger_(hidden_states)[0]};
+    return merger_(hidden_states)[0];
   }
 
- private:
   int32_t hidden_size_ = 768;
   int32_t num_heads_ = 12;
   int32_t spatial_merge_size_ = 2;
