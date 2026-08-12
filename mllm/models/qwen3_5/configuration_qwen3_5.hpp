@@ -152,7 +152,7 @@ struct Qwen3_5Config : protected ConfigFile {
         throw std::invalid_argument("Qwen3.5 CPU only supports gelu_pytorch_tanh in vision blocks");
       }
       if (!vision_deepstack_visual_indexes.empty()) {
-        throw std::invalid_argument("Qwen3.5 CPU single-image support does not implement deep-stack visual features");
+        throw std::invalid_argument("Qwen3.5 CPU multimodal support does not implement deep-stack visual features");
       }
       if (!mrope_interleaved || mrope_section.size() != 3
           || std::any_of(mrope_section.begin(), mrope_section.end(), [](int32_t section) { return section <= 0; })
@@ -310,7 +310,7 @@ inline auto isOfficialQwen35_08BTextRuntimeConfig(const Qwen3_5Config& config) -
   return hasOfficialQwen35_08BTextGeometry(config) && !config.vision_enabled;
 }
 
-/// Checks the single-image Qwen3.5-0.8B vision and deployment contract.
+/// Checks the Qwen3.5-0.8B vision and bounded mobile deployment contract.
 inline auto isOfficialQwen35_08BMultimodalRuntimeConfig(const Qwen3_5Config& config) -> bool {
   return hasOfficialQwen35_08BTextGeometry(config) && config.vision_enabled && config.vision_depth == 12
          && config.vision_hidden_size == 768 && config.vision_intermediate_size == 3072 && config.vision_in_channels == 3
@@ -327,14 +327,39 @@ inline auto isOfficialQwen35_08BRuntimeConfig(const Qwen3_5Config& config) -> bo
   return isOfficialQwen35_08BTextRuntimeConfig(config) || isOfficialQwen35_08BMultimodalRuntimeConfig(config);
 }
 
-/// Checks whether \p config is the official Qwen3.5-4B runtime configuration: the shared
-/// contract plus the 4B hidden/intermediate sizes, layer count, and head counts.
-/// \param config Qwen3.5 text-tower configuration to inspect.
-/// \return true only for the supported 4B variant.
-inline auto isOfficialQwen35_4BRuntimeConfig(const Qwen3_5Config& config) -> bool {
+inline auto hasOfficialQwen35_4BTextGeometry(const Qwen3_5Config& config) -> bool {
   return hasOfficialCommonRuntimeContract(config) && config.hidden_size == 2560 && config.intermediate_size == 9216
          && config.num_hidden_layers == 32 && config.num_attention_heads == 16 && config.num_key_value_heads == 4
-         && config.linear_num_value_heads == 32 && !config.vision_enabled;
+         && config.linear_num_value_heads == 32;
+}
+
+/// Checks whether \p config is the official text-only Qwen3.5-4B runtime configuration.
+/// \param config Qwen3.5 text-tower configuration to inspect.
+/// \return true only for the supported text-only 4B variant.
+inline auto isOfficialQwen35_4BTextRuntimeConfig(const Qwen3_5Config& config) -> bool {
+  return hasOfficialQwen35_4BTextGeometry(config) && !config.vision_enabled;
+}
+
+/// Checks the Qwen3.5-4B vision and bounded mobile deployment contract.
+inline auto isOfficialQwen35_4BMultimodalRuntimeConfig(const Qwen3_5Config& config) -> bool {
+  return hasOfficialQwen35_4BTextGeometry(config) && config.vision_enabled && config.vision_depth == 24
+         && config.vision_hidden_size == 1024 && config.vision_intermediate_size == 4096 && config.vision_in_channels == 3
+         && config.vision_num_heads == 16 && config.vision_num_position_embeddings == 2304
+         && config.vision_out_hidden_size == 2560 && config.vision_patch_size == 16 && config.vision_spatial_merge_size == 2
+         && config.vision_temporal_patch_size == 2 && config.vision_hidden_act == "gelu_pytorch_tanh"
+         && config.vision_deepstack_visual_indexes.empty() && config.image_token_id == 248056 && config.video_token_id == 248057
+         && config.vision_start_token_id == 248053 && config.vision_end_token_id == 248054
+         && config.image_min_pixels == 256 * 256 && config.image_max_pixels == 512 * 512;
+}
+
+/// Checks whether \p config is either supported Qwen3.5-4B runtime contract.
+inline auto isOfficialQwen35_4BRuntimeConfig(const Qwen3_5Config& config) -> bool {
+  return isOfficialQwen35_4BTextRuntimeConfig(config) || isOfficialQwen35_4BMultimodalRuntimeConfig(config);
+}
+
+/// Checks whether \p config is either supported multimodal runtime contract.
+inline auto isOfficialQwen35MultimodalRuntimeConfig(const Qwen3_5Config& config) -> bool {
+  return isOfficialQwen35_08BMultimodalRuntimeConfig(config) || isOfficialQwen35_4BMultimodalRuntimeConfig(config);
 }
 
 /// Checks whether \p config is one of the runtime contracts this CPU runner supports.
@@ -346,12 +371,13 @@ inline auto matchesOfficialRuntimeContract(const Qwen3_5Config& config) -> bool 
 
 /// Resolves a human-readable model name for diagnostics and error messages.
 /// \param config Qwen3.5 text-tower configuration to inspect.
-/// \return "Qwen3.5-0.8B" or "Qwen3.5-4B" for a supported variant, otherwise the generic
-/// fallback "Qwen3.5 text model".
+/// \return A size- and modality-specific name for a supported variant, otherwise the
+/// generic fallback "Qwen3.5 text model".
 inline auto modelNameForConfig(const Qwen3_5Config& config) -> std::string {
   if (isOfficialQwen35_08BMultimodalRuntimeConfig(config)) { return "Qwen3.5-0.8B Multimodal"; }
+  if (isOfficialQwen35_4BMultimodalRuntimeConfig(config)) { return "Qwen3.5-4B Multimodal"; }
   if (isOfficialQwen35_08BTextRuntimeConfig(config)) { return "Qwen3.5-0.8B"; }
-  if (isOfficialQwen35_4BRuntimeConfig(config)) { return "Qwen3.5-4B"; }
+  if (isOfficialQwen35_4BTextRuntimeConfig(config)) { return "Qwen3.5-4B"; }
   return "Qwen3.5 text model";
 }
 
@@ -381,7 +407,7 @@ inline void validateModelConfigMatch(const Qwen3_5Config& config, const Paramete
   if (embedding.dtype() != kFloat32) {
     throw std::invalid_argument("Qwen3.5 model/config mismatch: " + model_name + " requires a float32 embedding tensor");
   }
-  const bool multimodal = isOfficialQwen35_08BMultimodalRuntimeConfig(config);
+  const bool multimodal = isOfficialQwen35MultimodalRuntimeConfig(config);
   if (multimodal && parameter_file->version() != ModelFileVersion::kV2) {
     throw std::invalid_argument("Qwen3.5 model/config mismatch: multimodal inference requires model-file V2");
   }

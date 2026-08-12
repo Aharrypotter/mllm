@@ -161,6 +161,35 @@ class Qwen35ValidatorTest(unittest.TestCase):
             103,
         )
 
+    def test_official_4b_multimodal_recipe_and_descriptors(self) -> None:
+        config = _load_json("config_4B_multimodal_w4a32_kai.json")
+        quant_config = _load_json("quant_cfg_4B_multimodal_w4a32_kai.json")
+
+        checkpoint_config = copy.deepcopy(config)
+        checkpoint_config["vision_config"].update(
+            {"initializer_range": 0.02, "model_type": "qwen3_5"}
+        )
+        validate_multimodal_config_contract(checkpoint_config, config)
+        quantized_names, _ = validate_kai_recipe_contract(
+            checkpoint_config["text_config"],
+            quant_config,
+            config,
+            checkpoint_config["vision_config"],
+        )
+        self.assertEqual(len(quantized_names), 445)
+        self.assertEqual(len(expected_vision_shapes(config["vision_config"])), 297)
+
+        expected = _expected_descriptors(config, quant_config)
+        dtype_counts = Counter(dtype for dtype, _, _ in expected.values())
+        self.assertEqual(len(expected), 626)
+        self.assertEqual(dtype_counts[BYTE], 347)
+        self.assertEqual(dtype_counts[FLOAT32], 279)
+        self.assertEqual(
+            sum(name.startswith("model.visual.") for name in expected),
+            199,
+        )
+        self.assertEqual(sum(size for _, _, size in expected.values()), 5_126_041_600)
+
     def test_multimodal_recipe_rejects_text_runtime_and_contract_drift(self) -> None:
         config = _load_json("config_0.8B_multimodal_w4a32_kai.json")
         text_runtime = _load_json("config_0.8B_w4a32_kai.json")
@@ -178,6 +207,17 @@ class Qwen35ValidatorTest(unittest.TestCase):
         mutated["image_max_pixels"] = 1024 * 1024
         with self.assertRaisesRegex(AssertionError, "image_max_pixels"):
             validate_multimodal_config_contract(config, mutated)
+
+        config_4b = _load_json("config_4B_multimodal_w4a32_kai.json")
+        wrong_vision = copy.deepcopy(config_4b)
+        wrong_vision["vision_config"]["depth"] = 12
+        with self.assertRaisesRegex(
+            AssertionError, "official Qwen3.5-4B"
+        ):
+            validate_multimodal_config_contract(config_4b, wrong_vision)
+
+        with self.assertRaisesRegex(AssertionError, "runtime is Qwen3.5-0.8B"):
+            validate_multimodal_config_contract(config_4b, config)
 
     def test_variant_resolution_rejects_runtime_semantic_mismatches(self) -> None:
         text_config = _load_json("config_4B_w4a32_kai.json")["text_config"]
