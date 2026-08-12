@@ -14,16 +14,24 @@
 #include "mllm/models/qwen3_5/image_preprocessor_qwen3_5.hpp"
 #include "mllm/models/qwen3_5/modeling_qwen3_5.hpp"
 #include "mllm/models/qwen3_5/multimodal_qwen3_5.hpp"
+#include "mllm/models/qwen3_5/tokenization_qwen3_5.hpp"
+#include "mllm/models/qwen3_5/video_preprocessor_qwen3_5.hpp"
 
 namespace {
 
 using mllm::models::qwen3_5::advanceQwen3_5PositionIds;
+using mllm::models::qwen3_5::calculateQwen3_5VideoTimestamps;
+using mllm::models::qwen3_5::convertQwen3_5I420ToRgb;
 using mllm::models::qwen3_5::expandQwen3_5ImagePlaceholders;
 using mllm::models::qwen3_5::expandQwen3_5SingleImagePlaceholders;
+using mllm::models::qwen3_5::expandQwen3_5VideoPlaceholders;
 using mllm::models::qwen3_5::injectQwen3_5ImageEmbeddings;
+using mllm::models::qwen3_5::injectQwen3_5VideoEmbeddings;
 using mllm::models::qwen3_5::makeQwen3_5ImagePositionIds;
 using mllm::models::qwen3_5::makeQwen3_5InterleavedRotaryEmbedding;
+using mllm::models::qwen3_5::makeQwen3_5MultimodalPositionIds;
 using mllm::models::qwen3_5::makeQwen3_5SingleImagePositionIds;
+using mllm::models::qwen3_5::makeQwen3_5VideoMarkers;
 using mllm::models::qwen3_5::makeQwen3_5VisionBilinearPositionEmbedding;
 using mllm::models::qwen3_5::makeQwen3_5VisionPositionIds;
 using mllm::models::qwen3_5::makeQwen3_5VisionRotaryEmbedding;
@@ -31,6 +39,9 @@ using mllm::models::qwen3_5::Qwen3_5Config;
 using mllm::models::qwen3_5::qwen3_5ExactGelu;
 using mllm::models::qwen3_5::Qwen3_5ForCausalLM;
 using mllm::models::qwen3_5::Qwen3_5ImagePreprocessor;
+using mllm::models::qwen3_5::Qwen3_5VideoPreprocessor;
+using mllm::models::qwen3_5::resizeQwen3_5RgbLikeTorchvision;
+using mllm::models::qwen3_5::sampleQwen3_5VideoFrames;
 
 Qwen3_5Config makeTinyQwen3_5Config() {
   Qwen3_5Config config;
@@ -121,6 +132,97 @@ TEST_F(Qwen35MultimodalTest, PreprocessesAndConcatenatesDifferentImagesInOrder) 
   std::filesystem::remove(second_path);
 }
 
+TEST_F(Qwen35MultimodalTest, VideoSmartResizeMatchesOfficialTotalPixelEnvelope) {
+  const Qwen3_5VideoPreprocessor preprocessor;
+  EXPECT_EQ(preprocessor.smartResize(4, 48, 64), (std::pair<int32_t, int32_t>{64, 64}));
+  EXPECT_EQ(preprocessor.smartResize(8, 720, 1280), (std::pair<int32_t, int32_t>{704, 1280}));
+  EXPECT_EQ(preprocessor.smartResize(4, 1, 200), (std::pair<int32_t, int32_t>{32, 6400}));
+  EXPECT_THROW((void)preprocessor.smartResize(1, 64, 64), std::invalid_argument);
+  EXPECT_THROW((void)preprocessor.smartResize(4, 1, 201), std::invalid_argument);
+}
+
+TEST_F(Qwen35MultimodalTest, ConvertsBoundedI420FramesToRgb) {
+  const std::array<uint8_t, 8> y = {16, 235, 81, 145, 16, 235, 81, 145};
+  const std::array<uint8_t, 2> u = {128, 90};
+  const std::array<uint8_t, 2> v = {128, 240};
+  std::array<float, 24> rgb{};
+  convertQwen3_5I420ToRgb(y.data(), 4, u.data(), 2, v.data(), 2, 4, 2, rgb.data());
+
+  EXPECT_EQ((std::array<float, 3>{rgb[0], rgb[1], rgb[2]}), (std::array<float, 3>{0.0F, 0.0F, 0.0F}));
+  EXPECT_EQ((std::array<float, 3>{rgb[3], rgb[4], rgb[5]}), (std::array<float, 3>{255.0F, 255.0F, 255.0F}));
+  EXPECT_EQ((std::array<float, 3>{rgb[6], rgb[7], rgb[8]}), (std::array<float, 3>{255.0F, 0.0F, 0.0F}));
+  EXPECT_EQ((std::array<float, 3>{rgb[9], rgb[10], rgb[11]}), (std::array<float, 3>{255.0F, 74.0F, 74.0F}));
+  EXPECT_THROW(convertQwen3_5I420ToRgb(y.data(), 4, u.data(), 2, v.data(), 2, 3, 2, rgb.data()), std::invalid_argument);
+  EXPECT_THROW(convertQwen3_5I420ToRgb(nullptr, 4, u.data(), 2, v.data(), 2, 4, 2, rgb.data()), std::invalid_argument);
+}
+
+TEST_F(Qwen35MultimodalTest, BicubicResizeMatchesTorchvisionUint8Oracle) {
+  const std::array<float, 12> input = {0, 10, 255, 64, 20, 128, 128, 30, 64, 255, 40, 0};
+  const std::array<uint8_t, 48> expected = {0,  7,   255, 1,  10,  244, 35, 16,  167, 52, 19,  128, 20, 13,  225, 42,
+                                            16, 192, 88,  22, 125, 110, 25, 91,  91,  25, 110, 125, 28, 88,  192, 34,
+                                            42, 225, 37,  20, 128, 31,  52, 167, 34,  35, 244, 40,  1,  255, 43,  0};
+  EXPECT_EQ(resizeQwen3_5RgbLikeTorchvision(input.data(), 2, 2, 4, 4),
+            (std::vector<uint8_t>{expected.begin(), expected.end()}));
+}
+
+TEST_F(Qwen35MultimodalTest, SamplesThePinnedVideoLikeTransformers) {
+  EXPECT_EQ(sampleQwen3_5VideoFrames(8, 4.0), (std::vector<int32_t>{0, 2, 5, 7}));
+  EXPECT_EQ(sampleQwen3_5VideoFrames(3, 30.0), (std::vector<int32_t>{0, 1, 2}));
+  const auto capped = sampleQwen3_5VideoFrames(2000, 10.0, 10.0, 4, 768);
+  ASSERT_EQ(capped.size(), 768);
+  EXPECT_EQ(capped.front(), 0);
+  EXPECT_EQ(capped.back(), 1999);
+  EXPECT_THROW((void)sampleQwen3_5VideoFrames(0, 4.0), std::invalid_argument);
+  EXPECT_THROW((void)sampleQwen3_5VideoFrames(8, -1.0), std::invalid_argument);
+}
+
+TEST_F(Qwen35MultimodalTest, BuildsOfficialTimestampSeparatedVideoMarkers) {
+  const auto timestamps = calculateQwen3_5VideoTimestamps({0, 2, 5, 7}, 4.0);
+  ASSERT_EQ(timestamps.size(), 2);
+  EXPECT_DOUBLE_EQ(timestamps[0], 0.25);
+  EXPECT_DOUBLE_EQ(timestamps[1], 1.5);
+  EXPECT_EQ(makeQwen3_5VideoMarkers(timestamps), "<|vision_start|><0.2 seconds><|vision_start|><|video_pad|><|vision_end|>"
+                                                 "<1.5 seconds><|vision_start|><|video_pad|><|vision_end|><|vision_end|>");
+
+  const auto padded = calculateQwen3_5VideoTimestamps({3, 5, 8}, 2.0);
+  ASSERT_EQ(padded.size(), 2);
+  EXPECT_DOUBLE_EQ(padded[0], 2.0);
+  EXPECT_DOUBLE_EQ(padded[1], 4.0);
+  EXPECT_THROW((void)calculateQwen3_5VideoTimestamps({}, 4.0), std::invalid_argument);
+  EXPECT_THROW((void)calculateQwen3_5VideoTimestamps({1, 0}, 4.0), std::invalid_argument);
+  EXPECT_THROW((void)calculateQwen3_5VideoTimestamps({0, 1}, 0.0), std::invalid_argument);
+}
+
+TEST_F(Qwen35MultimodalTest, VideoPatchifyInterleavesFramesAndPadsTheLastFrame) {
+  const Qwen3_5VideoPreprocessor preprocessor;
+  auto video = mllm::Tensor::empty({3, 32, 32, 3}, mllm::kFloat32, mllm::kCPU).alloc();
+  const std::array<float, 3> frame_values = {0.0F, 64.0F, 255.0F};
+  for (int32_t t = 0; t < 3; ++t) {
+    std::fill(video.ptr<float>() + static_cast<int64_t>(t) * 32 * 32 * 3,
+              video.ptr<float>() + static_cast<int64_t>(t + 1) * 32 * 32 * 3, frame_values[t]);
+  }
+
+  auto [patches, grid] = preprocessor.flattenNormalizedPatches(video);
+  EXPECT_EQ(patches.shape(), (mllm::Tensor::shape_t{8, 1536}));
+  const std::array<int32_t, 3> expected_grid = {2, 2, 2};
+  EXPECT_TRUE(std::equal(expected_grid.begin(), expected_grid.end(), grid.ptr<int32_t>()));
+  const auto normalized = [](float value) { return value * (2.0F / 255.0F) - 1.0F; };
+  EXPECT_FLOAT_EQ(patches.ptr<float>()[0], normalized(0.0F));
+  EXPECT_FLOAT_EQ(patches.ptr<float>()[256], normalized(64.0F));
+  EXPECT_FLOAT_EQ(patches.ptr<float>()[4 * 1536], normalized(255.0F));
+  EXPECT_FLOAT_EQ(patches.ptr<float>()[4 * 1536 + 256], normalized(255.0F));
+}
+
+TEST_F(Qwen35MultimodalTest, ResizesEveryVideoFrameToTheSharedOfficialGeometry) {
+  const Qwen3_5VideoPreprocessor preprocessor;
+  auto video = mllm::Tensor::empty({4, 48, 64, 3}, mllm::kFloat32, mllm::kCPU).alloc();
+  std::fill(video.ptr<float>(), video.ptr<float>() + video.numel(), 64.0F);
+  auto resized = preprocessor.resizeFrames(video);
+  EXPECT_EQ(resized.shape(), (mllm::Tensor::shape_t{4, 64, 64, 3}));
+  EXPECT_NEAR(resized.ptr<float>()[0], 64.0F, 1.0e-4F);
+  EXPECT_NEAR(resized.ptr<float>()[resized.numel() - 1], 64.0F, 1.0e-4F);
+}
+
 TEST_F(Qwen35MultimodalTest, ExpandsExactlyOneImagePlaceholderAndMarksItsSpan) {
   const std::vector<int64_t> input = {10, 248053, 248056, 248054, 11};
   auto [expanded, token_types] = expandQwen3_5SingleImagePlaceholders(input, 248056, 4);
@@ -143,6 +245,17 @@ TEST_F(Qwen35MultimodalTest, ExpandsMultipleImagePlaceholdersInOrder) {
   EXPECT_THROW(expandQwen3_5ImagePlaceholders(input, 248056, {2, 0}), std::invalid_argument);
 }
 
+TEST_F(Qwen35MultimodalTest, ExpandsTimestampSeparatedVideoPlaceholders) {
+  const std::vector<int64_t> input = {10, 248053, 20, 248053, 248057, 248054, 21, 248053, 248057, 248054, 248054, 11};
+  auto [expanded, token_types] = expandQwen3_5VideoPlaceholders(input, 248057, {4, 4});
+
+  EXPECT_EQ(expanded, (std::vector<int64_t>{10, 248053, 20, 248053, 248057, 248057, 248057, 248057, 248054, 21, 248053, 248057,
+                                            248057, 248057, 248057, 248054, 248054, 11}));
+  EXPECT_EQ(token_types, (std::vector<int32_t>{0, 0, 0, 0, 2, 2, 2, 2, 0, 0, 0, 2, 2, 2, 2, 0, 0, 0}));
+  EXPECT_THROW(expandQwen3_5VideoPlaceholders(input, 248057, {4}), std::invalid_argument);
+  EXPECT_THROW(expandQwen3_5VideoPlaceholders(input, 248057, {4, 0}), std::invalid_argument);
+}
+
 TEST_F(Qwen35MultimodalTest, InjectsDistinctImageEmbeddingsIntoEverySpanInOrder) {
   auto input = mllm::Tensor::empty({1, 8, 3}, mllm::kFloat32, mllm::kCPU).alloc();
   std::fill(input.ptr<float>(), input.ptr<float>() + input.numel(), -1.0F);
@@ -162,6 +275,21 @@ TEST_F(Qwen35MultimodalTest, InjectsDistinctImageEmbeddingsIntoEverySpanInOrder)
       EXPECT_FLOAT_EQ(input.ptr<float>()[position * 3 + column], expected);
     }
   }
+}
+
+TEST_F(Qwen35MultimodalTest, InjectsVideoEmbeddingsWithoutOverwritingTextOrImages) {
+  auto input = mllm::Tensor::empty({1, 6, 2}, mllm::kFloat32, mllm::kCPU).alloc();
+  std::fill(input.ptr<float>(), input.ptr<float>() + input.numel(), -1.0F);
+  auto video = mllm::Tensor::empty({3, 2}, mllm::kFloat32, mllm::kCPU).alloc();
+  const std::array<float, 6> values = {10.0F, 11.0F, 20.0F, 21.0F, 30.0F, 31.0F};
+  std::copy(values.begin(), values.end(), video.ptr<float>());
+  auto types = mllm::Tensor::empty({1, 6}, mllm::kInt32, mllm::kCPU).alloc();
+  const std::array<int32_t, 6> type_values = {0, 2, 2, 1, 2, 0};
+  std::copy(type_values.begin(), type_values.end(), types.ptr<int32_t>());
+
+  injectQwen3_5VideoEmbeddings(input, video, types);
+  const std::array<float, 12> expected = {-1.0F, -1.0F, 10.0F, 11.0F, 20.0F, 21.0F, -1.0F, -1.0F, 30.0F, 31.0F, -1.0F, -1.0F};
+  EXPECT_TRUE(std::equal(expected.begin(), expected.end(), input.ptr<float>()));
 }
 
 TEST_F(Qwen35MultimodalTest, InterleavesTemporalHeightAndWidthFrequencies) {
@@ -269,6 +397,54 @@ TEST_F(Qwen35MultimodalTest, BuildsOfficialMultipleImagePositionsWithDifferentGe
   EXPECT_THROW(makeQwen3_5ImagePositionIds(missing_span_types, grids, 2), std::invalid_argument);
 }
 
+TEST_F(Qwen35MultimodalTest, BuildsTimestampSeparatedVideoPositions) {
+  auto token_types = mllm::Tensor::empty({1, 12}, mllm::kInt32, mllm::kCPU).alloc();
+  const std::array<int32_t, 12> types = {0, 0, 2, 2, 2, 2, 0, 2, 2, 2, 2, 0};
+  std::copy(types.begin(), types.end(), token_types.ptr<int32_t>());
+  auto video_grid = mllm::Tensor::empty({1, 3}, mllm::kInt32, mllm::kCPU).alloc();
+  const std::array<int32_t, 3> dimensions = {2, 4, 4};
+  std::copy(dimensions.begin(), dimensions.end(), video_grid.ptr<int32_t>());
+
+  auto positions = makeQwen3_5MultimodalPositionIds(token_types, mllm::Tensor::nil(), video_grid, 2);
+  const std::array<int64_t, 12> expected_t = {0, 1, 2, 2, 2, 2, 4, 5, 5, 5, 5, 7};
+  const std::array<int64_t, 12> expected_h = {0, 1, 2, 2, 3, 3, 4, 5, 5, 6, 6, 7};
+  const std::array<int64_t, 12> expected_w = {0, 1, 2, 3, 2, 3, 4, 5, 6, 5, 6, 7};
+  EXPECT_TRUE(std::equal(expected_t.begin(), expected_t.end(), positions.ptr<int64_t>()));
+  EXPECT_TRUE(std::equal(expected_h.begin(), expected_h.end(), positions.ptr<int64_t>() + 12));
+  EXPECT_TRUE(std::equal(expected_w.begin(), expected_w.end(), positions.ptr<int64_t>() + 24));
+
+  auto missing_span = token_types.clone();
+  missing_span.ptr<int32_t>()[7] = 0;
+  missing_span.ptr<int32_t>()[8] = 0;
+  missing_span.ptr<int32_t>()[9] = 0;
+  missing_span.ptr<int32_t>()[10] = 0;
+  EXPECT_THROW(makeQwen3_5MultimodalPositionIds(missing_span, mllm::Tensor::nil(), video_grid, 2), std::invalid_argument);
+}
+
+TEST_F(Qwen35MultimodalTest, MatchesPinnedTransformersVideoMropeOracle) {
+  auto token_types = mllm::Tensor::empty({1, 42}, mllm::kInt32, mllm::kCPU).alloc();
+  const std::array<int32_t, 42> types = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0,
+                                         0, 0, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  std::copy(types.begin(), types.end(), token_types.ptr<int32_t>());
+  auto video_grid = mllm::Tensor::empty({1, 3}, mllm::kInt32, mllm::kCPU).alloc();
+  const std::array<int32_t, 3> dimensions = {2, 4, 4};
+  std::copy(dimensions.begin(), dimensions.end(), video_grid.ptr<int32_t>());
+
+  auto positions = makeQwen3_5MultimodalPositionIds(token_types, mllm::Tensor::nil(), video_grid, 2);
+  const std::array<int64_t, 42> expected_t = {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 11, 11,
+                                              11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 21, 21, 21, 23,
+                                              24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37};
+  const std::array<int64_t, 42> expected_h = {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 11, 12,
+                                              12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 21, 22, 22, 23,
+                                              24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37};
+  const std::array<int64_t, 42> expected_w = {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 11,
+                                              12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 21, 22, 23,
+                                              24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37};
+  EXPECT_TRUE(std::equal(expected_t.begin(), expected_t.end(), positions.ptr<int64_t>()));
+  EXPECT_TRUE(std::equal(expected_h.begin(), expected_h.end(), positions.ptr<int64_t>() + 42));
+  EXPECT_TRUE(std::equal(expected_w.begin(), expected_w.end(), positions.ptr<int64_t>() + 84));
+}
+
 TEST_F(Qwen35MultimodalTest, RejectsPlaceholderCountMismatchAndVideoTypes) {
   auto token_types = mllm::Tensor::empty({1, 4}, mllm::kInt32, mllm::kCPU).alloc();
   std::fill(token_types.ptr<int32_t>(), token_types.ptr<int32_t>() + 4, 1);
@@ -312,6 +488,13 @@ TEST_F(Qwen35MultimodalTest, RejectsIncompleteAndTextOnlyImageInputsBeforeExecut
       {"mm_token_type_ids", token_types},
   };
   EXPECT_THROW((void)model.forward(text_only_image, {}), std::invalid_argument);
+
+  mllm::models::ARGenerationOutputPast incomplete_video = {
+      {"sequence", sequence},
+      {"pixel_values_videos", pixel_values},
+      {"mm_token_type_ids", token_types},
+  };
+  EXPECT_THROW((void)model.forward(incomplete_video, {}), std::invalid_argument);
 }
 
 }  // namespace

@@ -14,6 +14,7 @@
 #include "mllm/models/ARGeneration.hpp"
 #include "mllm/models/qwen3_5/image_preprocessor_qwen3_5.hpp"
 #include "mllm/models/qwen3_5/multimodal_qwen3_5.hpp"
+#include "mllm/models/qwen3_5/video_preprocessor_qwen3_5.hpp"
 #include "mllm/preprocessor/tokenizers/Unicode.hpp"
 #include "mllm/preprocessor/tokenizers/AutoTokenizer.hpp"
 
@@ -245,6 +246,9 @@ inline bool qwen3_5Regex(const std::string& str, std::vector<std::wstring>& spli
 struct Qwen3_5Message {
   std::string prompt;
   std::vector<std::string> image_paths;
+  Tensor video_frames_thwc = Tensor::nil();
+  std::vector<int32_t> video_frame_indices;
+  double video_frames_per_second = 0.0;
   static inline std::string message_template =
       "<|im_start|>user\n{{{prompt}}}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
 };
@@ -253,9 +257,13 @@ class Qwen3_5Tokenizer final : public mllm::preprocessor::AutoTokenizer {
  public:
   explicit Qwen3_5Tokenizer(const std::string& file_path, int32_t image_min_pixels = 256 * 256,
                             int32_t image_max_pixels = 512 * 512, int32_t vision_patch_size = 16,
-                            int32_t vision_temporal_patch_size = 2, int32_t vision_spatial_merge_size = 2)
+                            int32_t vision_temporal_patch_size = 2, int32_t vision_spatial_merge_size = 2,
+                            int32_t video_min_pixels = 4 * 32 * 32, int32_t video_max_pixels = 24 * 32 * 32 * 1024)
       : image_preprocessor_(image_min_pixels, image_max_pixels, vision_patch_size, vision_temporal_patch_size,
                             vision_spatial_merge_size),
+        video_preprocessor_(video_min_pixels, video_max_pixels, vision_patch_size, vision_temporal_patch_size,
+                            vision_spatial_merge_size),
+        vision_temporal_patch_size_(vision_temporal_patch_size),
         vision_spatial_merge_size_(vision_spatial_merge_size) {
     preprocessor::initLocal();
     preprocessor::makeBytes2UnicodeMap(bytes_2_unicode_dict_);
@@ -363,6 +371,16 @@ class Qwen3_5Tokenizer final : public mllm::preprocessor::AutoTokenizer {
     }
 
     const bool has_image = !message.image_paths.empty();
+    const bool has_video = !message.video_frames_thwc.isNil();
+    if (has_image && has_video) {
+      throw std::invalid_argument("Qwen3.5 initial video input does not mix still images and video");
+    }
+    if (has_video && message.video_frame_indices.size() < 4) {
+      throw std::invalid_argument("Qwen3.5 bounded video input requires at least four sampled frames");
+    }
+    if (!has_video && (!message.video_frame_indices.empty() || message.video_frames_per_second != 0.0)) {
+      throw std::invalid_argument("Qwen3.5 video metadata requires video frames");
+    }
     auto applied_string = Qwen3_5Message::message_template;
     if (has_image) {
       const auto user_content = applied_string.find("user\n");
@@ -373,6 +391,12 @@ class Qwen3_5Tokenizer final : public mllm::preprocessor::AutoTokenizer {
         image_markers += "<|vision_start|><|image_pad|><|vision_end|>";
       }
       applied_string.insert(user_content + 5, image_markers);
+    } else if (has_video) {
+      const auto user_content = applied_string.find("user\n");
+      if (user_content == std::string::npos) { throw std::runtime_error("Qwen3.5 message template is malformed"); }
+      const auto timestamps = calculateQwen3_5VideoTimestamps(message.video_frame_indices, message.video_frames_per_second,
+                                                              vision_temporal_patch_size_);
+      applied_string.insert(user_content + 5, makeQwen3_5VideoMarkers(timestamps));
     }
     static constexpr char kPromptPlaceholder[] = "{{{prompt}}}";
     size_t pos = applied_string.find(kPromptPlaceholder);
@@ -386,6 +410,8 @@ class Qwen3_5Tokenizer final : public mllm::preprocessor::AutoTokenizer {
 
     Tensor pixel_values = Tensor::nil();
     Tensor image_grid_thw = Tensor::nil();
+    Tensor pixel_values_videos = Tensor::nil();
+    Tensor video_grid_thw = Tensor::nil();
     std::vector<int32_t> token_types;
     if (has_image) {
       std::tie(pixel_values, image_grid_thw) = image_preprocessor_(message.image_paths);
@@ -398,6 +424,18 @@ class Qwen3_5Tokenizer final : public mllm::preprocessor::AutoTokenizer {
       }
       const int64_t image_token_id = bpe_._lookup_vocab(L"<|image_pad|>");
       std::tie(ids, token_types) = expandQwen3_5ImagePlaceholders(ids, image_token_id, image_token_counts);
+    } else if (has_video) {
+      if (message.video_frames_thwc.shape().size() != 4
+          || message.video_frames_thwc.shape()[0] != static_cast<int32_t>(message.video_frame_indices.size())) {
+        throw std::invalid_argument("Qwen3.5 video metadata must contain one source index per decoded frame");
+      }
+      auto resized_video_frames = video_preprocessor_.resizeFrames(message.video_frames_thwc);
+      std::tie(pixel_values_videos, video_grid_thw) = video_preprocessor_.flattenNormalizedPatches(resized_video_frames);
+      const auto* grid = video_grid_thw.ptr<int32_t>();
+      const int32_t frame_token_count = grid[1] * grid[2] / (vision_spatial_merge_size_ * vision_spatial_merge_size_);
+      std::vector<int32_t> video_token_counts(grid[0], frame_token_count);
+      const int64_t video_token_id = bpe_._lookup_vocab(L"<|video_pad|>");
+      std::tie(ids, token_types) = expandQwen3_5VideoPlaceholders(ids, video_token_id, video_token_counts);
     }
 
     Tensor sequence = Tensor::empty({/*batch*/ 1, /*seq*/ static_cast<int32_t>(ids.size())}, kInt64, kCPU)
@@ -407,21 +445,31 @@ class Qwen3_5Tokenizer final : public mllm::preprocessor::AutoTokenizer {
     auto ptr = sequence.ptr<int64_t>();
     for (size_t i = 0; i < ids.size(); ++i) { ptr[i] = ids[i]; }
 
-    if (!has_image) { return {{"sequence", sequence}}; }
+    if (!has_image && !has_video) { return {{"sequence", sequence}}; }
 
     auto mm_token_type_ids =
         Tensor::empty({1, static_cast<int32_t>(token_types.size())}, kInt32, kCPU).setMemType(kNormal).alloc();
     std::copy(token_types.begin(), token_types.end(), mm_token_type_ids.ptr<int32_t>());
+    if (has_image) {
+      return {
+          {"sequence", sequence},
+          {"pixel_values", pixel_values},
+          {"image_grid_thw", image_grid_thw},
+          {"mm_token_type_ids", mm_token_type_ids},
+      };
+    }
     return {
         {"sequence", sequence},
-        {"pixel_values", pixel_values},
-        {"image_grid_thw", image_grid_thw},
+        {"pixel_values_videos", pixel_values_videos},
+        {"video_grid_thw", video_grid_thw},
         {"mm_token_type_ids", mm_token_type_ids},
     };
   }
 
  private:
   Qwen3_5ImagePreprocessor image_preprocessor_;
+  Qwen3_5VideoPreprocessor video_preprocessor_;
+  int32_t vision_temporal_patch_size_ = 2;
   int32_t vision_spatial_merge_size_ = 2;
   preprocessor::BPE bpe_;
   std::unordered_map<std::wint_t, wchar_t> bytes_2_unicode_dict_;

@@ -567,6 +567,10 @@ class Qwen3_5Model final : public nn::Module {
     if (!vision_enabled_) { throw std::invalid_argument("Qwen3.5 model was built without a vision tower"); }
     return visual_(pixel_values, image_grid_thw)[0];
   }
+  Tensor encodeVideo(Tensor pixel_values_videos, Tensor video_grid_thw) {
+    if (!vision_enabled_) { throw std::invalid_argument("Qwen3.5 model was built without a vision tower"); }
+    return visual_(pixel_values_videos, video_grid_thw)[0];
+  }
   Tensor forwardEmbeddings(Tensor embeddings, Tensor sin, Tensor cos, const AnyValue& kv_cache) {
     return language_model_.forwardEmbeddings(embeddings, sin, cos, kv_cache)[0];
   }
@@ -620,22 +624,30 @@ class Qwen3_5ForCausalLM : public ARGeneration, public nn::Module {
 
     const bool has_pixel_values = input.count("pixel_values") != 0;
     const bool has_image_grid = input.count("image_grid_thw") != 0;
+    const bool has_pixel_values_videos = input.count("pixel_values_videos") != 0;
+    const bool has_video_grid = input.count("video_grid_thw") != 0;
     const bool has_token_types = input.count("mm_token_type_ids") != 0;
-    if (has_pixel_values != has_image_grid || has_pixel_values != has_token_types) {
-      throw std::invalid_argument(
-          "Qwen3.5 image prefill requires pixel_values, image_grid_thw, and mm_token_type_ids together");
+    if (has_pixel_values != has_image_grid || has_pixel_values_videos != has_video_grid) {
+      throw std::invalid_argument("Qwen3.5 multimodal prefill requires each pixel tensor with its matching grid");
     }
-    if (has_pixel_values && !vision_enabled_) {
-      throw std::invalid_argument("Qwen3.5 image input requires a multimodal config with vision_config");
+    const bool has_image = has_pixel_values;
+    const bool has_video = has_pixel_values_videos;
+    const bool has_multimodal = has_image || has_video;
+    if (has_token_types != has_multimodal) {
+      throw std::invalid_argument("Qwen3.5 multimodal prefill requires mm_token_type_ids");
+    }
+    if (has_multimodal && !vision_enabled_) {
+      throw std::invalid_argument("Qwen3.5 multimodal input requires a config with vision_config");
     }
 
     Tensor position_ids = Tensor::nil();
     if (input.count("position_ids")) {
       position_ids = input.at("position_ids");
       if (seq_len == 1) { position_ids = advanceQwen3_5PositionIds(position_ids); }
-    } else if (has_pixel_values) {
-      position_ids =
-          makeQwen3_5ImagePositionIds(input.at("mm_token_type_ids"), input.at("image_grid_thw"), vision_spatial_merge_size_);
+    } else if (has_multimodal) {
+      position_ids = makeQwen3_5MultimodalPositionIds(
+          input.at("mm_token_type_ids"), has_image ? input.at("image_grid_thw") : Tensor::nil(),
+          has_video ? input.at("video_grid_thw") : Tensor::nil(), vision_spatial_merge_size_);
     } else {
       position_ids = Tensor::empty({batch_size, seq_len}, kInt64, kCPU).alloc();
       auto position_ids_ptr = position_ids.ptr<int64_t>();
@@ -652,7 +664,7 @@ class Qwen3_5ForCausalLM : public ARGeneration, public nn::Module {
     }
     auto& [llm_embedding_sin, llm_embedding_cos] = rotary_embeddings;
 
-    if (has_pixel_values) {
+    if (has_multimodal) {
       auto token_types = input.at("mm_token_type_ids");
       if (token_types.shape() != sequence.shape() || token_types.dtype() != kInt32 || token_types.device() != kCPU) {
         throw std::invalid_argument("Qwen3.5 mm_token_type_ids must match the input sequence");
@@ -660,24 +672,45 @@ class Qwen3_5ForCausalLM : public ARGeneration, public nn::Module {
       const auto* input_ids = sequence.ptr<int64_t>();
       const auto* types = token_types.ptr<int32_t>();
       int32_t image_count = 0;
+      int32_t video_count = 0;
       for (int32_t s = 0; s < seq_len; ++s) {
-        if (input_ids[s] == video_token_id_ || types[s] == 2) {
-          throw std::invalid_argument("Qwen3.5 CPU image support does not accept video tokens");
+        if (types[s] < 0 || types[s] > 2) {
+          throw std::invalid_argument("Qwen3.5 mm_token_type_ids contains an unsupported modality");
         }
         if ((input_ids[s] == image_token_id_) != (types[s] == 1)) {
           throw std::invalid_argument("Qwen3.5 image token IDs and modality token types disagree");
         }
+        if ((input_ids[s] == video_token_id_) != (types[s] == 2)) {
+          throw std::invalid_argument("Qwen3.5 video token IDs and modality token types disagree");
+        }
         if (types[s] == 1) { ++image_count; }
+        if (types[s] == 2) { ++video_count; }
       }
 
       auto input_embeddings = llm.embed(sequence);
-      auto image_embeddings = llm.encodeImage(input.at("pixel_values"), input.at("image_grid_thw"));
-      if (image_count <= 0 || image_embeddings.shape().size() != 2 || image_embeddings.shape()[0] != image_count
-          || input_embeddings.shape().size() != 3 || image_embeddings.shape()[1] != input_embeddings.shape()[2]
-          || image_embeddings.dtype() != input_embeddings.dtype()) {
-        throw std::invalid_argument("Qwen3.5 image features and image placeholders do not match");
+      const auto validate_features = [&input_embeddings](const Tensor& features, int32_t placeholder_count) {
+        return placeholder_count > 0 && features.shape().size() == 2 && features.shape()[0] == placeholder_count
+               && input_embeddings.shape().size() == 3 && features.shape()[1] == input_embeddings.shape()[2]
+               && features.dtype() == input_embeddings.dtype();
+      };
+      if (has_image) {
+        auto image_embeddings = llm.encodeImage(input.at("pixel_values"), input.at("image_grid_thw"));
+        if (!validate_features(image_embeddings, image_count)) {
+          throw std::invalid_argument("Qwen3.5 image features and image placeholders do not match");
+        }
+        injectQwen3_5ImageEmbeddings(input_embeddings, image_embeddings, token_types);
+      } else if (image_count != 0) {
+        throw std::invalid_argument("Qwen3.5 image placeholders require image pixels");
       }
-      injectQwen3_5ImageEmbeddings(input_embeddings, image_embeddings, token_types);
+      if (has_video) {
+        auto video_embeddings = llm.encodeVideo(input.at("pixel_values_videos"), input.at("video_grid_thw"));
+        if (!validate_features(video_embeddings, video_count)) {
+          throw std::invalid_argument("Qwen3.5 video features and video placeholders do not match");
+        }
+        injectQwen3_5VideoEmbeddings(input_embeddings, video_embeddings, token_types);
+      } else if (video_count != 0) {
+        throw std::invalid_argument("Qwen3.5 video placeholders require video pixels");
+      }
       sequence = llm.forwardEmbeddings(input_embeddings, llm_embedding_sin, llm_embedding_cos, AnyValue(&kv_cache_));
     } else {
       sequence = llm(sequence, llm_embedding_sin, llm_embedding_cos, AnyValue(&kv_cache_))[0];
