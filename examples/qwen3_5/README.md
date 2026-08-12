@@ -2,13 +2,14 @@
 
 This example supports the text towers of
 [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) and
-[`Qwen/Qwen3.5-4B`](https://huggingface.co/Qwen/Qwen3.5-4B), plus single-image,
-ordered multi-image, and bounded short-video inference for Qwen3.5-0.8B.
+[`Qwen/Qwen3.5-4B`](https://huggingface.co/Qwen/Qwen3.5-4B), including
+single-image, ordered multi-image, and bounded short-video inference for both
+model sizes.
 
 | Model | Text | Images | Decoded RGB-frame API | Local H.264 MP4 | Hidden size | GDN / full-attention layers |
 | --- | --- | --- | --- | --- | ---: | ---: |
 | 0.8B | Yes | Yes | Yes | Yes, portable backend only | 1024 | 18 / 6 |
-| 4B | Yes | No | No | No | 2560 | 24 / 8 |
+| 4B | Yes | Yes | Yes | Yes, portable backend only | 2560 | 24 / 8 |
 
 All configurations support batch size 1 and a maximum cache length of 2048
 tokens. `Qwen3_5ForCausalLM::resetState()` clears the full-attention KV cache
@@ -112,7 +113,7 @@ python examples/qwen3_5/validate_converted_model.py \
   --model-name Qwen3.5-0.8B
 ```
 
-### Qwen3.5-0.8B single-image
+### Qwen3.5-0.8B multimodal
 
 ```bash
 python examples/qwen3_5/validate_checkpoint.py \
@@ -163,6 +164,33 @@ python examples/qwen3_5/validate_converted_model.py \
   --model-name Qwen3.5-4B
 ```
 
+### Qwen3.5-4B multimodal
+
+```bash
+python examples/qwen3_5/validate_checkpoint.py \
+  /path/to/Qwen3.5-4B \
+  --quant-config examples/qwen3_5/quant_cfg_4B_multimodal_w4a32_kai.json \
+  --runtime-config examples/qwen3_5/config_4B_multimodal_w4a32_kai.json
+
+python -m pymllm.mobile.utils.mllm_convertor \
+  --input_path /path/to/Qwen3.5-4B \
+  --output_path /path/to/qwen3.5-4b-multimodal-w4a32-kai.mllm \
+  --model_name Qwen3.5-4B-Multimodal \
+  --cfg_path examples/qwen3_5/quant_cfg_4B_multimodal_w4a32_kai.json \
+  --pipeline w4a32_kai_pipeline \
+  --include_prefix model.language_model. \
+  --include_prefix model.visual. \
+  --format v2 \
+  --verbose
+
+python examples/qwen3_5/validate_converted_model.py \
+  /path/to/qwen3.5-4b-multimodal-w4a32-kai.mllm \
+  /path/to/Qwen3.5-4B \
+  --quant-config examples/qwen3_5/quant_cfg_4B_multimodal_w4a32_kai.json \
+  --runtime-config examples/qwen3_5/config_4B_multimodal_w4a32_kai.json \
+  --model-name Qwen3.5-4B-Multimodal
+```
+
 The 4B converted tensor data exceeds 4 GiB. Use model-file V2 so descriptor
 sizes and offsets remain 64-bit, and provide at least 32 GiB of available host
 memory plus working disk space for conversion.
@@ -209,12 +237,23 @@ mllm-qwen3-5-runner \
   --config_path examples/qwen3_5/config_4B_w4a32_kai.json \
   --prompt "Give a one-sentence introduction." \
   --max_new_tokens 32
+
+# Qwen3.5-4B multimodal; repeat --image_path for ordered multi-image input,
+# or replace it with --video_path in a decoder-enabled build.
+mllm-qwen3-5-runner \
+  --model_path /path/to/qwen3.5-4b-multimodal-w4a32-kai.mllm \
+  --model_version v2 \
+  --tokenizer_path /path/to/Qwen3.5-4B/tokenizer.json \
+  --config_path examples/qwen3_5/config_4B_multimodal_w4a32_kai.json \
+  --image_path /path/to/image.jpg \
+  --prompt "Describe the image." \
+  --max_new_tokens 32
 ```
 
 Omit `--prompt` for the interactive loop. Repeat `--image_path` to attach
 multiple still images in order; the same ordered image list is used for each
 independent prompt in that process. Omit `--image_path` to run text-only
-inference with either the text-only or multimodal 0.8B model. `--video_path`
+inference with either the text-only or multimodal model of the selected size. `--video_path`
 requires a decoder-enabled build and cannot be combined with `--image_path`.
 Use `--video_fps`, `--video_max_frames`, `--video_max_bytes`,
 `--video_max_tokens`, `--video_max_decoded_pixels`, and

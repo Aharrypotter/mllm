@@ -20,8 +20,8 @@ auto loadConfig(const std::string& model_size) -> mllm::models::qwen3_5::Qwen3_5
   return mllm::models::qwen3_5::Qwen3_5Config(exampleDir() + "/config_" + model_size + "_w4a32_kai.json");
 }
 
-auto loadMultimodalConfig() -> mllm::models::qwen3_5::Qwen3_5Config {
-  return mllm::models::qwen3_5::Qwen3_5Config(exampleDir() + "/config_0.8B_multimodal_w4a32_kai.json");
+auto loadMultimodalConfig(const std::string& model_size = "0.8B") -> mllm::models::qwen3_5::Qwen3_5Config {
+  return mllm::models::qwen3_5::Qwen3_5Config(exampleDir() + "/config_" + model_size + "_multimodal_w4a32_kai.json");
 }
 
 constexpr auto kKaiLinearImpl =
@@ -106,6 +106,27 @@ TEST(Qwen35ConfigTest, Official08BMultimodalConfigBuildsVisionContract) {
   EXPECT_EQ(config.image_max_pixels, 512 * 512);
 }
 
+TEST(Qwen35ConfigTest, Official4BMultimodalConfigBuildsVisionContract) {
+  const auto config = loadMultimodalConfig("4B");
+
+  EXPECT_EQ(mllm::models::qwen3_5::modelNameForConfig(config), "Qwen3.5-4B Multimodal");
+  EXPECT_TRUE(mllm::models::qwen3_5::isOfficialQwen35_4BMultimodalRuntimeConfig(config));
+  EXPECT_TRUE(mllm::models::qwen3_5::isOfficialQwen35MultimodalRuntimeConfig(config));
+  EXPECT_TRUE(config.vision_enabled);
+  EXPECT_EQ(config.vision_depth, 24);
+  EXPECT_EQ(config.vision_hidden_size, 1024);
+  EXPECT_EQ(config.vision_intermediate_size, 4096);
+  EXPECT_EQ(config.vision_num_heads, 16);
+  EXPECT_EQ(config.vision_num_position_embeddings, 2304);
+  EXPECT_EQ(config.vision_patch_size, 16);
+  EXPECT_EQ(config.vision_temporal_patch_size, 2);
+  EXPECT_EQ(config.vision_spatial_merge_size, 2);
+  EXPECT_EQ(config.vision_out_hidden_size, config.hidden_size);
+  EXPECT_EQ(config.mrope_section, (std::vector<int32_t>{11, 11, 10}));
+  EXPECT_EQ(config.image_min_pixels, 256 * 256);
+  EXPECT_EQ(config.image_max_pixels, 512 * 512);
+}
+
 TEST(Qwen35ConfigTest, RejectsModelConfigEmbeddingMismatchWithoutAllocatingWeights) {
   const auto config = loadConfig("0.8B");
   const auto expected_numel =
@@ -134,17 +155,20 @@ TEST(Qwen35ConfigTest, RejectsModelConfigEmbeddingMismatchWithoutAllocatingWeigh
 }
 
 TEST(Qwen35ConfigTest, MultimodalConfigRequiresMatchingV2VisionDescriptors) {
+  for (const auto& model_size : {std::string("0.8B"), std::string("4B")}) {
+    const auto config = loadMultimodalConfig(model_size);
+    auto parameter_file = parameterFileWithEmbedding(mllm::ModelFileVersion::kV2, {config.vocab_size, config.hidden_size});
+
+    EXPECT_THROW(mllm::models::qwen3_5::validateModelConfigMatch(config, parameter_file), std::invalid_argument) << model_size;
+    pushDescriptor(parameter_file, "model.visual.patch_embed.proj.weight",
+                   {config.vision_hidden_size, config.vision_in_channels, config.vision_temporal_patch_size,
+                    config.vision_patch_size, config.vision_patch_size});
+    pushDescriptor(parameter_file, "model.visual.pos_embed.weight",
+                   {config.vision_num_position_embeddings, config.vision_hidden_size});
+    EXPECT_NO_THROW(mllm::models::qwen3_5::validateModelConfigMatch(config, parameter_file)) << model_size;
+  }
+
   const auto config = loadMultimodalConfig();
-  auto parameter_file = parameterFileWithEmbedding(mllm::ModelFileVersion::kV2, {config.vocab_size, config.hidden_size});
-
-  EXPECT_THROW(mllm::models::qwen3_5::validateModelConfigMatch(config, parameter_file), std::invalid_argument);
-  pushDescriptor(parameter_file, "model.visual.patch_embed.proj.weight",
-                 {config.vision_hidden_size, config.vision_in_channels, config.vision_temporal_patch_size,
-                  config.vision_patch_size, config.vision_patch_size});
-  pushDescriptor(parameter_file, "model.visual.pos_embed.weight",
-                 {config.vision_num_position_embeddings, config.vision_hidden_size});
-  EXPECT_NO_THROW(mllm::models::qwen3_5::validateModelConfigMatch(config, parameter_file));
-
   const auto v1 = parameterFileWithEmbedding(mllm::ModelFileVersion::kV1, {config.vocab_size * config.hidden_size});
   EXPECT_THROW(mllm::models::qwen3_5::validateModelConfigMatch(config, v1), std::invalid_argument);
 }

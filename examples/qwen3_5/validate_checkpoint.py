@@ -98,19 +98,35 @@ KAI_LINEAR_IMPL_TYPE = (
     "KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_" "qai8dxp1x8_qsi4c32p8x8_1x8x32"
 )
 TIED_EMBEDDING_WEIGHT = "model.language_model.embed_tokens.weight"
-OFFICIAL_08B_VISION_CONTRACT = {
-    "deepstack_visual_indexes": [],
-    "depth": 12,
-    "hidden_act": "gelu_pytorch_tanh",
-    "hidden_size": 768,
-    "in_channels": 3,
-    "intermediate_size": 3072,
-    "num_heads": 12,
-    "num_position_embeddings": 2304,
-    "out_hidden_size": 1024,
-    "patch_size": 16,
-    "spatial_merge_size": 2,
-    "temporal_patch_size": 2,
+OFFICIAL_VISION_CONTRACTS = {
+    "0.8B": {
+        "deepstack_visual_indexes": [],
+        "depth": 12,
+        "hidden_act": "gelu_pytorch_tanh",
+        "hidden_size": 768,
+        "in_channels": 3,
+        "intermediate_size": 3072,
+        "num_heads": 12,
+        "num_position_embeddings": 2304,
+        "out_hidden_size": 1024,
+        "patch_size": 16,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2,
+    },
+    "4B": {
+        "deepstack_visual_indexes": [],
+        "depth": 24,
+        "hidden_act": "gelu_pytorch_tanh",
+        "hidden_size": 1024,
+        "in_channels": 3,
+        "intermediate_size": 4096,
+        "num_heads": 16,
+        "num_position_embeddings": 2304,
+        "out_hidden_size": 2560,
+        "patch_size": 16,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2,
+    },
 }
 MULTIMODAL_TOKEN_CONTRACT = {
     "image_token_id": 248056,
@@ -120,10 +136,13 @@ MULTIMODAL_TOKEN_CONTRACT = {
 }
 
 
-def _vision_contract_mismatches(vision_config: dict) -> list[str]:
+def _vision_contract_mismatches(
+    vision_config: dict, model_size: str
+) -> list[str]:
+    contract = OFFICIAL_VISION_CONTRACTS[model_size]
     return [
         f"{field}={vision_config.get(field)!r} (expected {expected!r})"
-        for field, expected in OFFICIAL_08B_VISION_CONTRACT.items()
+        for field, expected in contract.items()
         if vision_config.get(field) != expected
     ]
 
@@ -372,24 +391,24 @@ def validate_kai_recipe_contract(
             "KAI recipe and runtime config must either both include vision or both be text-only"
         )
     if include_vision:
-        if checkpoint_size != "0.8B":
-            raise AssertionError(
-                "Qwen3.5 multimodal conversion currently supports only 0.8B"
-            )
         if not isinstance(vision_config, dict):
             raise AssertionError(
                 "Multimodal KAI validation requires checkpoint vision_config"
             )
-        checkpoint_vision_mismatches = _vision_contract_mismatches(vision_config)
+        checkpoint_vision_mismatches = _vision_contract_mismatches(
+            vision_config, checkpoint_size
+        )
         if checkpoint_vision_mismatches:
             raise AssertionError(
-                "Checkpoint vision_config does not match official Qwen3.5-0.8B: "
+                f"Checkpoint vision_config does not match official Qwen3.5-{checkpoint_size}: "
                 + "; ".join(checkpoint_vision_mismatches)
             )
-        runtime_vision_mismatches = _vision_contract_mismatches(runtime_vision_config)
+        runtime_vision_mismatches = _vision_contract_mismatches(
+            runtime_vision_config, checkpoint_size
+        )
         if runtime_vision_mismatches:
             raise AssertionError(
-                "Runtime vision_config does not match official Qwen3.5-0.8B: "
+                f"Runtime vision_config does not match official Qwen3.5-{checkpoint_size}: "
                 + "; ".join(runtime_vision_mismatches)
             )
 
@@ -536,7 +555,22 @@ def expected_vision_shapes(vision_config: dict) -> dict[str, list[int]]:
 def validate_multimodal_config_contract(
     checkpoint_config: dict, runtime_config: dict
 ) -> None:
-    """Validate the official 0.8B single-image checkpoint/runtime boundary."""
+    """Validate a supported official multimodal checkpoint/runtime boundary."""
+
+    checkpoint_text_config = checkpoint_config.get("text_config")
+    runtime_text_config = runtime_config.get("text_config")
+    if not isinstance(checkpoint_text_config, dict) or not isinstance(
+        runtime_text_config, dict
+    ):
+        raise AssertionError(
+            "Multimodal checkpoint and runtime must declare object text_config values"
+        )
+    checkpoint_size = resolve_model_size(checkpoint_text_config)
+    runtime_size = resolve_model_size(runtime_text_config)
+    if checkpoint_size != runtime_size:
+        raise AssertionError(
+            f"Multimodal runtime is Qwen3.5-{runtime_size}, checkpoint is Qwen3.5-{checkpoint_size}"
+        )
 
     for field, expected in MULTIMODAL_TOKEN_CONTRACT.items():
         if checkpoint_config.get(field) != expected:
@@ -550,19 +584,23 @@ def validate_multimodal_config_contract(
     checkpoint_vision_config = checkpoint_config.get("vision_config")
     if not isinstance(checkpoint_vision_config, dict):
         raise AssertionError("Checkpoint must declare vision_config")
-    checkpoint_vision_mismatches = _vision_contract_mismatches(checkpoint_vision_config)
+    checkpoint_vision_mismatches = _vision_contract_mismatches(
+        checkpoint_vision_config, checkpoint_size
+    )
     if checkpoint_vision_mismatches:
         raise AssertionError(
-            "Checkpoint vision_config does not match official Qwen3.5-0.8B: "
+            f"Checkpoint vision_config does not match official Qwen3.5-{checkpoint_size}: "
             + "; ".join(checkpoint_vision_mismatches)
         )
     runtime_vision_config = runtime_config.get("vision_config")
     if not isinstance(runtime_vision_config, dict):
         raise AssertionError("Runtime must declare vision_config")
-    runtime_vision_mismatches = _vision_contract_mismatches(runtime_vision_config)
+    runtime_vision_mismatches = _vision_contract_mismatches(
+        runtime_vision_config, checkpoint_size
+    )
     if runtime_vision_mismatches:
         raise AssertionError(
-            "Runtime vision_config does not match official Qwen3.5-0.8B: "
+            f"Runtime vision_config does not match official Qwen3.5-{checkpoint_size}: "
             + "; ".join(runtime_vision_mismatches)
         )
     if runtime_config.get("image_min_pixels") != 256 * 256:
