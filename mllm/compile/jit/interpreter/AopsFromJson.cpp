@@ -22,6 +22,7 @@
 #include "mllm/core/aops/SplitOp.hpp"
 #include "mllm/core/aops/STFTOp.hpp"
 #include "mllm/core/aops/FlashAttention2Op.hpp"
+#include "mllm/core/aops/GroupedQueryAttentionDecodeOp.hpp"
 #include "mllm/core/aops/RepeatOp.hpp"
 #include "mllm/core/aops/PermuteOp.hpp"
 #include "mllm/core/aops/GELUOp.hpp"
@@ -103,6 +104,8 @@ BaseOp::ptr_t aopsFromJson(const nlohmann::json& json) {
       return __stftFromJson(json);
     } else if (op_type == "FlashAttention2") {
       return __flashAttention2FromJson(json);
+    } else if (op_type == "GroupedQueryAttentionDecode") {
+      return __groupedQueryAttentionDecodeFromJson(json);
     } else if (op_type == "Repeat") {
       return __repeatFromJson(json);
     } else if (op_type == "Permute") {
@@ -593,6 +596,15 @@ BaseOp::ptr_t __flashAttention2FromJson(const nlohmann::json& json) {
   // Use Context to create op
   auto op = Context::instance().getBackend(backend)->createOp(OpTypes::kFlashAttention2, options);
   return op;
+}
+
+BaseOp::ptr_t __groupedQueryAttentionDecodeFromJson(const nlohmann::json& json) {
+  aops::GroupedQueryAttentionDecodeOpOptions options;
+
+  DeviceTypes backend = DeviceTypes::kCPU;
+  if (json.contains("backend")) { backend = str2DeviceType(json["backend"]); }
+
+  return Context::instance().getBackend(backend)->createOp(OpTypes::kGroupedQueryAttentionDecode, options);
 }
 
 BaseOp::ptr_t __repeatFromJson(const nlohmann::json& json) {

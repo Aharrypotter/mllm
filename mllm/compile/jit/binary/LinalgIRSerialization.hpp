@@ -37,6 +37,7 @@ nlohmann::json dumpViewOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op);
 nlohmann::json dumpSplitOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op);
 nlohmann::json dumpSTFTOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op);
 nlohmann::json dumpFlashAttention2OpIROptions(const ir::linalg::LinalgIROp::ptr_t& op);
+nlohmann::json dumpGroupedQueryAttentionDecodeOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op);
 nlohmann::json dumpRepeatOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op);
 nlohmann::json dumpPermuteOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op);
 nlohmann::json dumpConv1DOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op);

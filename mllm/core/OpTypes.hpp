@@ -97,6 +97,9 @@ enum class OpTypes : int32_t {
 
   kSigmoid = 75,
 
+  // Phase-specific native KV-head attention.
+  kGroupedQueryAttentionDecode = 76,
+
   // Dynamic Op Start for user to register there own ops.
   kDynamicOp_Start = 4096,
 
@@ -181,6 +184,7 @@ inline std::string optype2Str(OpTypes type) {
     case OpTypes::kEqual: return "Equal";
     case OpTypes::kWhere: return "Where";
     case OpTypes::kSigmoid: return "Sigmoid";
+    case OpTypes::kGroupedQueryAttentionDecode: return "GroupedQueryAttentionDecode";
     case OpTypes::kDynamicOp_Start: return "DynamicOp_Start";
     case OpTypes::kOpType_End: return "OpType_End";
     default: return "Unknown";

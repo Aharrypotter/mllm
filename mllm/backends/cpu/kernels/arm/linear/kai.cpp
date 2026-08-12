@@ -394,14 +394,13 @@ void KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::matmul(float* __restrict__ dst, con
     const int m_step = ukernels_[tile_cfg].get_m_step();  // Scheduling along M
     const int n_step = ukernels_[tile_cfg].get_n_step();  // Scheduling along N
 
-    std::vector<std::pair<int, int>> tile_splits;
-    for (int i_m_step = 0; i_m_step < M; i_m_step += m_step) {
-      for (int i_n_step = 0; i_n_step < N; i_n_step += n_step) { tile_splits.emplace_back(i_m_step, i_n_step); }
-    }
-    auto tile_sizes = tile_splits.size();
+    const int m_tiles = (M + m_step - 1) / m_step;
+    const int n_tiles = (N + n_step - 1) / n_step;
+    const int tile_count = m_tiles * n_tiles;
 
-    MLLM_CONDITIONAL_PARALLEL_FOR(thread_count > 1, thread_count, tile_idx, 0, tile_sizes, 1, {
-      auto [i_m_step, i_n_step] = tile_splits[tile_idx];
+    MLLM_CONDITIONAL_PARALLEL_FOR(thread_count > 1, thread_count, tile_idx, 0, tile_count, 1, {
+      const int i_m_step = (tile_idx / n_tiles) * m_step;
+      const int i_n_step = (tile_idx % n_tiles) * n_step;
 
       // Support functions return offset in bytes
       const void* lhs_ptr = (const void*)((const char*)workspace + (ukernels_[tile_cfg].get_lhs_packed_offset(i_m_step, K)));
