@@ -11,6 +11,7 @@
 #include "mllm/core/aops/TransposeOp.hpp"
 #include "mllm/core/aops/CastTypeOp.hpp"
 #include "mllm/core/aops/FlashAttention2Op.hpp"
+#include "mllm/core/aops/GroupedQueryAttentionDecodeOp.hpp"
 #include "mllm/core/aops/KVCacheOp.hpp"
 #include "mllm/core/aops/MultimodalRoPEOp.hpp"
 #include "mllm/core/aops/VisionRoPEOp.hpp"
@@ -69,6 +70,7 @@ nlohmann::json dumpLinalgIROptions(const ir::linalg::LinalgIROp::ptr_t& op) {
     CASE(Split)
     CASE(STFT)
     CASE(FlashAttention2)
+    CASE(GroupedQueryAttentionDecode)
     CASE(Repeat)
     CASE(Permute)
     CASE(Conv1D)
@@ -213,6 +215,8 @@ nlohmann::json dumpFlashAttention2OpIROptions(const ir::linalg::LinalgIROp::ptr_
   return {{"B", options.B}, {"q_head", options.q_head}, {"kv_head", options.kv_head},
           {"D", options.D}, {"hp_exp", options.hp_exp}, {"causal_mask", options.causal_mask}};
 }
+
+nlohmann::json dumpGroupedQueryAttentionDecodeOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op) { return {}; }
 
 nlohmann::json dumpRepeatOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op) {
   auto options = ((aops::RepeatOp*)op->getAOp())->options();

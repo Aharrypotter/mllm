@@ -247,6 +247,7 @@ def define_lianlg_ir(ir: dict):
     op.derive(Cls("ViewOp"))
     op.derive(Cls("SplitOp"))
     op.derive(Cls("FlashAttention2Op"))
+    op.derive(Cls("GroupedQueryAttentionDecodeOp"))
     op.derive(Cls("RepeatOp"))
     op.derive(Cls("PermuteOp"))
     op.derive(Cls("Conv1DOp"))

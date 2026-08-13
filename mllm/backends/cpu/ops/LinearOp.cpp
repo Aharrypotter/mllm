@@ -1,6 +1,15 @@
 // Copyright (c) MLLM Team.
 // Licensed under the MIT License.
 
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+
+#if defined(__linux__)
+#include <sys/auxv.h>
+#endif
+
 #include "mllm/backends/cpu/ops/LinearOp.hpp"
 #include "mllm/backends/cpu/kernels/Kernels.hpp"
 #include "mllm/core/DataTypes.hpp"
@@ -8,7 +17,69 @@
 
 namespace mllm::cpu {
 
+namespace {
+
+#if defined(MLLM_HOST_ARCH_ARM64) || defined(MLLM_HOST_ARCH_ARM)
+
+using KaiW4A32Helper = ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk;
+using KaiW4A32Tile = KaiW4A32Helper::Tiles;
+
+constexpr KaiW4A32Tile kKaiW4A32DotProdTile = KaiW4A32Tile::qai8dxp1x8_qsi4c32p8x8_1x8x32;
+constexpr KaiW4A32Tile kKaiW4A32I8mmTile = KaiW4A32Tile::qai8dxp4x8_qsi4c32p8x8_4x8x32;
+
+bool environmentFlagEnabled(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+bool cpuSupportsI8mm() {
+#if defined(__linux__) && defined(__aarch64__)
+  constexpr unsigned long kHwcap2I8mm = 1UL << 13;
+  static const bool supported = (getauxval(AT_HWCAP2) & kHwcap2I8mm) != 0;
+  return supported;
+#else
+  return false;
+#endif
+}
+
+KaiW4A32Tile selectKaiW4A32PrefillTile(int m) {
+  static const bool disabled = environmentFlagEnabled("MLLM_KAI_PREFILL_I8MM_DISABLE");
+  if (detail::shouldUseKaiW4A32I8mmPrefill(m, disabled, cpuSupportsI8mm())) { return kKaiW4A32I8mmTile; }
+  return kKaiW4A32DotProdTile;
+}
+
+void traceKaiW4A32PrefillTile(KaiW4A32Tile tile, int m, int k, int n, int threads) {
+  if (m < 4) { return; }
+  static const bool trace = environmentFlagEnabled("MLLM_KAI_PREFILL_I8MM_TRACE");
+  if (!trace) { return; }
+
+  const uint32_t activation_bit = tile == kKaiW4A32I8mmTile ? 1U : 2U;
+  static std::atomic<uint32_t> activated_tiles{0};
+  const uint32_t previous = activated_tiles.fetch_or(activation_bit, std::memory_order_relaxed);
+  if ((previous & activation_bit) != 0) { return; }
+
+  if (tile == kKaiW4A32I8mmTile) {
+    std::fprintf(stderr, "MLLM_KAI_PREFILL_I8MM_ACTIVATED m=%d k=%d n=%d threads=%d\n", m, k, n, threads);
+  } else {
+    const char* reason = environmentFlagEnabled("MLLM_KAI_PREFILL_I8MM_DISABLE") ? "disabled" : "unsupported";
+    std::fprintf(stderr, "MLLM_KAI_PREFILL_DOTPROD_FALLBACK reason=%s m=%d k=%d n=%d threads=%d\n", reason, m, k, n, threads);
+  }
+}
+
+#endif
+
+}  // namespace
+
 CPULinearOp::CPULinearOp(const aops::LinearOpOptions& options) : LinearOp(options) {}
+
+Tensor CPULinearOp::acquireKaiWorkspace(int32_t workspace_size, int m) {
+  if (m != 1) { return Tensor::empty({workspace_size}, kInt8, kCPU).alloc(); }
+
+  if (kai_decode_workspace_.isNil() || kai_decode_workspace_.numel() < static_cast<size_t>(workspace_size)) {
+    kai_decode_workspace_ = Tensor::empty({workspace_size}, kInt8, kCPU).alloc();
+  }
+  return kai_decode_workspace_;
+}
 
 void CPULinearOp::load(const ParameterFile::ptr_t& ploader) {
   switch (ploader->version()) {
@@ -176,7 +247,7 @@ void CPULinearOp::forward(const std::vector<Tensor>& inputs, std::vector<Tensor>
       // Can be optimized for better performance.
       int32_t work_space_size = kai_helper.workspace_size(
           M, K, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp1x8_qsi4c32p4x8_1x4x32);
-      auto workspace = Tensor::empty({work_space_size}, kInt8, kCPU).alloc();
+      auto workspace = acquireKaiWorkspace(work_space_size, M);
 
       kai_helper.matmul(o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(), weight_.ptr<mllm_byte_t>(), workspace.ptr<void>(), M, K,
                         N, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp1x8_qsi4c32p4x8_1x4x32,
@@ -189,17 +260,17 @@ void CPULinearOp::forward(const std::vector<Tensor>& inputs, std::vector<Tensor>
       auto K = options_.in_channels;
       auto N = options_.out_channels;
 
-      ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk kai_helper;
+      KaiW4A32Helper kai_helper;
+      const auto tile = selectKaiW4A32PrefillTile(M);
+      traceKaiW4A32PrefillTile(tile, M, K, N, options_.getThreads());
 
       // FIXME:
       // Can be optimized for better performance.
-      int32_t work_space_size = kai_helper.workspace_size(
-          M, K, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp1x8_qsi4c32p8x8_1x8x32);
-      auto workspace = Tensor::empty({work_space_size}, kInt8, kCPU).alloc();
+      int32_t work_space_size = kai_helper.workspace_size(M, K, tile);
+      auto workspace = acquireKaiWorkspace(work_space_size, M);
 
       kai_helper.matmul(o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(), weight_.ptr<mllm_byte_t>(), workspace.ptr<void>(), M, K,
-                        N, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp1x8_qsi4c32p8x8_1x8x32,
-                        options_.getThreads());
+                        N, tile, options_.getThreads());
       return;
     }
     case aops::LinearImplTypes::kKaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_qai8dxp4x8_qsi4c32p4x8_8x4x32: {
@@ -215,7 +286,7 @@ void CPULinearOp::forward(const std::vector<Tensor>& inputs, std::vector<Tensor>
       // Can be optimized for better performance.
       int32_t work_space_size = kai_helper.workspace_size(
           M, K, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp4x8_qsi4c32p4x8_8x4x32);
-      auto workspace = Tensor::empty({work_space_size}, kInt8, kCPU).alloc();
+      auto workspace = acquireKaiWorkspace(work_space_size, M);
 
       kai_helper.matmul(o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(), weight_.ptr<mllm_byte_t>(), workspace.ptr<void>(), M, K,
                         N, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp4x8_qsi4c32p4x8_8x4x32,
@@ -233,7 +304,7 @@ void CPULinearOp::forward(const std::vector<Tensor>& inputs, std::vector<Tensor>
       // Can be optimized for better performance.
       int32_t work_space_size = kai_helper.workspace_size(
           M, K, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp4x8_qsi4c32p4x8_16x4x32);
-      auto workspace = Tensor::empty({work_space_size}, kInt8, kCPU).alloc();
+      auto workspace = acquireKaiWorkspace(work_space_size, M);
 
       kai_helper.matmul(o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(), weight_.ptr<mllm_byte_t>(), workspace.ptr<void>(), M, K,
                         N, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp4x8_qsi4c32p4x8_16x4x32,
@@ -253,7 +324,7 @@ void CPULinearOp::forward(const std::vector<Tensor>& inputs, std::vector<Tensor>
       // Can be optimized for better performance.
       int32_t work_space_size = kai_helper.workspace_size(
           M, K, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp4x8_qsi4c32p8x8_4x8x32);
-      auto workspace = Tensor::empty({work_space_size}, kInt8, kCPU).alloc();
+      auto workspace = acquireKaiWorkspace(work_space_size, M);
 
       kai_helper.matmul(o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(), weight_.ptr<mllm_byte_t>(), workspace.ptr<void>(), M, K,
                         N, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp4x8_qsi4c32p8x8_4x8x32,
@@ -271,7 +342,7 @@ void CPULinearOp::forward(const std::vector<Tensor>& inputs, std::vector<Tensor>
       // Can be optimized for better performance.
       int32_t work_space_size = kai_helper.workspace_size(
           M, K, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp1x4_qsi4c32p4x4_1x4);
-      auto workspace = Tensor::empty({work_space_size}, kInt8, kCPU).alloc();
+      auto workspace = acquireKaiWorkspace(work_space_size, M);
 
       kai_helper.matmul(o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(), weight_.ptr<mllm_byte_t>(), workspace.ptr<void>(), M, K,
                         N, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp1x4_qsi4c32p4x4_1x4,

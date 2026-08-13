@@ -146,6 +146,15 @@ if(MLLM_KERNEL_USE_THREADS AND MLLM_KERNEL_THREADS_VENDOR_OPENMP)
     target_link_libraries(MllmRT PUBLIC ${OpenMP_CXX_FLAGS})
     target_compile_options(MllmRT PRIVATE ${OpenMP_CXX_FLAGS})
     target_include_directories(MllmRT PUBLIC ${OpenMP_CXX_INCLUDE_DIR})
+
+    # ARM CPU kernels contain the OpenMP regions used by the mobile product
+    # path. Keep x86 CPU kernels on the existing MllmRT-only configuration so
+    # unrelated kernels are not recompiled with OpenMP as part of ARM support.
+    if(MLLM_BUILD_ARM_BACKEND)
+      target_link_libraries(MllmCPUBackend PUBLIC ${OpenMP_CXX_FLAGS})
+      target_compile_options(MllmCPUBackend PRIVATE ${OpenMP_CXX_FLAGS})
+      target_include_directories(MllmCPUBackend PUBLIC ${OpenMP_CXX_INCLUDE_DIR})
+    endif()
   endif()
 endif()
 

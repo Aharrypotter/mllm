@@ -34,6 +34,7 @@ BaseOp::ptr_t __viewFromJson(const nlohmann::json& json);
 BaseOp::ptr_t __splitFromJson(const nlohmann::json& json);
 BaseOp::ptr_t __stftFromJson(const nlohmann::json& json);
 BaseOp::ptr_t __flashAttention2FromJson(const nlohmann::json& json);
+BaseOp::ptr_t __groupedQueryAttentionDecodeFromJson(const nlohmann::json& json);
 BaseOp::ptr_t __repeatFromJson(const nlohmann::json& json);
 BaseOp::ptr_t __permuteFromJson(const nlohmann::json& json);
 BaseOp::ptr_t __conv2dFromJson(const nlohmann::json& json);

@@ -110,6 +110,8 @@ Tensor stack(const std::vector<Tensor>& ins, int32_t dim);
 
 Tensor flashAttention2(const Tensor& Q, const Tensor& K, const Tensor& V);
 
+Tensor groupedQueryAttentionDecode(const Tensor& query, const Tensor& key, const Tensor& value);
+
 Tensor softmax(const Tensor& x, int32_t dim);
 
 Tensor log(const Tensor& x);

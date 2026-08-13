@@ -35,6 +35,7 @@ class X2XOp;
 class ViewOp;
 class SplitOp;
 class FlashAttention2Op;
+class GroupedQueryAttentionDecodeOp;
 class RepeatOp;
 class PermuteOp;
 class Conv1DOp;
@@ -197,6 +198,7 @@ LINALG_AOPS_DEFINE(ViewOp, VIEWOP);
 LINALG_AOPS_DEFINE(SplitOp, SPLITOP);
 
 LINALG_AOPS_DEFINE(FlashAttention2Op, FLASHATTENTION2OP);
+LINALG_AOPS_DEFINE(GroupedQueryAttentionDecodeOp, GROUPEDQUERYATTENTIONDECODEOP);
 LINALG_AOPS_DEFINE(RepeatOp, REPEATOP);
 LINALG_AOPS_DEFINE(PermuteOp, PERMUTEOP);
 

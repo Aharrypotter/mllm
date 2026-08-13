@@ -1,4 +1,4 @@
-// Auto generated: 2026-01-09 07:46:43
+// Auto generated: 2026-08-13 00:19:31
 // do not modify this file
 #pragma once
 
@@ -41,6 +41,7 @@ enum NodeKind : uint32_t {
   RK_Op_LinalgIROp_ViewOp,
   RK_Op_LinalgIROp_SplitOp,
   RK_Op_LinalgIROp_FlashAttention2Op,
+  RK_Op_LinalgIROp_GroupedQueryAttentionDecodeOp,
   RK_Op_LinalgIROp_RepeatOp,
   RK_Op_LinalgIROp_PermuteOp,
   RK_Op_LinalgIROp_Conv1DOp,
