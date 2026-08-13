@@ -3,8 +3,6 @@
 
 #pragma once
 
-#include "mllm/backends/cpu/kernels/common/gdn/gated_delta_net.hpp"
-#include "mllm/backends/cpu/kernels/common/kda/kimi_delta_attention.hpp"
 #include "mllm/mllm.hpp"
 #include "mllm/models/ARGeneration.hpp"
 #include "mllm/models/ling3/configuration_ling3.hpp"
@@ -26,6 +24,10 @@
 
 namespace mllm::models::ling3 {
 
+// Model-local tensor preparation: Ling-3 uses an adjacent-pair checkpoint RoPE
+// layout that must be converted to mllm's half-split attention layout.  These
+// helpers prepare RoPE/cache tensors only; reusable compute is dispatched
+// through registered nn layers and functional operations below.
 inline Tensor makeLing3RoPEInvFreq(int rotary_dim, float rope_theta) {
   auto inv_freq = Tensor::empty({rotary_dim / 2}, kFloat32, kCPU).alloc();
   auto* values = inv_freq.ptr<float>();
@@ -168,6 +170,10 @@ class Ling3MoEGate final : public nn::Module {
         || weight_.weight().dtype() != kFloat32 || expert_bias_.weight().dtype() != kFloat32) {
       throw std::invalid_argument("Ling-3 MoE router requires float32 tensors with official shapes");
     }
+    // Model-level orchestration: the official Ling grouped top-k rule includes
+    // expert bias and a top-2-per-group score, which the existing generic mllm
+    // MoE layers do not represent.  Matmul and every expert MLP remain normal
+    // nn operations; this loop only produces routing ids and weights.
     hidden = hidden.view({-1, hidden_size_});
     auto logits = nn::functional::matmul(hidden, weight_.weight(), false, true).contiguous();
     const int tokens = hidden.shape()[0];
@@ -270,7 +276,8 @@ class Ling3SparseMoE final : public nn::Module {
     auto routed_output = Tensor::empty({tokens, top_k_, hidden_size}, kFloat32, kCPU).alloc();
     const auto* id_values = topk_ids.ptr<int32_t>();
     auto* routed_values = routed_output.ptr<float>();
-    // Keep each routed expert invocation at M=1. KAI's dynamic activation
+    // Model-level sparse dispatch: keep each routed expert invocation at M=1.
+    // KAI's dynamic activation
     // quantization is row-local, and this avoids platform-dependent grouped
     // prefill results while retaining the same token/expert routing contract.
     for (int token = 0; token < tokens; ++token) {
@@ -293,6 +300,10 @@ class Ling3SparseMoE final : public nn::Module {
 
 class Ling3KimiDeltaAttention final : public nn::Module {
  public:
+  // The official checkpoint was validated against the current-first
+  // accumulation order (current tap first, then the K - 1 history taps).
+  static constexpr auto kConvAccumulationOrder = aops::CausalDepthwiseConv1DAccumulationOrder::kCurrentFirst;
+
   Ling3KimiDeltaAttention() = default;
   Ling3KimiDeltaAttention(const std::string& name, const Ling3Config& config) : nn::Module(name) {
     hidden_size_ = config.hidden_size;
@@ -306,12 +317,16 @@ class Ling3KimiDeltaAttention final : public nn::Module {
     q_proj_ = reg<nn::Linear>("q_proj", hidden_size_, projection_size_, false, config.linear_impl_type);
     k_proj_ = reg<nn::Linear>("k_proj", hidden_size_, projection_size_, false, config.linear_impl_type);
     v_proj_ = reg<nn::Linear>("v_proj", hidden_size_, projection_size_, false, config.linear_impl_type);
-    q_conv1d_ = reg<nn::Conv1D>("q_conv1d", projection_size_, projection_size_, conv_size_, 1, conv_size_ - 1, 1,
-                                projection_size_, false);
-    k_conv1d_ = reg<nn::Conv1D>("k_conv1d", projection_size_, projection_size_, conv_size_, 1, conv_size_ - 1, 1,
-                                projection_size_, false);
-    v_conv1d_ = reg<nn::Conv1D>("v_conv1d", projection_size_, projection_size_, conv_size_, 1, conv_size_ - 1, 1,
-                                projection_size_, false);
+    // Stateful depthwise causal short convolutions.  The registered operation
+    // owns the official `{q,k,v}_conv1d.weight` parameters and the explicit
+    // [B, C, K - 1] history; the current-first accumulation order reuses the
+    // existing GDN causal-convolution kernel.
+    q_conv1d_ = reg<nn::CausalDepthwiseConv1D>("q_conv1d", projection_size_, conv_size_, /*bias=*/false,
+                                               /*state_inplace=*/true, kConvAccumulationOrder);
+    k_conv1d_ = reg<nn::CausalDepthwiseConv1D>("k_conv1d", projection_size_, conv_size_, /*bias=*/false,
+                                               /*state_inplace=*/true, kConvAccumulationOrder);
+    v_conv1d_ = reg<nn::CausalDepthwiseConv1D>("v_conv1d", projection_size_, conv_size_, /*bias=*/false,
+                                               /*state_inplace=*/true, kConvAccumulationOrder);
     f_proj_ = reg<nn::Linear>("f_proj", hidden_size_, projection_size_, false, config.linear_impl_type);
     b_proj_ = reg<nn::Linear>("b_proj", hidden_size_, num_heads_, false, config.linear_impl_type);
     g_proj_ = reg<nn::Linear>("g_proj", hidden_size_, projection_size_, false, config.linear_impl_type);
@@ -321,10 +336,13 @@ class Ling3KimiDeltaAttention final : public nn::Module {
     o_proj_ = reg<nn::Linear>("o_proj", projection_size_, hidden_size_, false, config.linear_impl_type);
     silu_ = reg<nn::SiLU>("conv_activation");
     sigmoid_ = reg<nn::Sigmoid>("gate_activation");
+    kda_ = reg<nn::KimiDeltaAttention>("kda", safe_gate_, lower_bound_, /*state_inplace=*/true);
   }
 
   void resetState(int batch_size) {
     if (batch_size <= 0) { throw std::invalid_argument("Ling-3 KDA reset requires a positive batch size"); }
+    // Module-owned request state.  State transitions themselves are explicit
+    // outputs of the registered causal-convolution and KDA operations.
     recurrent_state_ = Tensor::zeros({batch_size, num_heads_, head_dim_, head_dim_}, kFloat32, kCPU);
     q_conv_state_ = Tensor::zeros({batch_size, projection_size_, conv_size_ - 1}, kFloat32, kCPU);
     k_conv_state_ = Tensor::zeros({batch_size, projection_size_, conv_size_ - 1}, kFloat32, kCPU);
@@ -342,34 +360,25 @@ class Ling3KimiDeltaAttention final : public nn::Module {
     auto v = v_proj_(hidden).contiguous();
     auto gate_logits = f_proj_(hidden).contiguous();
     auto beta = sigmoid_(b_proj_(hidden)).contiguous();
-    const auto q_weight = q_conv1d_.weight();
-    const auto k_weight = k_conv1d_.weight();
-    const auto v_weight = v_conv1d_.weight();
     const auto a_log = A_log_.weight();
     const auto dt_bias = dt_bias_.weight();
     if (q.dtype() != kFloat32 || k.dtype() != kFloat32 || v.dtype() != kFloat32 || gate_logits.dtype() != kFloat32
-        || beta.dtype() != kFloat32 || q_weight.dtype() != kFloat32 || k_weight.dtype() != kFloat32
-        || v_weight.dtype() != kFloat32 || a_log.dtype() != kFloat32 || dt_bias.dtype() != kFloat32) {
+        || beta.dtype() != kFloat32 || a_log.dtype() != kFloat32 || dt_bias.dtype() != kFloat32) {
       throw std::invalid_argument("Ling-3 KDA requires float32 recurrent activations and parameters");
     }
 
-    auto q_conv = Tensor::empty({batch, sequence, projection_size_}, kFloat32, kCPU).alloc();
-    auto k_conv = Tensor::empty({batch, sequence, projection_size_}, kFloat32, kCPU).alloc();
-    auto v_conv = Tensor::empty({batch, sequence, projection_size_}, kFloat32, kCPU).alloc();
-    cpu::gdn::depthwiseCausalConvF32(q.ptr<float>(), q_weight.ptr<float>(), q_conv_state_.ptr<float>(), q_conv.ptr<float>(),
-                                     batch, sequence, projection_size_, conv_size_);
-    cpu::gdn::depthwiseCausalConvF32(k.ptr<float>(), k_weight.ptr<float>(), k_conv_state_.ptr<float>(), k_conv.ptr<float>(),
-                                     batch, sequence, projection_size_, conv_size_);
-    cpu::gdn::depthwiseCausalConvF32(v.ptr<float>(), v_weight.ptr<float>(), v_conv_state_.ptr<float>(), v_conv.ptr<float>(),
-                                     batch, sequence, projection_size_, conv_size_);
+    auto [q_conv, updated_q_conv_state] = q_conv1d_(q, q_conv_state_);
+    auto [k_conv, updated_k_conv_state] = k_conv1d_(k, k_conv_state_);
+    auto [v_conv, updated_v_conv_state] = v_conv1d_(v, v_conv_state_);
+    q_conv_state_ = std::move(updated_q_conv_state);
+    k_conv_state_ = std::move(updated_k_conv_state);
+    v_conv_state_ = std::move(updated_v_conv_state);
     q = silu_(q_conv).view({batch, sequence, num_heads_, head_dim_}).contiguous();
     k = silu_(k_conv).view({batch, sequence, num_heads_, head_dim_}).contiguous();
     v = silu_(v_conv).view({batch, sequence, num_heads_, head_dim_}).contiguous();
     gate_logits = gate_logits.view({batch, sequence, num_heads_, head_dim_}).contiguous();
-    auto output = Tensor::empty({batch, sequence, num_heads_, head_dim_}, kFloat32, kCPU).alloc();
-    cpu::kda::kimiDeltaAttentionF32(q.ptr<float>(), k.ptr<float>(), v.ptr<float>(), gate_logits.ptr<float>(), beta.ptr<float>(),
-                                    a_log.ptr<float>(), dt_bias.ptr<float>(), recurrent_state_.ptr<float>(),
-                                    output.ptr<float>(), batch, sequence, num_heads_, head_dim_, safe_gate_, lower_bound_);
+    auto [output, updated_state] = kda_(q, k, v, gate_logits, beta, a_log, dt_bias, recurrent_state_);
+    recurrent_state_ = std::move(updated_state);
 
     output = output.view({batch * sequence * num_heads_, head_dim_});
     auto output_gate = sigmoid_(g_proj_(hidden).view({batch * sequence * num_heads_, head_dim_}));
@@ -387,13 +396,14 @@ class Ling3KimiDeltaAttention final : public nn::Module {
   bool safe_gate_ = true;
   float lower_bound_ = -5.0F;
   nn::Linear q_proj_, k_proj_, v_proj_;
-  nn::Conv1D q_conv1d_, k_conv1d_, v_conv1d_;
+  nn::CausalDepthwiseConv1D q_conv1d_, k_conv1d_, v_conv1d_;
   nn::Linear f_proj_, b_proj_, g_proj_;
   nn::Param A_log_, dt_bias_;
   nn::RMSNorm o_norm_;
   nn::Linear o_proj_;
   nn::SiLU silu_;
   nn::Sigmoid sigmoid_;
+  nn::KimiDeltaAttention kda_;
   Tensor recurrent_state_, q_conv_state_, k_conv_state_, v_conv_state_;
 };
 
@@ -619,6 +629,8 @@ class Ling3ForCausalLM final : public ARGeneration, public nn::Module {
       throw std::invalid_argument("Ling-3 sequence exceeds the configured KV-cache capacity");
     }
 
+    // Autoregressive input orchestration; position ids feed the model-local
+    // checkpoint-layout RoPE preparation above.
     auto position_ids = Tensor::empty({1, sequence_length}, kInt64, kCPU).alloc();
     auto* positions = position_ids.ptr<int64_t>();
     if (input.count("position_ids") != 0 && sequence_length == 1) {

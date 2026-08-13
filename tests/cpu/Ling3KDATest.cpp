@@ -2,6 +2,13 @@
 // Licensed under the MIT License.
 
 #include "mllm/backends/cpu/kernels/common/kda/kimi_delta_attention.hpp"
+#include "mllm/compile/ir/Trace.hpp"
+#include "mllm/compile/ir/linalg/Op.hpp"
+#include "mllm/compile/jit/binary/LinalgIRSerialization.hpp"
+#include "mllm/compile/jit/interpreter/AopsFromJson.hpp"
+#include "mllm/core/aops/KimiDeltaAttentionOp.hpp"
+#include "mllm/mllm.hpp"
+#include "mllm/nn/Functional.hpp"
 
 #include <gtest/gtest.h>
 
@@ -9,6 +16,8 @@
 #include <cstddef>
 #include <stdexcept>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 namespace {
 
@@ -70,6 +79,15 @@ std::vector<float> makeValues(std::size_t count, float scale, float offset = 0.0
     values[i] = offset + scale * static_cast<float>((static_cast<int>(i * 37U % 29U) - 14));
   }
   return values;
+}
+
+void ensureCpuContext() {
+  static const bool kContextInitialized = [] {
+    mllm::initializeContext();
+    mllm::Context::instance().setCpuOpThreads(1);
+    return true;
+  }();
+  (void)kContextInitialized;
 }
 
 TEST(Ling3KDA, MatchesSafeGateReference) {
@@ -144,6 +162,151 @@ TEST(Ling3KDA, RejectsInvalidSafeGateBound) {
                                                      values.data(), values.data(), state.data(), values.data(), 1, 1, 1, 2,
                                                      true, 0.0F, 1),
                std::invalid_argument);
+}
+
+TEST(Ling3KDA, FunctionalDispatchReturnsOutputAndUpdatedState) {
+  ensureCpuContext();
+  constexpr int kBatch = 1;
+  constexpr int kSequence = 3;
+  constexpr int kHeads = 2;
+  constexpr int kDim = 4;
+  const std::size_t vector_count = static_cast<std::size_t>(kBatch) * kSequence * kHeads * kDim;
+  const std::size_t state_count = static_cast<std::size_t>(kBatch) * kHeads * kDim * kDim;
+
+  const auto q = makeValues(vector_count, 0.017F);
+  const auto k = makeValues(vector_count, -0.013F, 0.02F);
+  const auto v = makeValues(vector_count, 0.011F, -0.03F);
+  const auto gate = makeValues(vector_count, 0.019F, 0.1F);
+  const auto beta = makeValues(static_cast<std::size_t>(kBatch) * kSequence * kHeads, 0.01F, 0.45F);
+  const auto a_log = makeValues(kHeads, 0.02F, 0.3F);
+  const auto dt_bias = makeValues(static_cast<std::size_t>(kHeads) * kDim, 0.015F, -0.1F);
+  const auto initial_state = makeValues(state_count, 0.003F);
+  auto expected_state = initial_state;
+  std::vector<float> expected_output(vector_count, 0.0F);
+  referenceKDA(q, k, v, gate, beta, a_log, dt_bias, expected_state, expected_output, kBatch, kSequence, kHeads, kDim, true,
+               -5.0F);
+  auto state_input = mllm::Tensor::fromVector(initial_state, {kBatch, kHeads, kDim, kDim});
+
+  auto [output, updated_state] = mllm::nn::functional::kimiDeltaAttention(
+      mllm::Tensor::fromVector(q, {kBatch, kSequence, kHeads, kDim}),
+      mllm::Tensor::fromVector(k, {kBatch, kSequence, kHeads, kDim}),
+      mllm::Tensor::fromVector(v, {kBatch, kSequence, kHeads, kDim}),
+      mllm::Tensor::fromVector(gate, {kBatch, kSequence, kHeads, kDim}),
+      mllm::Tensor::fromVector(beta, {kBatch, kSequence, kHeads}), mllm::Tensor::fromVector(a_log, {kHeads}),
+      mllm::Tensor::fromVector(dt_bias, {kHeads * kDim}), state_input, true, -5.0F);
+
+  const auto actual_output = output.toVector<float>();
+  const auto actual_state = updated_state.toVector<float>();
+  EXPECT_EQ(state_input.toVector<float>(), initial_state);
+  for (std::size_t i = 0; i < vector_count; ++i) { EXPECT_NEAR(actual_output[i], expected_output[i], 2.0e-6F); }
+  for (std::size_t i = 0; i < state_count; ++i) { EXPECT_NEAR(actual_state[i], expected_state[i], 2.0e-6F); }
+}
+
+TEST(Ling3KDA, FunctionalDispatchMatchesKernelAtTinyProductionGeometry) {
+  ensureCpuContext();
+  constexpr int kBatch = 1;
+  constexpr int kSequence = 49;
+  constexpr int kHeads = 16;
+  constexpr int kDim = 128;
+  const std::size_t vector_count = static_cast<std::size_t>(kBatch) * kSequence * kHeads * kDim;
+  const std::size_t state_count = static_cast<std::size_t>(kBatch) * kHeads * kDim * kDim;
+  const auto q = makeValues(vector_count, 0.0017F);
+  const auto k = makeValues(vector_count, -0.0013F, 0.002F);
+  const auto v = makeValues(vector_count, 0.0011F, -0.003F);
+  const auto gate = makeValues(vector_count, 0.0019F, 0.01F);
+  const auto beta = makeValues(static_cast<std::size_t>(kBatch) * kSequence * kHeads, 0.001F, 0.45F);
+  const auto a_log = makeValues(kHeads, 0.002F, 0.3F);
+  const auto dt_bias = makeValues(static_cast<std::size_t>(kHeads) * kDim, 0.0015F, -0.1F);
+  const auto initial_state = makeValues(state_count, 0.0003F);
+  auto expected_state = initial_state;
+  std::vector<float> expected_output(vector_count, 0.0F);
+  mllm::cpu::kda::kimiDeltaAttentionF32(q.data(), k.data(), v.data(), gate.data(), beta.data(), a_log.data(), dt_bias.data(),
+                                        expected_state.data(), expected_output.data(), kBatch, kSequence, kHeads, kDim, true,
+                                        -5.0F, 8);
+
+  auto [output, updated_state] = mllm::nn::functional::kimiDeltaAttention(
+      mllm::Tensor::fromVector(q, {kBatch, kSequence, kHeads, kDim}),
+      mllm::Tensor::fromVector(k, {kBatch, kSequence, kHeads, kDim}),
+      mllm::Tensor::fromVector(v, {kBatch, kSequence, kHeads, kDim}),
+      mllm::Tensor::fromVector(gate, {kBatch, kSequence, kHeads, kDim}),
+      mllm::Tensor::fromVector(beta, {kBatch, kSequence, kHeads}), mllm::Tensor::fromVector(a_log, {kHeads}),
+      mllm::Tensor::fromVector(dt_bias, {kHeads * kDim}), mllm::Tensor::fromVector(initial_state, {kBatch, kHeads, kDim, kDim}),
+      true, -5.0F);
+
+  EXPECT_EQ(output.toVector<float>(), expected_output);
+  EXPECT_EQ(updated_state.toVector<float>(), expected_state);
+}
+
+TEST(Ling3KDA, FunctionalInplaceStateAliasesAndMutatesInput) {
+  ensureCpuContext();
+  constexpr int kBatch = 1;
+  constexpr int kSequence = 3;
+  constexpr int kHeads = 2;
+  constexpr int kDim = 4;
+  const std::size_t vector_count = static_cast<std::size_t>(kBatch) * kSequence * kHeads * kDim;
+  const std::size_t state_count = static_cast<std::size_t>(kBatch) * kHeads * kDim * kDim;
+  const auto q = makeValues(vector_count, 0.017F);
+  const auto k = makeValues(vector_count, -0.013F, 0.02F);
+  const auto v = makeValues(vector_count, 0.011F, -0.03F);
+  const auto gate = makeValues(vector_count, 0.019F, 0.1F);
+  const auto beta = makeValues(static_cast<std::size_t>(kBatch) * kSequence * kHeads, 0.01F, 0.45F);
+  const auto a_log = makeValues(kHeads, 0.02F, 0.3F);
+  const auto dt_bias = makeValues(static_cast<std::size_t>(kHeads) * kDim, 0.015F, -0.1F);
+  const auto initial_state = makeValues(state_count, 0.003F);
+  auto expected_state = initial_state;
+  std::vector<float> expected_output(vector_count, 0.0F);
+  mllm::cpu::kda::kimiDeltaAttentionF32(q.data(), k.data(), v.data(), gate.data(), beta.data(), a_log.data(), dt_bias.data(),
+                                        expected_state.data(), expected_output.data(), kBatch, kSequence, kHeads, kDim, true,
+                                        -5.0F, 8);
+  auto state = mllm::Tensor::fromVector(initial_state, {kBatch, kHeads, kDim, kDim});
+
+  auto [output, updated_state] = mllm::nn::functional::kimiDeltaAttention(
+      mllm::Tensor::fromVector(q, {kBatch, kSequence, kHeads, kDim}),
+      mllm::Tensor::fromVector(k, {kBatch, kSequence, kHeads, kDim}),
+      mllm::Tensor::fromVector(v, {kBatch, kSequence, kHeads, kDim}),
+      mllm::Tensor::fromVector(gate, {kBatch, kSequence, kHeads, kDim}),
+      mllm::Tensor::fromVector(beta, {kBatch, kSequence, kHeads}), mllm::Tensor::fromVector(a_log, {kHeads}),
+      mllm::Tensor::fromVector(dt_bias, {kHeads * kDim}), state, true, -5.0F, true);
+
+  EXPECT_EQ(updated_state.ptr<float>(), state.ptr<float>());
+  EXPECT_EQ(output.toVector<float>(), expected_output);
+  EXPECT_EQ(state.toVector<float>(), expected_state);
+}
+
+TEST(Ling3KDA, FunctionalDispatchProducesLinalgIR) {
+  ensureCpuContext();
+  auto q = mllm::Tensor::empty({1, 2, 2, 4}, mllm::kFloat32, mllm::kCPU);
+  auto beta = mllm::Tensor::empty({1, 2, 2}, mllm::kFloat32, mllm::kCPU);
+  auto a_log = mllm::Tensor::empty({2}, mllm::kFloat32, mllm::kCPU);
+  auto dt_bias = mllm::Tensor::empty({8}, mllm::kFloat32, mllm::kCPU);
+  auto state = mllm::Tensor::empty({1, 2, 4, 4}, mllm::kFloat32, mllm::kCPU);
+
+  mllm::ir::lowlevel::traceStart();
+  auto outputs = mllm::nn::functional::kimiDeltaAttention(q, q, q, q, beta, a_log, dt_bias, state, true, -5.0F, true);
+  auto ir_context = mllm::ir::lowlevel::traceStop();
+
+  EXPECT_EQ(outputs[0].shape(), q.shape());
+  EXPECT_EQ(outputs[1].shape(), state.shape());
+  mllm::ir::linalg::LinalgIROp::ptr_t kda_ir;
+  for (const auto& op : ir_context->topLevelOp()->cast_<mllm::ir::Op>()->getTopRegion()->ops()) {
+    if (op->isa_<mllm::ir::linalg::KimiDeltaAttentionOp>()) {
+      kda_ir = op->cast_<mllm::ir::linalg::LinalgIROp>();
+      break;
+    }
+  }
+  ASSERT_NE(kda_ir, nullptr);
+
+  const auto options = mllm::jit::binary::dumpLinalgIROptions(kda_ir);
+  EXPECT_EQ(options.at("safe_gate"), true);
+  EXPECT_FLOAT_EQ(options.at("lower_bound").get<float>(), -5.0F);
+  EXPECT_EQ(options.at("state_inplace"), true);
+  const auto restored =
+      mllm::jit::interpreter::aopsFromJson(nlohmann::json{{"op_type", "KimiDeltaAttention"}, {"op_options", options}});
+  const auto restored_kda = std::dynamic_pointer_cast<mllm::aops::KimiDeltaAttentionOp>(restored);
+  ASSERT_NE(restored_kda, nullptr);
+  EXPECT_EQ(restored_kda->options().safe_gate, true);
+  EXPECT_FLOAT_EQ(restored_kda->options().lower_bound, -5.0F);
+  EXPECT_EQ(restored_kda->options().state_inplace, true);
 }
 
 }  // namespace

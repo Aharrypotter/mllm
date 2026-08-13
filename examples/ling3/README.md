@@ -41,15 +41,15 @@ The runner emits `LING3_RUN_START`, generated token IDs, and
 runtime result; device evidence must retain the converted model SHA256 and
 the runner/library identities together.
 
-For a longer deterministic correctness demo, use the checked-in prompt and a
-64-token generation limit:
+For a longer correctness demo, pass the prompt directly and use a 64-token
+generation limit:
 
 ```bash
 ./mllm-ling3-runner \
   --model_path /path/to/Ling-3.0-tiny.mllm \
   --tokenizer_path /path/to/Ling-3.0-tiny/tokenizer.json \
   --config_path config_tiny_w4a32_kai.json \
-  --prompt_file demo_prompt_v1.txt --disable_thinking \
+  --prompt '请用中文详细介绍 Ling-3.0-tiny 的混合注意力架构，并解释 KDA、MLA 和 MoE 各自的作用。' --disable_thinking \
   --max_new_tokens 64 --print_token_ids
 ```
 
