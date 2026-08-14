@@ -110,6 +110,9 @@ void CPUParallelLinearOp::forward(const std::vector<Tensor>& inputs, std::vector
   const auto& input = inputs[0];
   if (tryForwardSharedInputKaiM1(input, outputs)) { return; }
   for (size_t index = 0; index < fallback_ops_.size(); ++index) {
+    // Keep fallback Linear execution aligned if the parent op's thread policy
+    // is adjusted after construction.
+    fallback_ops_[index]->options().setThreads(options_.getThreads());
     std::vector<Tensor> child_outputs = {outputs[index]};
     fallback_ops_[index]->forward({input}, child_outputs);
   }

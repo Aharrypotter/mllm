@@ -24,8 +24,8 @@ inline auto makeLfm2LinearOptions(int32_t in_channels, int32_t out_channels, boo
           .out_channels = out_channels,
           .bias = bias,
           .impl_type = impl_type,
-          // OnePlus 13T source-bound screening keeps I8MM prefill above 80 tok/s
-          // with six workers, while four workers avoid decode GEMV oversubscription.
+          // Source-bound OnePlus 13T screening selected six workers for I8MM
+          // prefill and four workers to avoid decode GEMV oversubscription.
           .kai_w4a32_decode_thread_cap = 4,
           .kai_w4a32_prefill_thread_cap = 6};
 }
