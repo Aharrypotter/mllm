@@ -12,6 +12,7 @@
 #include "mllm/core/aops/SplitOp.hpp"
 #include "mllm/core/aops/PadOp.hpp"
 #include "mllm/core/aops/InterpolateOp.hpp"
+#include "mllm/core/aops/GroupedQueryAttentionOp.hpp"
 #include "mllm/core/aops/RadixAttnWithSinkAndSwaDiffDimOp.hpp"
 #include "mllm/engine/Context.hpp"
 
@@ -111,6 +112,10 @@ Tensor stack(const std::vector<Tensor>& ins, int32_t dim);
 Tensor flashAttention2(const Tensor& Q, const Tensor& K, const Tensor& V);
 
 Tensor groupedQueryAttentionDecode(const Tensor& query, const Tensor& key, const Tensor& value);
+
+Tensor groupedQueryAttention(
+    const Tensor& query, const Tensor& key, const Tensor& value,
+    aops::GroupedQueryAttentionImplementation implementation = aops::GroupedQueryAttentionImplementation::kDirectStrided);
 
 Tensor softmax(const Tensor& x, int32_t dim);
 

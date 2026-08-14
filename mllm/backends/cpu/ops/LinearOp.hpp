@@ -30,19 +30,12 @@ class CPULinearOp final : public aops::LinearOp {
 
   void reshape(const std::vector<Tensor>& inputs, std::vector<Tensor>& outputs) override;
 
-  static bool tryForwardSharedInputKaiM1(const Tensor& input, const BaseOp::ptr_t* linear_ops, size_t linear_op_count,
-                                         std::vector<Tensor>& outputs);
-
-  void setKaiW4A32ThreadCaps(int decode_thread_cap, int prefill_thread_cap);
-
  private:
   Tensor acquireKaiWorkspace(int32_t workspace_size, int m);
 
   [[nodiscard]] int kaiW4A32ThreadCount(int m) const;
 
   Tensor kai_decode_workspace_;
-  int kai_w4a32_decode_thread_cap_ = 0;
-  int kai_w4a32_prefill_thread_cap_ = 0;
 };
 
 class CPULinearOpFactory : public TypedOpFactory<OpTypes::kLinear, aops::LinearOpOptions> {

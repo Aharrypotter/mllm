@@ -54,6 +54,10 @@ add_executable(Mllm-Test-Lfm2-ShortConv Lfm2ShortConvTest.cpp)
 target_link_libraries(Mllm-Test-Lfm2-ShortConv PRIVATE gtest_main MllmCPUBackend)
 target_include_directories(Mllm-Test-Lfm2-ShortConv PRIVATE ${MLLM_INCLUDE_DIR})
 
+add_executable(Mllm-Test-Lfm2-RegisteredOps Lfm2RegisteredOpsTest.cpp)
+target_link_libraries(Mllm-Test-Lfm2-RegisteredOps PRIVATE gtest_main MllmCPUBackend)
+target_include_directories(Mllm-Test-Lfm2-RegisteredOps PRIVATE ${MLLM_INCLUDE_DIR})
+
 add_executable(Mllm-Test-CPUContiguousOp ContiguousOpTest.cpp)
 target_link_libraries(Mllm-Test-CPUContiguousOp PRIVATE gtest_main MllmRT MllmCPUBackend)
 target_include_directories(Mllm-Test-CPUContiguousOp PRIVATE ${MLLM_INCLUDE_DIR})

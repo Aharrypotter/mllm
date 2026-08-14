@@ -23,6 +23,9 @@
 #include "mllm/core/aops/STFTOp.hpp"
 #include "mllm/core/aops/FlashAttention2Op.hpp"
 #include "mllm/core/aops/GroupedQueryAttentionDecodeOp.hpp"
+#include "mllm/core/aops/CausalDepthwiseConv1DOp.hpp"
+#include "mllm/core/aops/GroupedQueryAttentionOp.hpp"
+#include "mllm/core/aops/ParallelLinearOp.hpp"
 #include "mllm/core/aops/RepeatOp.hpp"
 #include "mllm/core/aops/PermuteOp.hpp"
 #include "mllm/core/aops/GELUOp.hpp"
@@ -106,6 +109,12 @@ BaseOp::ptr_t aopsFromJson(const nlohmann::json& json) {
       return __flashAttention2FromJson(json);
     } else if (op_type == "GroupedQueryAttentionDecode") {
       return __groupedQueryAttentionDecodeFromJson(json);
+    } else if (op_type == "CausalDepthwiseConv1D") {
+      return __causalDepthwiseConv1DFromJson(json);
+    } else if (op_type == "GroupedQueryAttention") {
+      return __groupedQueryAttentionFromJson(json);
+    } else if (op_type == "ParallelLinear") {
+      return __parallelLinearFromJson(json);
     } else if (op_type == "Repeat") {
       return __repeatFromJson(json);
     } else if (op_type == "Permute") {
@@ -231,6 +240,12 @@ BaseOp::ptr_t __linearFromJson(const nlohmann::json& json) {
       // Convert string to LinearImplTypes enum
       std::string impl_type_str = opts["impl_type"];
       options.impl_type = aops::str2LinearImplTypes(impl_type_str);
+    }
+    if (opts.contains("kai_w4a32_decode_thread_cap")) {
+      options.kai_w4a32_decode_thread_cap = opts["kai_w4a32_decode_thread_cap"];
+    }
+    if (opts.contains("kai_w4a32_prefill_thread_cap")) {
+      options.kai_w4a32_prefill_thread_cap = opts["kai_w4a32_prefill_thread_cap"];
     }
   }
 
@@ -605,6 +620,58 @@ BaseOp::ptr_t __groupedQueryAttentionDecodeFromJson(const nlohmann::json& json) 
   if (json.contains("backend")) { backend = str2DeviceType(json["backend"]); }
 
   return Context::instance().getBackend(backend)->createOp(OpTypes::kGroupedQueryAttentionDecode, options);
+}
+
+BaseOp::ptr_t __causalDepthwiseConv1DFromJson(const nlohmann::json& json) {
+  aops::CausalDepthwiseConv1DOpOptions options;
+  if (json.contains("op_options")) {
+    const auto& opts = json["op_options"];
+    if (opts.contains("channels")) options.channels = opts["channels"];
+    if (opts.contains("kernel_size")) options.kernel_size = opts["kernel_size"];
+    if (opts.contains("bias")) options.bias = opts["bias"];
+    if (opts.contains("state_inplace")) options.state_inplace = opts["state_inplace"];
+    if (opts.contains("accumulation_order")) {
+      options.accumulation_order =
+          aops::str2CausalDepthwiseConv1DAccumulationOrder(opts["accumulation_order"].get<std::string>());
+    }
+  }
+  DeviceTypes backend = DeviceTypes::kCPU;
+  if (json.contains("backend")) { backend = str2DeviceType(json["backend"]); }
+  return Context::instance().getBackend(backend)->createOp(OpTypes::kCausalDepthwiseConv1D, options);
+}
+
+BaseOp::ptr_t __groupedQueryAttentionFromJson(const nlohmann::json& json) {
+  aops::GroupedQueryAttentionOpOptions options;
+  if (json.contains("op_options") && json["op_options"].contains("implementation")) {
+    options.implementation =
+        aops::str2GroupedQueryAttentionImplementation(json["op_options"]["implementation"].get<std::string>());
+  }
+  DeviceTypes backend = DeviceTypes::kCPU;
+  if (json.contains("backend")) { backend = str2DeviceType(json["backend"]); }
+  return Context::instance().getBackend(backend)->createOp(OpTypes::kGroupedQueryAttention, options);
+}
+
+BaseOp::ptr_t __parallelLinearFromJson(const nlohmann::json& json) {
+  aops::ParallelLinearOpOptions options;
+  if (json.contains("op_options")) {
+    const auto& opts = json["op_options"];
+    if (opts.contains("in_channels")) options.in_channels = opts["in_channels"];
+    if (opts.contains("out_channels")) options.out_channels = opts["out_channels"].get<std::vector<int32_t>>();
+    if (opts.contains("projection_names")) {
+      options.projection_names = opts["projection_names"].get<std::vector<std::string>>();
+    }
+    if (opts.contains("bias")) options.bias = opts["bias"];
+    if (opts.contains("impl_type")) options.impl_type = aops::str2LinearImplTypes(opts["impl_type"]);
+    if (opts.contains("kai_w4a32_decode_thread_cap")) {
+      options.kai_w4a32_decode_thread_cap = opts["kai_w4a32_decode_thread_cap"];
+    }
+    if (opts.contains("kai_w4a32_prefill_thread_cap")) {
+      options.kai_w4a32_prefill_thread_cap = opts["kai_w4a32_prefill_thread_cap"];
+    }
+  }
+  DeviceTypes backend = DeviceTypes::kCPU;
+  if (json.contains("backend")) { backend = str2DeviceType(json["backend"]); }
+  return Context::instance().getBackend(backend)->createOp(OpTypes::kParallelLinear, options);
 }
 
 BaseOp::ptr_t __repeatFromJson(const nlohmann::json& json) {

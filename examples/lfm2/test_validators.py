@@ -20,6 +20,13 @@ class Lfm2ValidatorTest(unittest.TestCase):
         self.assertEqual(len(shapes), 266)
         self.assertEqual(sum(kind == "full_attention" for kind in validate_checkpoint.LAYER_TYPES), 8)
 
+    def test_generation_contract_has_one_pinned_eos(self) -> None:
+        validate_checkpoint.validate_generation_config(validate_checkpoint.OFFICIAL_GENERATION)
+        drifted = dict(validate_checkpoint.OFFICIAL_GENERATION)
+        drifted["eos_token_id"] = [124900, 124901]
+        with self.assertRaisesRegex(AssertionError, "eos_token_id"):
+            validate_checkpoint.validate_generation_config(drifted)
+
     def test_quant_recipe_has_exact_tied_output_alias(self) -> None:
         validate_checkpoint.validate_recipe(self.recipe, validate_checkpoint.expected_shapes())
         descriptors = validate_converted_model.expected_descriptors(self.recipe)

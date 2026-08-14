@@ -7,6 +7,7 @@
 #include "mllm/core/aops/FlashAttention2Op.hpp"
 #include "mllm/core/aops/GatherOp.hpp"
 #include "mllm/core/aops/GroupedQueryAttentionDecodeOp.hpp"
+#include "mllm/core/aops/GroupedQueryAttentionOp.hpp"
 #include "mllm/core/aops/MatMulOp.hpp"
 #include "mllm/core/aops/LinearOp.hpp"
 #include "mllm/core/aops/ReduceOps.hpp"
@@ -91,6 +92,13 @@ Tensor flashAttention2(const Tensor& Q, const Tensor& K, const Tensor& V) {
 Tensor groupedQueryAttentionDecode(const Tensor& query, const Tensor& key, const Tensor& value) {
   return Context::instance().buildOpAndSubmitTask(OpTypes::kGroupedQueryAttentionDecode,
                                                   aops::GroupedQueryAttentionDecodeOpOptions{}, {query, key, value})[0];
+}
+
+Tensor groupedQueryAttention(const Tensor& query, const Tensor& key, const Tensor& value,
+                             aops::GroupedQueryAttentionImplementation implementation) {
+  return Context::instance().buildOpAndSubmitTask(OpTypes::kGroupedQueryAttention,
+                                                  aops::GroupedQueryAttentionOpOptions{.implementation = implementation},
+                                                  {query, key, value})[0];
 }
 
 Tensor softmax(const Tensor& x, int32_t dim) {

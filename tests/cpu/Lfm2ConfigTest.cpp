@@ -4,6 +4,7 @@
 
 #include <string>
 
+#include "mllm/backends/cpu/ops/LinearOp.hpp"
 #include "mllm/mllm.hpp"
 #include "mllm/models/lfm2/configuration_lfm2.hpp"
 #include "mllm/models/lfm2/modeling_lfm2.hpp"
@@ -36,6 +37,9 @@ TEST(Lfm2ConfigTest, NativeKVCacheUsesEightHeadsPerLogicalSlot) {
   EXPECT_EQ(model.kvCache().maxCacheLength(), 2048);
   EXPECT_NO_THROW(model.resetState());
   EXPECT_EQ(model.kvCache().getCurrentSeqCnt(0), 0);
+  model.kvCache().setCurrentSeqCnt(1);
+  auto sequence = mllm::Tensor::zeros({1, 1}, mllm::kInt64, mllm::kCPU);
+  EXPECT_THROW((void)model.forward({{"sequence", sequence}}, {}), std::invalid_argument);
   mllm::shutdownContext();
 }
 

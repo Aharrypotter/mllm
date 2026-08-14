@@ -33,6 +33,11 @@ OFFICIAL = {
     "pad_token_id": 124893,
     "rope_parameters": {"rope_theta": 10000000.0, "rope_type": "default"},
 }
+OFFICIAL_GENERATION = {
+    "bos_token_id": 124894,
+    "eos_token_id": [124900],
+    "pad_token_id": 124893,
+}
 LAYER_TYPES = [
     "conv", "conv", "full_attention", "conv", "conv", "full_attention", "conv", "conv", "conv", "full_attention",
     "conv", "conv", "conv", "full_attention", "conv", "conv", "conv", "full_attention", "conv", "conv", "conv",
@@ -96,6 +101,16 @@ def validate_config(config: dict) -> None:
         mismatches.append("layer_types differs from the official 30-layer physical schedule")
     if mismatches:
         raise AssertionError("Checkpoint contract mismatch: " + "; ".join(mismatches))
+
+
+def validate_generation_config(config: dict) -> None:
+    mismatches = [
+        f"{name}={config.get(name)!r}, expected {value!r}"
+        for name, value in OFFICIAL_GENERATION.items()
+        if config.get(name) != value
+    ]
+    if mismatches:
+        raise AssertionError("Generation contract mismatch: " + "; ".join(mismatches))
 
 
 def validate_runtime_config(checkpoint: dict, runtime: dict) -> None:
@@ -178,10 +193,12 @@ def main() -> None:
     args = parser.parse_args()
 
     checkpoint_config = json.loads((args.checkpoint / "config.json").read_text())
+    generation_config = json.loads((args.checkpoint / "generation_config.json").read_text())
     runtime_config = json.loads(args.runtime_config.read_text())
     recipe = json.loads(args.quant_config.read_text())
     expected = expected_shapes()
     validate_config(checkpoint_config)
+    validate_generation_config(generation_config)
     validate_runtime_config(checkpoint_config, runtime_config)
     validate_recipe(recipe, expected)
     actual = checkpoint_shapes(args.checkpoint)

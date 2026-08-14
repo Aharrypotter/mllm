@@ -1,13 +1,10 @@
 // Copyright (c) MLLM Team.
 // Licensed under the MIT License.
 
-#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <limits>
-#include <stdexcept>
 
 #if defined(__linux__)
 #include <sys/auxv.h>
@@ -17,7 +14,6 @@
 #include "mllm/backends/cpu/kernels/Kernels.hpp"
 #include "mllm/core/DataTypes.hpp"
 #include "mllm/core/aops/LinearOp.hpp"
-#include "mllm/engine/Context.hpp"
 
 namespace mllm::cpu {
 
@@ -76,17 +72,9 @@ void traceKaiW4A32PrefillTile(KaiW4A32Tile tile, int m, int k, int n, int thread
 
 CPULinearOp::CPULinearOp(const aops::LinearOpOptions& options) : LinearOp(options) {}
 
-void CPULinearOp::setKaiW4A32ThreadCaps(int decode_thread_cap, int prefill_thread_cap) {
-  if (decode_thread_cap <= 0 || prefill_thread_cap <= 0) {
-    throw std::invalid_argument("KAI W4A32 thread caps must be positive");
-  }
-  kai_w4a32_decode_thread_cap_ = decode_thread_cap;
-  kai_w4a32_prefill_thread_cap_ = prefill_thread_cap;
-}
-
 int CPULinearOp::kaiW4A32ThreadCount(int m) const {
-  return detail::kaiW4A32ThreadCount(
-      m, options_.getThreads(), kai_w4a32_decode_thread_cap_, kai_w4a32_prefill_thread_cap_);
+  return detail::kaiW4A32ThreadCount(m, options_.getThreads(), options_.kai_w4a32_decode_thread_cap,
+                                     options_.kai_w4a32_prefill_thread_cap);
 }
 
 Tensor CPULinearOp::acquireKaiWorkspace(int32_t workspace_size, int m) {
@@ -96,93 +84,6 @@ Tensor CPULinearOp::acquireKaiWorkspace(int32_t workspace_size, int m) {
     kai_decode_workspace_ = Tensor::empty({workspace_size}, kInt8, kCPU).alloc();
   }
   return kai_decode_workspace_;
-}
-
-bool CPULinearOp::tryForwardSharedInputKaiM1(const Tensor& input, const BaseOp::ptr_t* linear_ops, size_t linear_op_count,
-                                             std::vector<Tensor>& outputs) {
-#if defined(MLLM_HOST_ARCH_ARM64) || defined(MLLM_HOST_ARCH_ARM)
-  constexpr size_t kMaximumSharedProjections = 3;
-  constexpr auto kRequiredImpl = aops::LinearImplTypes::kKaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_qai8dxp1x8_qsi4c32p8x8_1x8x32;
-  using KaiHelper = ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk;
-  constexpr auto kTile = KaiHelper::Tiles::qai8dxp1x8_qsi4c32p8x8_1x8x32;
-
-  if (Context::instance().thisThread()->trace_mode || input.isNil() || input.device() != kCPU || input.dtype() != kFloat32
-      || !input.isContiguous() || input.rank() < 2 || input.size(-2) != 1 || input.size(-1) <= 0 || !outputs.empty()
-      || linear_ops == nullptr || linear_op_count < 2 || linear_op_count > kMaximumSharedProjections) {
-    return false;
-  }
-
-  const auto input_shape = input.shape();
-  for (size_t index = 0; index + 2 < input_shape.size(); ++index) {
-    if (input_shape[index] != 1) { return false; }
-  }
-
-  const int32_t K = input.size(-1);
-  int32_t thread_count = 0;
-  std::array<CPULinearOp*, kMaximumSharedProjections> ops{};
-  for (size_t index = 0; index < linear_op_count; ++index) {
-    auto* op = dynamic_cast<CPULinearOp*>(linear_ops[index].get());
-    if (op == nullptr || op->getDevice() != kCPU || op->options_.impl_type != kRequiredImpl || op->options_.bias
-        || op->options_.in_channels != K || op->options_.out_channels <= 0 || op->weight_.isNil()
-        || op->weight_.device() != kCPU || op->options_.getThreads() <= 0) {
-      return false;
-    }
-    if (index == 0) {
-      thread_count = op->kaiW4A32ThreadCount(1);
-    } else if (op->kaiW4A32ThreadCount(1) != thread_count) {
-      return false;
-    }
-    ops[index] = op;
-  }
-
-  std::vector<Tensor> prepared_outputs;
-  prepared_outputs.reserve(linear_op_count);
-  for (size_t index = 0; index < linear_op_count; ++index) {
-    auto output_shape = input_shape;
-    output_shape.back() = ops[index]->options_.out_channels;
-    prepared_outputs.emplace_back(Tensor::empty(output_shape, kFloat32, kCPU).alloc());
-  }
-
-  std::array<KaiHelper::SharedInputProjection, kMaximumSharedProjections> projections{};
-  for (size_t index = 0; index < linear_op_count; ++index) {
-    projections[index] = {
-        .dst = prepared_outputs[index].ptr<mllm_fp32_t>(),
-        .packed_weight_bias = reinterpret_cast<const uint8_t*>(ops[index]->weight_.ptr<mllm_byte_t>()),
-        .n = ops[index]->options_.out_channels,
-    };
-  }
-
-  KaiHelper kai_helper;
-  const size_t workspace_size = kai_helper.workspace_size(1, K, kTile);
-  if (workspace_size == 0 || workspace_size > static_cast<size_t>(std::numeric_limits<int32_t>::max())) { return false; }
-  auto workspace = ops[0]->acquireKaiWorkspace(static_cast<int32_t>(workspace_size), 1);
-  if (!kai_helper.matmul_shared_input_m1(input.ptr<mllm_fp32_t>(), projections.data(), linear_op_count, workspace.ptr<void>(),
-                                         K, kTile, thread_count)) {
-    return false;
-  }
-
-  static const bool trace_activation = [] {
-    const char* value = std::getenv("MLLM_KAI_SHARED_INPUT_TRACE");
-    return value != nullptr && value[0] == '1' && value[1] == '\0';
-  }();
-  if (trace_activation) {
-    const uint32_t activation_bit = 1U << static_cast<uint32_t>(linear_op_count - 2);
-    static std::atomic<uint32_t> activated_groups{0};
-    const uint32_t previous = activated_groups.fetch_or(activation_bit, std::memory_order_relaxed);
-    if ((previous & activation_bit) == 0) {
-      std::fprintf(stderr, "MLLM_KAI_SHARED_INPUT_ACTIVATED rhs=%zu k=%d threads=%d\n", linear_op_count, K, thread_count);
-    }
-  }
-
-  outputs = std::move(prepared_outputs);
-  return true;
-#else
-  (void)input;
-  (void)linear_ops;
-  (void)linear_op_count;
-  (void)outputs;
-  return false;
-#endif
 }
 
 void CPULinearOp::load(const ParameterFile::ptr_t& ploader) {

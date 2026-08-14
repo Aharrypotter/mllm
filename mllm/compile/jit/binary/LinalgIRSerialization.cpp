@@ -12,6 +12,9 @@
 #include "mllm/core/aops/CastTypeOp.hpp"
 #include "mllm/core/aops/FlashAttention2Op.hpp"
 #include "mllm/core/aops/GroupedQueryAttentionDecodeOp.hpp"
+#include "mllm/core/aops/CausalDepthwiseConv1DOp.hpp"
+#include "mllm/core/aops/GroupedQueryAttentionOp.hpp"
+#include "mllm/core/aops/ParallelLinearOp.hpp"
 #include "mllm/core/aops/KVCacheOp.hpp"
 #include "mllm/core/aops/MultimodalRoPEOp.hpp"
 #include "mllm/core/aops/VisionRoPEOp.hpp"
@@ -71,6 +74,9 @@ nlohmann::json dumpLinalgIROptions(const ir::linalg::LinalgIROp::ptr_t& op) {
     CASE(STFT)
     CASE(FlashAttention2)
     CASE(GroupedQueryAttentionDecode)
+    CASE(CausalDepthwiseConv1D)
+    CASE(GroupedQueryAttention)
+    CASE(ParallelLinear)
     CASE(Repeat)
     CASE(Permute)
     CASE(Conv1D)
@@ -137,7 +143,34 @@ nlohmann::json dumpLinearOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op) {
   return {{"in_channels", options.in_channels},
           {"out_channels", options.out_channels},
           {"bias", options.bias},
-          {"impl_type", LinearImplTypes2Str(options.impl_type)}};
+          {"impl_type", LinearImplTypes2Str(options.impl_type)},
+          {"kai_w4a32_decode_thread_cap", options.kai_w4a32_decode_thread_cap},
+          {"kai_w4a32_prefill_thread_cap", options.kai_w4a32_prefill_thread_cap}};
+}
+
+nlohmann::json dumpCausalDepthwiseConv1DOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op) {
+  const auto options = static_cast<aops::CausalDepthwiseConv1DOp*>(op->getAOp())->options();
+  return {{"channels", options.channels},
+          {"kernel_size", options.kernel_size},
+          {"bias", options.bias},
+          {"state_inplace", options.state_inplace},
+          {"accumulation_order", aops::causalDepthwiseConv1DAccumulationOrder2Str(options.accumulation_order)}};
+}
+
+nlohmann::json dumpGroupedQueryAttentionOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op) {
+  const auto options = static_cast<aops::GroupedQueryAttentionOp*>(op->getAOp())->options();
+  return {{"implementation", aops::groupedQueryAttentionImplementation2Str(options.implementation)}};
+}
+
+nlohmann::json dumpParallelLinearOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op) {
+  const auto options = static_cast<aops::ParallelLinearOp*>(op->getAOp())->options();
+  return {{"in_channels", options.in_channels},
+          {"out_channels", options.out_channels},
+          {"projection_names", options.projection_names},
+          {"bias", options.bias},
+          {"impl_type", aops::LinearImplTypes2Str(options.impl_type)},
+          {"kai_w4a32_decode_thread_cap", options.kai_w4a32_decode_thread_cap},
+          {"kai_w4a32_prefill_thread_cap", options.kai_w4a32_prefill_thread_cap}};
 }
 
 nlohmann::json dumpRoPEOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op) { return {}; }

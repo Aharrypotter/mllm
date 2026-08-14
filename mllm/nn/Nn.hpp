@@ -13,6 +13,8 @@
 #include "mllm/nn/layers/Sigmoid.hpp"         // IWYU pragma: export
 #include "mllm/nn/layers/Embedding.hpp"       // IWYU pragma: export
 #include "mllm/nn/layers/GELU.hpp"            // IWYU pragma: export
+#include "mllm/nn/layers/CausalDepthwiseConv1D.hpp"  // IWYU pragma: export
+#include "mllm/nn/layers/GroupedQueryAttention.hpp"  // IWYU pragma: export
 #include "mllm/nn/layers/GroupedQueryAttentionDecode.hpp"  // IWYU pragma: export
 #include "mllm/nn/layers/QuickGELU.hpp"       // IWYU pragma: export
 #include "mllm/nn/layers/ReLU.hpp"            // IWYU pragma: export
@@ -25,6 +27,7 @@
 #include "mllm/nn/layers/RoPE.hpp"            // IWYU pragma: export
 #include "mllm/nn/layers/MultimodalRoPE.hpp"  // IWYU pragma: export
 #include "mllm/nn/layers/Param.hpp"           // IWYU pragma: export
+#include "mllm/nn/layers/ParallelLinear.hpp"  // IWYU pragma: export
 #include "mllm/nn/layers/KVCache.hpp"         // IWYU pragma: export
 #include "mllm/nn/layers/Conv1D.hpp"          // IWYU pragma: export
 #include "mllm/nn/layers/AvgPool1d.hpp"       // IWYU pragma: export

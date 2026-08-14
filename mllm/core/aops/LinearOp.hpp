@@ -168,6 +168,8 @@ struct LinearOpOptions : public BaseOpOptions<LinearOpOptions> {
   int32_t out_channels;
   bool bias;
   LinearImplTypes impl_type;
+  int32_t kai_w4a32_decode_thread_cap = 0;
+  int32_t kai_w4a32_prefill_thread_cap = 0;
 
   LinearImplTypes qnn_impl_type = LinearImplTypes::kQNN_tensor_symm_w8a16;  // specify Linear type when using QNN
 };

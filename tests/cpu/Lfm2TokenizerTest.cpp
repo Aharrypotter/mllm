@@ -29,6 +29,13 @@ TEST(Lfm2TokenizerTest, RendersPinnedSystemAndRawToolSchemaContract) {
                   "<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\n<think>");
 }
 
+TEST(Lfm2TokenizerTest, StreamsUtf8AcrossTokenBoundaries) {
+  mllm::models::lfm2::StreamingUtf8Decoder decoder;
+  EXPECT_EQ(decoder.append("\xF0\x9F"), "");
+  EXPECT_EQ(decoder.append("\x98\x80"), "\xF0\x9F\x98\x80");
+  EXPECT_EQ(decoder.finish(), "");
+}
+
 TEST(Lfm2TokenizerTest, MatchesPinnedCheckpointOracleWhenProvided) {
   const char* tokenizer_path = std::getenv("MLLM_LFM2_TOKENIZER_JSON");
   if (tokenizer_path == nullptr) GTEST_SKIP() << "set MLLM_LFM2_TOKENIZER_JSON to run checkpoint oracle";

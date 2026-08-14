@@ -10,77 +10,14 @@
 #include <vector>
 
 #include "mllm/models/ARGeneration.hpp"
+#include "mllm/preprocessor/StreamingUtf8Decoder.hpp"
 #include "mllm/preprocessor/tokenizers/AutoTokenizer.hpp"
 #include "mllm/preprocessor/tokenizers/BPE.hpp"
 #include "mllm/preprocessor/tokenizers/Unicode.hpp"
 
 namespace mllm::models::lfm2 {
 
-class StreamingUtf8Decoder {
- public:
-  std::string append(std::string_view bytes) {
-    pending_.append(bytes.data(), bytes.size());
-    return drain(false);
-  }
-  std::string finish() { return drain(true); }
-
- private:
-  static bool continuation(unsigned char byte) { return byte >= 0x80 && byte <= 0xBF; }
-  static size_t length(unsigned char lead) {
-    if (lead <= 0x7F) return 1;
-    if (lead >= 0xC2 && lead <= 0xDF) return 2;
-    if (lead >= 0xE0 && lead <= 0xEF) return 3;
-    if (lead >= 0xF0 && lead <= 0xF4) return 4;
-    return 0;
-  }
-  static bool validSecond(unsigned char lead, unsigned char second) {
-    if (!continuation(second)) return false;
-    if (lead == 0xE0) return second >= 0xA0;
-    if (lead == 0xED) return second <= 0x9F;
-    if (lead == 0xF0) return second >= 0x90;
-    if (lead == 0xF4) return second <= 0x8F;
-    return true;
-  }
-  std::string drain(bool flush) {
-    static constexpr std::string_view replacement = "\xEF\xBF\xBD";
-    std::string output;
-    size_t offset = 0;
-    while (offset < pending_.size()) {
-      const auto lead = static_cast<unsigned char>(pending_[offset]);
-      const auto count = length(lead);
-      if (count == 1) {
-        output.push_back(pending_[offset++]);
-        continue;
-      }
-      if (count == 0) {
-        output.append(replacement);
-        ++offset;
-        continue;
-      }
-      const auto available = pending_.size() - offset;
-      bool valid = available < 2 || validSecond(lead, static_cast<unsigned char>(pending_[offset + 1]));
-      for (size_t index = 2; valid && index < std::min(available, count); ++index) {
-        valid = continuation(static_cast<unsigned char>(pending_[offset + index]));
-      }
-      if (!valid) {
-        output.append(replacement);
-        ++offset;
-      } else if (available < count) {
-        if (flush) {
-          output.append(replacement);
-          offset = pending_.size();
-        }
-        break;
-      } else {
-        output.append(pending_, offset, count);
-        offset += count;
-      }
-    }
-    pending_.erase(0, offset);
-    return output;
-  }
-  std::string pending_;
-};
+using StreamingUtf8Decoder = preprocessor::StreamingUtf8Decoder;
 
 // Implements the checkpoint regex. The material difference from the older
 // Qwen pattern is the numeric branch: LFM2 groups one to three digits.

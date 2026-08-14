@@ -2,36 +2,44 @@
 // Licensed under the MIT License.
 #pragma once
 
-#include <array>
-#include <atomic>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
-#include "mllm/backends/cpu/ops/LinearOp.hpp"
-#include "mllm/backends/cpu/kernels/common/gdn/gated_delta_net.hpp"
 #include "mllm/core/Tensor.hpp"
 #include "mllm/models/ARGeneration.hpp"
 #include "mllm/models/lfm2/configuration_lfm2.hpp"
 #include "mllm/nn/Functional.hpp"
 #include "mllm/nn/Module.hpp"
 #include "mllm/nn/Nn.hpp"
-#include "mllm/nn/llm_components/GroupedQueryAttention.hpp"
 #include "mllm/nn/lmcache/KVHeadStaticCache.hpp"
 
 namespace mllm::models::lfm2 {
 
-inline void configureLfm2KaiW4A32Threads(nn::Linear& linear) {
-  auto op = std::dynamic_pointer_cast<cpu::CPULinearOp>(linear.impl()->getInstancedOp());
-  if (op != nullptr) {
-    // OnePlus 13T source-bound screening keeps I8MM prefill above 80 tok/s
-    // with six workers, while four workers avoid decode GEMV oversubscription.
-    op->setKaiW4A32ThreadCaps(4, 6);
-  }
+inline auto makeLfm2LinearOptions(int32_t in_channels, int32_t out_channels, bool bias, aops::LinearImplTypes impl_type)
+    -> aops::LinearOpOptions {
+  return {.in_channels = in_channels,
+          .out_channels = out_channels,
+          .bias = bias,
+          .impl_type = impl_type,
+          // OnePlus 13T source-bound screening keeps I8MM prefill above 80 tok/s
+          // with six workers, while four workers avoid decode GEMV oversubscription.
+          .kai_w4a32_decode_thread_cap = 4,
+          .kai_w4a32_prefill_thread_cap = 6};
+}
+
+inline auto makeLfm2ParallelLinearOptions(int32_t in_channels, std::vector<int32_t> out_channels,
+                                          std::vector<std::string> projection_names, bool bias, aops::LinearImplTypes impl_type)
+    -> aops::ParallelLinearOpOptions {
+  return {.in_channels = in_channels,
+          .out_channels = std::move(out_channels),
+          .projection_names = std::move(projection_names),
+          .bias = bias,
+          .impl_type = impl_type,
+          .kai_w4a32_decode_thread_cap = 4,
+          .kai_w4a32_prefill_thread_cap = 6};
 }
 
 // Model-level orchestration: materialize the immutable analytical RoPE table.
@@ -73,29 +81,20 @@ class Lfm2MLP final : public nn::Module {
  public:
   Lfm2MLP() = default;
   Lfm2MLP(const std::string& name, const Lfm2Config& cfg) : nn::Module(name) {
-    w1_ = reg<nn::Linear>("w1", cfg.hidden_size, cfg.intermediate_size, false, cfg.linear_impl_type);
-    w3_ = reg<nn::Linear>("w3", cfg.hidden_size, cfg.intermediate_size, false, cfg.linear_impl_type);
-    w2_ = reg<nn::Linear>("w2", cfg.intermediate_size, cfg.hidden_size, false, cfg.linear_impl_type);
-    configureLfm2KaiW4A32Threads(w1_);
-    configureLfm2KaiW4A32Threads(w3_);
-    configureLfm2KaiW4A32Threads(w2_);
+    gate_up_proj_ = reg<nn::ParallelLinear>(
+        "gate_up_proj", makeLfm2ParallelLinearOptions(cfg.hidden_size, {cfg.intermediate_size, cfg.intermediate_size},
+                                                      {"w1", "w3"}, false, cfg.linear_impl_type));
+    w2_ = reg<nn::Linear>("w2", makeLfm2LinearOptions(cfg.intermediate_size, cfg.hidden_size, false, cfg.linear_impl_type));
     silu_ = reg<nn::SiLU>("silu");
   }
   std::vector<Tensor> forward(const std::vector<Tensor>& inputs, const std::vector<AnyValue>&) override {
-    std::vector<Tensor> gate_up;
-    if (inputs[0].rank() >= 2 && inputs[0].size(-2) == 1) {
-      const std::array<BaseOp::ptr_t, 2> gate_up_ops = {w1_.impl()->getInstancedOp(), w3_.impl()->getInstancedOp()};
-      if (cpu::CPULinearOp::tryForwardSharedInputKaiM1(inputs[0], gate_up_ops.data(), gate_up_ops.size(), gate_up)) {
-        return {w2_(silu_(gate_up[0]) * gate_up[1])};
-      }
-    }
-    return {w2_(silu_(w1_(inputs[0])) * w3_(inputs[0]))};
+    auto gate_up = gate_up_proj_(inputs[0]);
+    return {w2_(silu_(gate_up[0]) * gate_up[1])};
   }
 
  private:
-  nn::Linear w1_;
+  nn::ParallelLinear gate_up_proj_;
   nn::Linear w2_;
-  nn::Linear w3_;
   nn::SiLU silu_;
 };
 
@@ -107,31 +106,26 @@ class Lfm2Attention final : public nn::Module {
     head_dim_ = cfg.head_dim;
     query_heads_ = cfg.num_attention_heads;
     kv_heads_ = cfg.num_key_value_heads;
-    q_proj_ = reg<nn::Linear>("q_proj", hidden_size_, query_heads_ * head_dim_, false, cfg.linear_impl_type);
-    k_proj_ = reg<nn::Linear>("k_proj", hidden_size_, kv_heads_ * head_dim_, false, cfg.linear_impl_type);
-    v_proj_ = reg<nn::Linear>("v_proj", hidden_size_, kv_heads_ * head_dim_, false, cfg.linear_impl_type);
-    out_proj_ = reg<nn::Linear>("out_proj", query_heads_ * head_dim_, hidden_size_, false, cfg.linear_impl_type);
-    configureLfm2KaiW4A32Threads(q_proj_);
-    configureLfm2KaiW4A32Threads(k_proj_);
-    configureLfm2KaiW4A32Threads(v_proj_);
-    configureLfm2KaiW4A32Threads(out_proj_);
+    qkv_proj_ = reg<nn::ParallelLinear>(
+        "qkv_proj",
+        makeLfm2ParallelLinearOptions(hidden_size_, {query_heads_ * head_dim_, kv_heads_ * head_dim_, kv_heads_ * head_dim_},
+                                      {"q_proj", "k_proj", "v_proj"}, false, cfg.linear_impl_type));
+    out_proj_ =
+        reg<nn::Linear>("out_proj", makeLfm2LinearOptions(query_heads_ * head_dim_, hidden_size_, false, cfg.linear_impl_type));
     q_layernorm_ = reg<nn::RMSNorm>("q_layernorm", cfg.norm_eps, false);
     k_layernorm_ = reg<nn::RMSNorm>("k_layernorm", cfg.norm_eps, false);
     q_rope_ = reg<nn::RoPE>("q_rope", cfg.rope_theta, cfg.max_position_embeddings, head_dim_);
     k_rope_ = reg<nn::RoPE>("k_rope", cfg.rope_theta, cfg.max_position_embeddings, head_dim_);
+    gqa_ = reg<nn::GroupedQueryAttention>(
+        "gqa",
+        aops::GroupedQueryAttentionOpOptions{.implementation = aops::GroupedQueryAttentionImplementation::kDirectStrided});
   }
 
   std::vector<Tensor> forward(const std::vector<Tensor>& inputs, const std::vector<AnyValue>& args) override {
     const auto& x = inputs[0];
     const int32_t batch = x.shape()[0];
     const int32_t sequence = x.shape()[1];
-    std::vector<Tensor> qkv;
-    if (sequence == 1) {
-      const std::array<BaseOp::ptr_t, 3> qkv_ops = {
-          q_proj_.impl()->getInstancedOp(), k_proj_.impl()->getInstancedOp(), v_proj_.impl()->getInstancedOp()};
-      (void)cpu::CPULinearOp::tryForwardSharedInputKaiM1(x, qkv_ops.data(), qkv_ops.size(), qkv);
-    }
-    if (qkv.empty()) { qkv = {q_proj_(x), k_proj_(x), v_proj_(x)}; }
+    auto qkv = qkv_proj_(x);
     auto query = qkv[0].view({batch, sequence, query_heads_, head_dim_});
     auto key = qkv[1].view({batch, sequence, kv_heads_, head_dim_});
     auto value = qkv[2].view({batch, sequence, kv_heads_, head_dim_});
@@ -147,7 +141,7 @@ class Lfm2Attention final : public nn::Module {
     // and decode. MiniCPM5's dedicated decode kernel is faster, but the
     // OnePlus exact-token gate showed that its different reduction order
     // changes LFM2 generation beginning at token 12.
-    auto output = nn::llm_components::groupedQueryAttentionDirectEager(query, updated[0], updated[1]);
+    auto output = gqa_(query, updated[0], updated[1]);
     output = output.transpose(1, 2).contiguous().view({batch, sequence, query_heads_ * head_dim_});
     return {out_proj_(output)};
   }
@@ -159,14 +153,13 @@ class Lfm2Attention final : public nn::Module {
   int32_t head_dim_ = 0;
   int32_t query_heads_ = 0;
   int32_t kv_heads_ = 0;
-  nn::Linear q_proj_;
-  nn::Linear k_proj_;
-  nn::Linear v_proj_;
+  nn::ParallelLinear qkv_proj_;
   nn::Linear out_proj_;
   nn::RMSNorm q_layernorm_;
   nn::RMSNorm k_layernorm_;
   nn::RoPE q_rope_;
   nn::RoPE k_rope_;
+  nn::GroupedQueryAttention gqa_;
 };
 
 class Lfm2ShortConv final : public nn::Module {
@@ -175,11 +168,12 @@ class Lfm2ShortConv final : public nn::Module {
   Lfm2ShortConv(const std::string& name, const Lfm2Config& cfg) : nn::Module(name) {
     hidden_size_ = cfg.hidden_size;
     kernel_size_ = cfg.conv_L_cache;
-    in_proj_ = reg<nn::Linear>("in_proj", hidden_size_, 3 * hidden_size_, cfg.conv_bias, cfg.linear_impl_type);
-    conv_ = reg<nn::Conv1D>("conv", hidden_size_, hidden_size_, kernel_size_, 1, 0, 1, hidden_size_, cfg.conv_bias);
-    out_proj_ = reg<nn::Linear>("out_proj", hidden_size_, hidden_size_, cfg.conv_bias, cfg.linear_impl_type);
-    configureLfm2KaiW4A32Threads(in_proj_);
-    configureLfm2KaiW4A32Threads(out_proj_);
+    in_proj_ =
+        reg<nn::Linear>("in_proj", makeLfm2LinearOptions(hidden_size_, 3 * hidden_size_, cfg.conv_bias, cfg.linear_impl_type));
+    conv_ = reg<nn::CausalDepthwiseConv1D>("conv", hidden_size_, kernel_size_, cfg.conv_bias, true,
+                                           aops::CausalDepthwiseConv1DAccumulationOrder::kHistoryFirst);
+    out_proj_ =
+        reg<nn::Linear>("out_proj", makeLfm2LinearOptions(hidden_size_, hidden_size_, cfg.conv_bias, cfg.linear_impl_type));
   }
 
   // The causal kernel consumes only K - 1 historical samples. The former
@@ -202,23 +196,8 @@ class Lfm2ShortConv final : public nn::Module {
     auto c = projected[{kAll, kAll, {hidden_size_, 2 * hidden_size_}}].contiguous();
     auto x = projected[{kAll, kAll, {2 * hidden_size_, 3 * hidden_size_}}].contiguous();
     auto bx = b * x;
-    auto conv_weight = conv_.weight();
-    if (conv_weight.dtype() != kFloat32 || conv_weight.device() != kCPU || !conv_weight.isContiguous()) {
-      throw std::invalid_argument("LFM2 short convolution requires contiguous float32 CPU weights");
-    }
-    auto convolved = Tensor::empty({batch, sequence, hidden_size_}, kFloat32, kCPU).alloc();
-    cpu::gdn::depthwiseCausalConvHistoryFirstF32(bx.ptr<float>(), conv_weight.ptr<float>(), state_.ptr<float>(),
-                                                 convolved.ptr<float>(), batch, sequence, hidden_size_, kernel_size_);
-    static const bool trace_activation = [] {
-      const char* value = std::getenv("MLLM_LFM2_SHORT_CONV_TRACE");
-      return value != nullptr && value[0] == '1' && value[1] == '\0';
-    }();
-    if (trace_activation) {
-      static std::atomic<bool> activated{false};
-      if (!activated.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr, "MLLM_LFM2_SHORT_CONV_REUSE_ACTIVATED k=%d channels=%d\n", kernel_size_, hidden_size_);
-      }
-    }
+    auto [convolved, updated_state] = conv_(bx, state_);
+    state_ = std::move(updated_state);
     return {out_proj_(c * convolved)};
   }
 
@@ -226,7 +205,7 @@ class Lfm2ShortConv final : public nn::Module {
   int32_t hidden_size_ = 0;
   int32_t kernel_size_ = 0;
   nn::Linear in_proj_;
-  nn::Conv1D conv_;
+  nn::CausalDepthwiseConv1D conv_;
   nn::Linear out_proj_;
   Tensor state_;
 };
@@ -333,8 +312,8 @@ class Lfm2ForCausalLM final : public ARGeneration, public nn::Module {
     model_ = reg<Lfm2Model>("model", cfg);
     // The converter creates this packed alias from the tied embedding. Keeping
     // it explicit lets the mobile W4A32 output projection use the standard Linear path.
-    lm_head_ = reg<nn::Linear>("lm_head_out", cfg.hidden_size, cfg.vocab_size, false, cfg.linear_impl_type);
-    configureLfm2KaiW4A32Threads(lm_head_);
+    lm_head_ =
+        reg<nn::Linear>("lm_head_out", makeLfm2LinearOptions(cfg.hidden_size, cfg.vocab_size, false, cfg.linear_impl_type));
     registerBuffer("inv_freq", makeRoPEInvFreq(cfg.head_dim, cfg.rope_theta));
   }
 
@@ -361,6 +340,10 @@ class Lfm2ForCausalLM final : public ARGeneration, public nn::Module {
         *position_ids.ptr<int64_t>() = previous + 1;
       }
     } else {
+      if (cached_tokens != 0) {
+        throw std::invalid_argument(
+            "LFM2 continuation with a non-empty KV cache requires the position_ids returned by the previous step");
+      }
       position_ids = Tensor::empty({1, sequence_length}, kInt64, kCPU).alloc();
       for (int32_t index = 0; index < sequence_length; ++index) position_ids.ptr<int64_t>()[index] = index;
     }

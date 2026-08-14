@@ -83,6 +83,10 @@ BPE contract and ends the generation prompt exactly at `<think>`. For a demo
 receipt, use `demo_prompt.txt` unchanged on the host and Android, request a long
 deterministic continuation with equal `max_new_tokens` and `min_new_tokens`,
 and retain the printed prompt, response, token IDs, and generated-token count.
+The runner deliberately streams the checkpoint output verbatim: reasoning text
+and a generated `</think>` marker are displayed rather than separated or
+suppressed. This is a transparent demo behavior, not a product chat-surface
+contract.
 
 ## Product benchmark records
 

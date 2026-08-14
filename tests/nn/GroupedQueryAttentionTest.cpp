@@ -37,6 +37,15 @@ class GroupedQueryAttentionDecodeTraceModule final : public mllm::nn::Module {
   }
 };
 
+class GroupedQueryAttentionTraceModule final : public mllm::nn::Module {
+ public:
+  GroupedQueryAttentionTraceModule() : Module("gqa_trace") {}
+
+  std::vector<Tensor> forward(const std::vector<Tensor>& inputs, const std::vector<mllm::AnyValue>& args) override {
+    return {mllm::nn::functional::groupedQueryAttention(inputs[0], inputs[1], inputs[2])};
+  }
+};
+
 mllm::ir::linalg::GroupedQueryAttentionDecodeOp::ptr_t findGroupedQueryAttentionDecodeOp(const mllm::ir::node_ptr_t& node) {
   if (node->isa_<mllm::ir::linalg::GroupedQueryAttentionDecodeOp>()) {
     return node->cast_<mllm::ir::linalg::GroupedQueryAttentionDecodeOp>();
@@ -45,6 +54,19 @@ mllm::ir::linalg::GroupedQueryAttentionDecodeOp::ptr_t findGroupedQueryAttention
   for (const auto& region : node->cast_<mllm::ir::Op>()->regions()) {
     for (const auto& op : region->ops()) {
       if (auto found = findGroupedQueryAttentionDecodeOp(op)) { return found; }
+    }
+  }
+  return nullptr;
+}
+
+mllm::ir::linalg::GroupedQueryAttentionOp::ptr_t findGroupedQueryAttentionOp(const mllm::ir::node_ptr_t& node) {
+  if (node->isa_<mllm::ir::linalg::GroupedQueryAttentionOp>()) {
+    return node->cast_<mllm::ir::linalg::GroupedQueryAttentionOp>();
+  }
+  if (!node->isa_<mllm::ir::Op>()) { return nullptr; }
+  for (const auto& region : node->cast_<mllm::ir::Op>()->regions()) {
+    for (const auto& op : region->ops()) {
+      if (auto found = findGroupedQueryAttentionOp(op)) { return found; }
     }
   }
   return nullptr;
@@ -121,14 +143,31 @@ TEST_F(GroupedQueryAttentionTest, MatchesRepeatedKVReference) {
   expectNear(actual, expected);
 }
 
-TEST_F(GroupedQueryAttentionTest, DirectEagerMatchesReference) {
+TEST_F(GroupedQueryAttentionTest, RegisteredDirectStridedMatchesReference) {
   auto query = sequential({1, 4, 3, 5}, 0.07F);
   auto key = sequential({1, 2, 3, 5}, 0.11F);
   auto value = sequential({1, 2, 3, 5}, 0.13F);
-  const auto actual = mllm::nn::llm_components::groupedQueryAttentionDirectEager(query, key, value);
+  const auto actual = mllm::nn::functional::groupedQueryAttention(query, key, value);
   const auto expected = gqaReference(query, key, value);
 
   expectNear(actual, expected, 1e-6F);
+}
+
+TEST_F(GroupedQueryAttentionTest, DirectStridedOpTraceAndSerializationRoundTrip) {
+  GroupedQueryAttentionTraceModule module;
+  auto ir_ctx = mllm::ir::trace(module, Tensor::empty({1, 4, 2, 5}, mllm::kFloat32, mllm::kCPU),
+                                Tensor::empty({1, 2, 4, 5}, mllm::kFloat32, mllm::kCPU),
+                                Tensor::empty({1, 2, 4, 3}, mllm::kFloat32, mllm::kCPU));
+  auto ir_op = findGroupedQueryAttentionOp(ir_ctx->topLevelOp());
+  ASSERT_NE(ir_op, nullptr);
+  EXPECT_EQ(ir_op->getAOp()->getOpType(), mllm::OpTypes::kGroupedQueryAttention);
+
+  const auto options = mllm::jit::binary::dumpLinalgIROptions(ir_op);
+  EXPECT_EQ(options.at("implementation"), "DirectStrided");
+  const auto restored = mllm::jit::interpreter::aopsFromJson(
+      nlohmann::json{{"op_type", "GroupedQueryAttention"}, {"backend", "CPU"}, {"op_options", options}});
+  ASSERT_NE(restored, nullptr);
+  EXPECT_EQ(restored->getOpType(), mllm::OpTypes::kGroupedQueryAttention);
 }
 
 TEST_F(GroupedQueryAttentionTest, SupportsOneKVHeadAndRejectsIllegalGeometry) {
