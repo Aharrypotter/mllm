@@ -445,6 +445,58 @@ void KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::matmul(float* __restrict__ dst, con
   }
 }
 
+bool KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::matmul_shared_input_m1(
+    const float* __restrict__ lhs_fp32, const SharedInputProjection* projections, size_t projection_count, void* workspace,
+    int K, KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles tile_cfg, int thread_count) {
+  if (lhs_fp32 == nullptr || projections == nullptr || projection_count < 2 || workspace == nullptr || K <= 0
+      || thread_count <= 0) {
+    return false;
+  }
+  for (size_t projection_index = 0; projection_index < projection_count; ++projection_index) {
+    if (projections[projection_index].dst == nullptr || projections[projection_index].packed_weight_bias == nullptr
+        || projections[projection_index].n <= 0) {
+      return false;
+    }
+  }
+
+  const auto& ukernel = ukernels_.at(tile_cfg);
+  kai_run_lhs_quant_pack_qai8dxp_f32(1, K, ukernel.get_mr(), ukernel.get_kr(), ukernel.get_sr(), 0, lhs_fp32,
+                                     K * sizeof(float), workspace);
+
+  const size_t n_step = static_cast<size_t>(ukernel.get_n_step());
+  size_t total_tiles = 0;
+  for (size_t projection_index = 0; projection_index < projection_count; ++projection_index) {
+    total_tiles += (static_cast<size_t>(projections[projection_index].n) + n_step - 1) / n_step;
+  }
+  const void* lhs_ptr =
+      static_cast<const void*>(static_cast<const char*>(workspace) + ukernel.get_lhs_packed_offset(0, K));
+
+  MLLM_CONDITIONAL_PARALLEL_FOR(thread_count > 1, thread_count, global_tile, 0, total_tiles, 1, {
+    size_t local_tile = static_cast<size_t>(global_tile);
+    size_t projection_index = 0;
+    for (; projection_index < projection_count; ++projection_index) {
+      const size_t projection_tiles = (static_cast<size_t>(projections[projection_index].n) + n_step - 1) / n_step;
+      if (local_tile < projection_tiles) { break; }
+      local_tile -= projection_tiles;
+    }
+
+    if (projection_index < projection_count) {
+      const auto& projection = projections[projection_index];
+      const int n_index = static_cast<int>(local_tile * n_step);
+      const int actual_n = std::min(projection.n - n_index, static_cast<int>(n_step));
+      const size_t dst_stride = static_cast<size_t>(projection.n) * sizeof(float);
+      const void* rhs_ptr = static_cast<const void*>(
+          reinterpret_cast<const char*>(projection.packed_weight_bias) + ukernel.get_rhs_packed_offset(n_index, K, 32));
+      float* dst_ptr = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(projection.dst)
+                                                + ukernel.get_dst_offset(0, n_index, dst_stride));
+
+      ukernel.run_matmul(1, actual_n, K, 32, lhs_ptr, rhs_ptr, dst_ptr, dst_stride, sizeof(float),
+                         -std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
+    }
+  });
+  return true;
+}
+
 std::unordered_map<KaiLinear_f32_qai8dxp_qsi4c32p_mxk_kxn::Tiles, kai_matmul_clamp_f32_qai8dxp_qsi4c32p_ukernel>
     KaiLinear_f32_qai8dxp_qsi4c32p_mxk_kxn::ukernels_ = {
         {KaiLinear_f32_qai8dxp_qsi4c32p_mxk_kxn::Tiles::qai8dxp1x8_qsi4c32p4x8_1x4x32,

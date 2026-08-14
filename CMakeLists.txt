@@ -41,6 +41,14 @@ option(MLLM_BLAS_VENDOR_BLIS "Enable BLIS BLAS for multi-platform" OFF)
 
 # CPU Backend: SME2 and SVE2
 option(MLLM_CPU_BACKEND_USE_SME2 "Enable SME2" OFF)
+option(
+  MLLM_ARM_CPU_BACKEND_USE_OPENMP
+  "Compile ARM CPU backend operators and kernels with OpenMP"
+  ON)
+option(
+  MLLM_ARM_KAI_USE_OPENMP
+  "Compile only the ARM KleidiAI linear-kernel translation unit with OpenMP"
+  ON)
 
 # Ascend Backend: Options
 option(MLLM_ASCEND_CPU_DEBUG_MODE "Enable CPU Debug mode in ascend" OFF)

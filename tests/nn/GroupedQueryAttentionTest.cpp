@@ -121,6 +121,16 @@ TEST_F(GroupedQueryAttentionTest, MatchesRepeatedKVReference) {
   expectNear(actual, expected);
 }
 
+TEST_F(GroupedQueryAttentionTest, DirectEagerMatchesReference) {
+  auto query = sequential({1, 4, 3, 5}, 0.07F);
+  auto key = sequential({1, 2, 3, 5}, 0.11F);
+  auto value = sequential({1, 2, 3, 5}, 0.13F);
+  const auto actual = mllm::nn::llm_components::groupedQueryAttentionDirectEager(query, key, value);
+  const auto expected = gqaReference(query, key, value);
+
+  expectNear(actual, expected, 1e-6F);
+}
+
 TEST_F(GroupedQueryAttentionTest, SupportsOneKVHeadAndRejectsIllegalGeometry) {
   auto query = sequential({1, 4, 1, 4}, 0.09F);
   auto key = sequential({1, 1, 2, 4}, 0.12F);
@@ -178,6 +188,21 @@ TEST_F(GroupedQueryAttentionTest, DecodeStaysFiniteAtMiniCPM5ProductGeometry) {
   expectNear(actual, expected, 2e-5F);
 }
 
+TEST_F(GroupedQueryAttentionTest, DecodeStaysFiniteAtLfm25ProductGeometry) {
+  auto query = sequential({1, 32, 1, 64}, 0.007F);
+  auto key_buffer = sequential({1, 8, 2048, 64}, 0.011F);
+  auto value_buffer = sequential({1, 8, 2048, 64}, 0.013F);
+  auto key = key_buffer[{mllm::kAll, mllm::kAll, {mllm::kAll, 201}, mllm::kAll}];
+  auto value = value_buffer[{mllm::kAll, mllm::kAll, {mllm::kAll, 201}, mllm::kAll}];
+
+  const auto actual = mllm::nn::llm_components::groupedQueryAttention(query, key, value);
+  const auto expected = gqaReference(query, key, value);
+
+  EXPECT_EQ(actual.shape(), (Tensor::shape_t{1, 32, 1, 64}));
+  for (int index = 0; index < actual.numel(); ++index) { EXPECT_TRUE(std::isfinite(actual.ptr<float>()[index])); }
+  expectNear(actual, expected, 2e-5F);
+}
+
 TEST_F(GroupedQueryAttentionTest, DecodeOpTraceAndSerializationRoundTrip) {
   GroupedQueryAttentionDecodeTraceModule module;
   auto ir_ctx = mllm::ir::trace(module, Tensor::empty({1, 4, 1, 5}, mllm::kFloat32, mllm::kCPU),
@@ -196,4 +221,16 @@ TEST_F(GroupedQueryAttentionTest, DecodeOpTraceAndSerializationRoundTrip) {
   EXPECT_EQ(restored->getOpType(), mllm::OpTypes::kGroupedQueryAttentionDecode);
 }
 
+TEST_F(GroupedQueryAttentionTest, SupportsTransposedNonContiguousHeadViews) {
+  auto query_bshd = sequential({1, 3, 4, 5}, 0.07F);
+  auto key_bshd = sequential({1, 3, 2, 5}, 0.11F);
+  auto value_bshd = sequential({1, 3, 2, 5}, 0.13F);
+  auto query = query_bshd.transpose(1, 2);
+  auto key = key_bshd.transpose(1, 2);
+  auto value = value_bshd.transpose(1, 2);
+
+  const auto actual = mllm::nn::llm_components::groupedQueryAttention(query, key, value);
+  const auto expected = gqaReference(query.contiguous(), key.contiguous(), value.contiguous());
+  expectNear(actual, expected);
+}
 }  // namespace

@@ -1,0 +1,1 @@
+Explain how to make mobile language-model inference reliable, covering correctness, state reset, artifact verification, and performance measurement.

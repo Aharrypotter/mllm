@@ -150,9 +150,18 @@ if(MLLM_KERNEL_USE_THREADS AND MLLM_KERNEL_THREADS_VENDOR_OPENMP)
     # ARM CPU kernels contain the OpenMP regions used by the mobile product
     # path. Keep x86 CPU kernels on the existing MllmRT-only configuration so
     # unrelated kernels are not recompiled with OpenMP as part of ARM support.
-    if(MLLM_BUILD_ARM_BACKEND)
+    if(MLLM_BUILD_ARM_BACKEND AND MLLM_ARM_CPU_BACKEND_USE_OPENMP)
       target_link_libraries(MllmCPUBackend PUBLIC ${OpenMP_CXX_FLAGS})
       target_compile_options(MllmCPUBackend PRIVATE ${OpenMP_CXX_FLAGS})
+      target_include_directories(MllmCPUBackend PUBLIC ${OpenMP_CXX_INCLUDE_DIR})
+    elseif(MLLM_BUILD_ARM_BACKEND AND MLLM_ARM_KAI_USE_OPENMP)
+      # The KAI linear helper owns its tile-parallel loops.  Compiling only
+      # this translation unit with OpenMP lets quantized Linear reuse those
+      # loops without adding parallel-region overhead to every CPU operator.
+      set_source_files_properties(
+        ${CMAKE_CURRENT_LIST_DIR}/kernels/arm/linear/kai.cpp
+        PROPERTIES COMPILE_OPTIONS "${OpenMP_CXX_FLAGS}")
+      target_link_libraries(MllmCPUBackend PUBLIC ${OpenMP_CXX_FLAGS})
       target_include_directories(MllmCPUBackend PUBLIC ${OpenMP_CXX_INCLUDE_DIR})
     endif()
   endif()
