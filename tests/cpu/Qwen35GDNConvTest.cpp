@@ -169,26 +169,31 @@ TEST(Qwen35GDNConvTest, HistoryFirstK3MatchesScalarReferenceBitwiseForLfmWidths)
   for (int batch : {1, 2}) {
     for (int sequence : {1, 2, 28, 225}) {
       for (int channels : {1, 3, 4, 5, 2045, 2048}) {
-        const auto element_count = static_cast<std::size_t>(batch) * sequence * channels;
-        const auto state_count = static_cast<std::size_t>(batch) * channels * (kKernel - 1);
-        const std::vector<float> input = makeBuffer(element_count, channels + sequence);
-        const std::vector<float> weight = makeBuffer(static_cast<std::size_t>(channels) * kKernel, kKernel);
-        const std::vector<float> initial_state = makeBuffer(state_count, 19);
+        for (bool non_zero_history : {false, true}) {
+          const auto element_count = static_cast<std::size_t>(batch) * sequence * channels;
+          const auto state_count = static_cast<std::size_t>(batch) * channels * (kKernel - 1);
+          const std::vector<float> input = makeBuffer(element_count, channels + sequence);
+          const std::vector<float> weight = makeBuffer(static_cast<std::size_t>(channels) * kKernel, kKernel);
+          const std::vector<float> initial_state =
+              non_zero_history ? makeBuffer(state_count, 19) : std::vector<float>(state_count, 0.0F);
 
-        auto kernel_state = initial_state;
-        std::vector<float> kernel_output(element_count, 0.0F);
-        depthwiseCausalConvHistoryFirstF32(input.data(), weight.data(), kernel_state.data(), kernel_output.data(), batch,
-                                           sequence, channels, kKernel);
+          auto kernel_state = initial_state;
+          std::vector<float> kernel_output(element_count, 0.0F);
+          depthwiseCausalConvHistoryFirstF32(input.data(), weight.data(), kernel_state.data(), kernel_output.data(), batch,
+                                             sequence, channels, kKernel);
 
-        auto reference_state = initial_state;
-        std::vector<float> reference_output(element_count, 0.0F);
-        referenceDepthwiseCausalConvHistoryFirst(input, weight, reference_state, reference_output, batch, sequence,
-                                                  channels, kKernel);
+          auto reference_state = initial_state;
+          std::vector<float> reference_output(element_count, 0.0F);
+          referenceDepthwiseCausalConvHistoryFirst(input, weight, reference_state, reference_output, batch, sequence, channels,
+                                                   kKernel);
 
-        ASSERT_EQ(kernel_output, reference_output)
-            << "history-first output mismatch for B=" << batch << " S=" << sequence << " C=" << channels;
-        ASSERT_EQ(kernel_state, reference_state)
-            << "history-first state mismatch for B=" << batch << " S=" << sequence << " C=" << channels;
+          ASSERT_EQ(kernel_output, reference_output)
+              << "history-first output mismatch for B=" << batch << " S=" << sequence << " C=" << channels
+              << " history=" << (non_zero_history ? "non-zero" : "zero");
+          ASSERT_EQ(kernel_state, reference_state)
+              << "history-first state mismatch for B=" << batch << " S=" << sequence << " C=" << channels
+              << " history=" << (non_zero_history ? "non-zero" : "zero");
+        }
       }
     }
   }

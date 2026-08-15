@@ -56,4 +56,9 @@ TEST(Lfm2ConfigTest, KaiW4A32ThreadCapsSeparateDecodeAndPrefill) {
   EXPECT_EQ(kaiW4A32ThreadCount(1, 2, 4, 6), 2);
   EXPECT_EQ(kaiW4A32ThreadCount(28, 4, 4, 6), 4);
   EXPECT_EQ(kaiW4A32ThreadCount(1, 8, 0, 0), 8);
+  EXPECT_EQ(kaiW4A32ThreadCount(28, 8, 0, 0), 8);
+  EXPECT_EQ(kaiW4A32ThreadCount(1, 8, 4, 0), 4);
+  EXPECT_EQ(kaiW4A32ThreadCount(28, 8, 0, 6), 6);
+  EXPECT_EQ(kaiW4A32ThreadCount(1, 8, 12, 12), 8);
+  EXPECT_EQ(kaiW4A32ThreadCount(28, 8, 12, 12), 8);
 }
