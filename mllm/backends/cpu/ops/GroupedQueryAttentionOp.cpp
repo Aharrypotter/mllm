@@ -127,6 +127,10 @@ void groupedQueryAttentionDecodeFloat32Reference(const Tensor& query, const Tens
   const auto q_stride = query.stride();
   const auto k_stride = key.stride();
   const auto v_stride = value.stride();
+  // The decode kernel declines any tensor whose last-dimension stride is not 1,
+  // so this fallback is reached precisely when that may hold. Honour the output
+  // stride rather than assuming a contiguous value dimension.
+  const auto o_stride = output.stride();
   const int32_t groups = q_shape[1] / k_shape[1];
   const float scale = 1.0F / std::sqrt(static_cast<float>(q_shape[3]));
 
@@ -171,7 +175,7 @@ void groupedQueryAttentionDecodeFloat32Reference(const Tensor& query, const Tens
           const auto* value_token = v_head + static_cast<size_t>(key_index) * v_stride[2];
           result += probabilities[static_cast<size_t>(key_index)] * value_token[static_cast<size_t>(value_dim) * v_stride[3]];
         }
-        output_head[value_dim] = result;
+        output_head[static_cast<size_t>(value_dim) * o_stride[3]] = result;
       }
     }
   }
