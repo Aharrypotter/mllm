@@ -16,16 +16,36 @@ namespace mllm::aops {
 ParallelLinearOp::ParallelLinearOp(const ParallelLinearOpOptions& options)
     : BaseOp(OpTypes::kParallelLinear), options_(options) {}
 
+// Parameters keep the original per-projection checkpoint names, so the fused
+// operation resolves them in its own parent scope rather than under its own
+// layer name. Two fused operations registered in one parent must therefore not
+// declare the same projection names, or they would resolve to the same
+// tensors; validateProjectionNames rejects the locally detectable violations.
 std::string ParallelLinearOp::projectionParameterName(size_t index, const char* suffix) const {
   const auto separator = getName().rfind('.');
   const std::string parent = separator == std::string::npos ? std::string{} : getName().substr(0, separator + 1);
   return parent + options_.projection_names.at(index) + suffix;
 }
 
-void ParallelLinearOp::load(const ParameterFile::ptr_t& ploader) {
+void ParallelLinearOp::validateProjectionNames() const {
   if (options_.projection_names.size() != options_.out_channels.size() || options_.projection_names.size() < 2) {
     throw std::invalid_argument("ParallelLinear requires matching projection names and at least two outputs");
   }
+  for (size_t index = 0; index < options_.projection_names.size(); ++index) {
+    const auto& name = options_.projection_names[index];
+    if (name.empty() || name.find('.') != std::string::npos) {
+      throw std::invalid_argument("ParallelLinear projection names must be non-empty and scope-local: " + name);
+    }
+    for (size_t other = 0; other < index; ++other) {
+      if (options_.projection_names[other] == name) {
+        throw std::invalid_argument("ParallelLinear projection names must be unique: " + name);
+      }
+    }
+  }
+}
+
+void ParallelLinearOp::load(const ParameterFile::ptr_t& ploader) {
+  validateProjectionNames();
   weights_.clear();
   biases_.clear();
   weights_.reserve(options_.projection_names.size());
@@ -76,10 +96,8 @@ void ParallelLinearOp::reshape(const std::vector<Tensor>& inputs, std::vector<Te
   if (inputs.size() != 1 || inputs[0].rank() < 2 || inputs[0].size(-1) != options_.in_channels) {
     throw std::invalid_argument("ParallelLinear expects one [..., M, K] input with the configured K");
   }
-  if (options_.in_channels <= 0 || options_.out_channels.size() < 2
-      || options_.projection_names.size() != options_.out_channels.size()) {
-    throw std::invalid_argument("ParallelLinear options are incomplete");
-  }
+  if (options_.in_channels <= 0) { throw std::invalid_argument("ParallelLinear options are incomplete"); }
+  validateProjectionNames();
   for (const int32_t channels : options_.out_channels) {
     if (channels <= 0) { throw std::invalid_argument("ParallelLinear output channels must be positive"); }
     auto shape = inputs[0].shape();

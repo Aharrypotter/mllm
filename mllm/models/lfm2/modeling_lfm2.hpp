@@ -10,6 +10,7 @@
 
 #include "mllm/core/Tensor.hpp"
 #include "mllm/models/ARGeneration.hpp"
+#include "mllm/models/common/rope_tables.hpp"
 #include "mllm/models/lfm2/configuration_lfm2.hpp"
 #include "mllm/nn/Functional.hpp"
 #include "mllm/nn/Module.hpp"
@@ -17,6 +18,11 @@
 #include "mllm/nn/lmcache/KVHeadStaticCache.hpp"
 
 namespace mllm::models::lfm2 {
+
+// Rotation itself remains the registered nn::RoPE operation; only the
+// immutable analytical tables are materialized here.
+using common::makeRoPEInvFreq;
+using common::makeRotaryPosEmbedding;
 
 inline auto makeLfm2LinearOptions(int32_t in_channels, int32_t out_channels, bool bias, aops::LinearImplTypes impl_type)
     -> aops::LinearOpOptions {
@@ -40,41 +46,6 @@ inline auto makeLfm2ParallelLinearOptions(int32_t in_channels, std::vector<int32
           .impl_type = impl_type,
           .kai_w4a32_decode_thread_cap = 4,
           .kai_w4a32_prefill_thread_cap = 6};
-}
-
-// Model-level orchestration: materialize the immutable analytical RoPE table.
-// Rotation itself remains the registered nn::RoPE operation.
-inline auto makeRoPEInvFreq(int32_t head_dim, float rope_theta) -> Tensor {
-  auto inv_freq = Tensor::empty({head_dim / 2}, kFloat32, kCPU).alloc();
-  auto* data = inv_freq.ptr<float>();
-  for (int32_t index = 0; index < head_dim / 2; ++index) {
-    data[index] = 1.0F / std::pow(rope_theta, 2.0F * static_cast<float>(index) / static_cast<float>(head_dim));
-  }
-  return inv_freq;
-}
-
-inline auto makeRotaryPosEmbedding(const Tensor& position_ids, const Tensor& inv_freq) -> std::pair<Tensor, Tensor> {
-  const auto batch = position_ids.shape()[0];
-  const auto sequence = position_ids.shape()[1];
-  const auto half_dim = inv_freq.shape()[0];
-  const auto head_dim = half_dim * 2;
-  auto sin = Tensor::empty({batch, sequence, head_dim}, kFloat32, kCPU).alloc();
-  auto cos = Tensor::empty({batch, sequence, head_dim}, kFloat32, kCPU).alloc();
-  const auto* positions = position_ids.ptr<int64_t>();
-  const auto* frequencies = inv_freq.ptr<float>();
-  auto* sin_data = sin.ptr<float>();
-  auto* cos_data = cos.ptr<float>();
-  for (int32_t b = 0; b < batch; ++b) {
-    for (int32_t s = 0; s < sequence; ++s) {
-      for (int32_t d = 0; d < half_dim; ++d) {
-        const auto angle = static_cast<float>(positions[b * sequence + s]) * frequencies[d];
-        const auto offset = (b * sequence + s) * head_dim;
-        sin_data[offset + d] = sin_data[offset + d + half_dim] = std::sin(angle);
-        cos_data[offset + d] = cos_data[offset + d + half_dim] = std::cos(angle);
-      }
-    }
-  }
-  return {sin, cos};
 }
 
 class Lfm2MLP final : public nn::Module {

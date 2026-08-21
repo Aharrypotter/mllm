@@ -39,6 +39,8 @@ class ParallelLinearOp : public BaseOp {
  protected:
   [[nodiscard]] std::string projectionParameterName(size_t index, const char* suffix) const;
 
+  void validateProjectionNames() const;
+
   std::vector<Tensor> weights_;
   std::vector<Tensor> biases_;
   ParallelLinearOpOptions options_;

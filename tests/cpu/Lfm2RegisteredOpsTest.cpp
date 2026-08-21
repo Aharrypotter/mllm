@@ -5,10 +5,14 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <memory>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "mllm/compile/ir/Trace.hpp"
+#include "mllm/core/aops/ParallelLinearOp.hpp"
 #include "mllm/compile/ir/linalg/Op.hpp"
 #include "mllm/compile/jit/binary/LinalgIRSerialization.hpp"
 #include "mllm/compile/jit/interpreter/AopsFromJson.hpp"
@@ -130,6 +134,27 @@ TEST_F(Lfm2RegisteredOpsTest, ParallelLinearTracesAndSerializesProjectionContrac
       nlohmann::json{{"op_type", "ParallelLinear"}, {"backend", "CPU"}, {"op_options", options}});
   ASSERT_NE(restored, nullptr);
   EXPECT_EQ(restored->getOpType(), mllm::OpTypes::kParallelLinear);
+}
+
+// Fused parameters resolve in the parent scope, so ambiguous or scope-escaping
+// projection names would silently bind the wrong checkpoint tensors.
+TEST_F(Lfm2RegisteredOpsTest, ParallelLinearRejectsAmbiguousProjectionNames) {
+  auto reshapeWith = [](std::vector<std::string> projection_names) {
+    auto op = std::make_shared<mllm::aops::ParallelLinearOp>(
+        mllm::aops::ParallelLinearOpOptions{.in_channels = 2,
+                                            .out_channels = {2, 1},
+                                            .projection_names = std::move(projection_names),
+                                            .bias = false,
+                                            .impl_type = mllm::aops::LinearImplTypes::kGGUF});
+    std::vector<Tensor> inputs = {Tensor::empty({1, 1, 2}, mllm::kFloat32, mllm::kCPU)};
+    std::vector<Tensor> outputs;
+    op->reshape(inputs, outputs);
+  };
+
+  EXPECT_THROW(reshapeWith({"same", "same"}), std::invalid_argument);
+  EXPECT_THROW(reshapeWith({"left", "nested.right"}), std::invalid_argument);
+  EXPECT_THROW(reshapeWith({"left", ""}), std::invalid_argument);
+  EXPECT_NO_THROW(reshapeWith({"left", "right"}));
 }
 
 }  // namespace
