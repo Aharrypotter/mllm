@@ -4,11 +4,13 @@
 #include "mllm/backends/cpu/ops/CausalDepthwiseConv1DOp.hpp"
 
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
+#include "mllm/backends/cpu/kernels/common/causal_conv/depthwise_causal_conv.hpp"
 #include "mllm/backends/cpu/kernels/common/gdn/gated_delta_net.hpp"
 
 namespace mllm::cpu {
@@ -31,24 +33,30 @@ void CPUCausalDepthwiseConv1DOp::forward(const std::vector<Tensor>& inputs, std:
   auto& updated_state = outputs[1];
   if (!options_.state_inplace) { std::memcpy(updated_state.ptr<float>(), state.ptr<float>(), state.bytes()); }
 
-  if (options_.accumulation_order == aops::CausalDepthwiseConv1DAccumulationOrder::kHistoryFirst) {
-    gdn::depthwiseCausalConvHistoryFirstF32(input.ptr<float>(), weight_.ptr<float>(), updated_state.ptr<float>(),
-                                            output.ptr<float>(), input.shape()[0], input.shape()[1], input.shape()[2],
-                                            options_.kernel_size);
-    static const bool trace_activation = [] {
-      const char* value = std::getenv("MLLM_LFM2_SHORT_CONV_TRACE");
-      return value != nullptr && value[0] == '1' && value[1] == '\0';
-    }();
-    if (trace_activation) {
-      static std::atomic<bool> activated{false};
-      if (!activated.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr, "MLLM_LFM2_SHORT_CONV_REUSE_ACTIVATED k=%d channels=%d\n", options_.kernel_size,
-                     options_.channels);
-      }
-    }
+  const bool history_first = options_.accumulation_order == aops::CausalDepthwiseConv1DAccumulationOrder::kHistoryFirst;
+  if (history_first) {
+    causal_conv::depthwiseCausalConvHistoryFirstF32(input.ptr<float>(), weight_.ptr<float>(), updated_state.ptr<float>(),
+                                                    output.ptr<float>(), input.shape()[0], input.shape()[1],
+                                                    input.shape()[2], options_.kernel_size);
   } else {
     gdn::depthwiseCausalConvF32(input.ptr<float>(), weight_.ptr<float>(), updated_state.ptr<float>(), output.ptr<float>(),
                                 input.shape()[0], input.shape()[1], input.shape()[2], options_.kernel_size);
+  }
+
+  static const bool trace_activation = [] {
+    const char* value = std::getenv("MLLM_CAUSAL_CONV1D_TRACE");
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+  }();
+  if (trace_activation) {
+    // One marker per accumulation order, so a device receipt shows which
+    // kernel the operation actually reached.
+    static std::atomic<uint32_t> activated_orders{0};
+    const uint32_t order_bit = 1U << static_cast<uint32_t>(history_first);
+    if ((activated_orders.fetch_or(order_bit, std::memory_order_relaxed) & order_bit) == 0) {
+      std::fprintf(stderr, "MLLM_CAUSAL_CONV1D_ACTIVATED order=%s k=%d channels=%d\n",
+                   aops::causalDepthwiseConv1DAccumulationOrder2Str(options_.accumulation_order), options_.kernel_size,
+                   options_.channels);
+    }
   }
 
   if (options_.bias) {

@@ -10,6 +10,10 @@ add_executable(Mllm-Test-Qwen35-GDN-Conv Qwen35GDNConvTest.cpp)
 target_link_libraries(Mllm-Test-Qwen35-GDN-Conv PRIVATE gtest_main MllmCPUBackend)
 target_include_directories(Mllm-Test-Qwen35-GDN-Conv PRIVATE ${MLLM_INCLUDE_DIR})
 
+add_executable(Mllm-Test-CausalDepthwiseConvKernel CausalDepthwiseConvKernelTest.cpp)
+target_link_libraries(Mllm-Test-CausalDepthwiseConvKernel PRIVATE gtest_main MllmCPUBackend)
+target_include_directories(Mllm-Test-CausalDepthwiseConvKernel PRIVATE ${MLLM_INCLUDE_DIR})
+
 add_executable(Mllm-Test-KaiW4A32Pack KaiW4A32PackTest.cpp)
 target_link_libraries(Mllm-Test-KaiW4A32Pack PRIVATE gtest_main MllmCPUBackend)
 target_include_directories(Mllm-Test-KaiW4A32Pack PRIVATE ${MLLM_INCLUDE_DIR})

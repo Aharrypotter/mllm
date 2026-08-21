@@ -76,9 +76,9 @@ void groupedQueryAttentionDirectStrided(const Tensor& query, const Tensor& key, 
       for (int32_t key_index = 0; key_index < visible_keys; ++key_index) {
         float dot = 0.0F;
         const Scalar* key_row = key_row_data[key_row_base + key_index];
-        // Keep the legacy contiguous dot expression: changing it to a
-        // runtime-stride induction loop changes contraction/codegen and can
-        // diverge LFM2.5's frozen generation-token oracle.
+        // Keep the contiguous dot expression separate: folding it into the
+        // runtime-stride induction loop changes contraction/codegen, which
+        // breaks callers bound to an exact generation-token oracle.
         if (q_stride[3] == 1 && k_stride[3] == 1) {
           for (int32_t dim = 0; dim < q_shape[3]; ++dim) {
             dot += static_cast<float>(query_row[dim]) * static_cast<float>(key_row[dim]);

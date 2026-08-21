@@ -10,12 +10,6 @@ namespace mllm::cpu::gdn {
 void depthwiseCausalConvF32(const float* input, const float* weight, float* state, float* output, int batch_size,
                             int sequence_length, int channels, int kernel_size);
 
-// Same [B, S, C] / [B, C, K - 1] state contract, with the accumulation order
-// used by CPUConv1D: zero, historical taps in ascending order, then current.
-// Keeping this explicit lets callers retain bitwise-sensitive model semantics.
-void depthwiseCausalConvHistoryFirstF32(const float* input, const float* weight, float* state, float* output,
-                                        int batch_size, int sequence_length, int channels, int kernel_size);
-
 // Gated-delta recurrence. Each [batch, value_head] state is independent and
 // may run in parallel, while tokens within one state remain strictly ordered.
 //
