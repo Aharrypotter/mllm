@@ -59,7 +59,7 @@ float deterministicValue(uint32_t& state) {
 
 int parsePositiveInt(const char* value, const char* name) {
   char* end = nullptr;
-  const long parsed = std::strtol(value, &end, 10);
+  const int64_t parsed = std::strtoll(value, &end, 10);
   if (end == value || *end != '\0' || parsed <= 0 || parsed > std::numeric_limits<int>::max()) {
     throw std::invalid_argument(std::string(name) + " must be a positive integer");
   }
