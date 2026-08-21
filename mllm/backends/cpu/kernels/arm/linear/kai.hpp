@@ -124,6 +124,10 @@ struct KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk {
   void matmul(float* __restrict__ dst, const float* __restrict__ lhs_fp32, const uint8_t* packed_weight_bias, void* workspace,
               int M, int K, int N, KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles tile_cfg, int thread_count);
 
+  bool matmul_shared_input(const float* __restrict__ lhs_fp32, const SharedInputProjection* projections,
+                           size_t projection_count, void* workspace, int M, int K,
+                           KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles tile_cfg, int thread_count);
+
   bool matmul_shared_input_m1(const float* __restrict__ lhs_fp32, const SharedInputProjection* projections,
                               size_t projection_count, void* workspace, int K,
                               KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles tile_cfg, int thread_count);

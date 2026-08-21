@@ -43,8 +43,7 @@ bool cpuSupportsI8mm() {
 }
 
 KaiW4A32Tile selectKaiW4A32PrefillTile(int m) {
-  static const bool disabled = environmentFlagEnabled("MLLM_KAI_PREFILL_I8MM_DISABLE");
-  if (detail::shouldUseKaiW4A32I8mmPrefill(m, disabled, cpuSupportsI8mm())) { return kKaiW4A32I8mmTile; }
+  if (detail::shouldUseKaiW4A32I8mmPrefill(m)) { return kKaiW4A32I8mmTile; }
   return kKaiW4A32DotProdTile;
 }
 
@@ -69,6 +68,16 @@ void traceKaiW4A32PrefillTile(KaiW4A32Tile tile, int m, int k, int n, int thread
 #endif
 
 }  // namespace
+
+bool detail::shouldUseKaiW4A32I8mmPrefill(int m) {
+#if defined(MLLM_HOST_ARCH_ARM64) || defined(MLLM_HOST_ARCH_ARM)
+  static const bool disabled = environmentFlagEnabled("MLLM_KAI_PREFILL_I8MM_DISABLE");
+  return shouldUseKaiW4A32I8mmPrefill(m, disabled, cpuSupportsI8mm());
+#else
+  (void)m;
+  return false;
+#endif
+}
 
 CPULinearOp::CPULinearOp(const aops::LinearOpOptions& options) : LinearOp(options) {}
 

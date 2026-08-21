@@ -19,11 +19,11 @@ class CPUParallelLinearOp final : public aops::ParallelLinearOp {
   void forward(const std::vector<Tensor>& inputs, std::vector<Tensor>& outputs) override;
 
  private:
-  bool tryForwardSharedInputKaiM1(const Tensor& input, std::vector<Tensor>& outputs);
+  bool tryForwardSharedInputKai(const Tensor& input, std::vector<Tensor>& outputs);
   Tensor acquireKaiWorkspace(int32_t workspace_size);
 
   std::vector<std::unique_ptr<CPULinearOp>> fallback_ops_;
-  Tensor kai_decode_workspace_;
+  Tensor kai_workspace_;
 };
 
 class CPUParallelLinearOpFactory : public TypedOpFactory<OpTypes::kParallelLinear, aops::ParallelLinearOpOptions> {

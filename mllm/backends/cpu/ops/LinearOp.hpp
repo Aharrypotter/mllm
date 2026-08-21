@@ -13,6 +13,8 @@ constexpr bool shouldUseKaiW4A32I8mmPrefill(int m, bool disabled, bool cpu_suppo
   return m >= 4 && !disabled && cpu_supports_i8mm;
 }
 
+bool shouldUseKaiW4A32I8mmPrefill(int m);
+
 constexpr int kaiW4A32ThreadCount(int m, int requested_threads, int decode_thread_cap, int prefill_thread_cap) {
   // Every dynamic-input W4A32 KAI tile interprets the optional caps through
   // this helper; zero keeps the repository-wide requested thread count.
