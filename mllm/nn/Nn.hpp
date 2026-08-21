@@ -15,7 +15,6 @@
 #include "mllm/nn/layers/GELU.hpp"            // IWYU pragma: export
 #include "mllm/nn/layers/CausalDepthwiseConv1D.hpp"  // IWYU pragma: export
 #include "mllm/nn/layers/GroupedQueryAttention.hpp"  // IWYU pragma: export
-#include "mllm/nn/layers/GroupedQueryAttentionDecode.hpp"  // IWYU pragma: export
 #include "mllm/nn/layers/QuickGELU.hpp"       // IWYU pragma: export
 #include "mllm/nn/layers/ReLU.hpp"            // IWYU pragma: export
 #include "mllm/nn/layers/LayerNorm.hpp"       // IWYU pragma: export

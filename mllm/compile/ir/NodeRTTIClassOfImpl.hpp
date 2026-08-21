@@ -1,4 +1,4 @@
-// Auto generated: 2026-08-14 18:50:28
+// Auto generated: 2026-08-21 15:20:12
 // do not modify this file
 #pragma once
 namespace mllm::ir {
@@ -92,10 +92,6 @@ struct NodeRTTIClassOfImpl {
 
 #define RTTI_RK_OP_LINALGIROP_FLASHATTENTION2OP_IMPL(v) \
   return (v)->getKind() >= RK_Op_LinalgIROp_FlashAttention2Op && (v)->getKind() <= RK_Op_LinalgIROp_FlashAttention2Op
-
-#define RTTI_RK_OP_LINALGIROP_GROUPEDQUERYATTENTIONDECODEOP_IMPL(v)       \
-  return (v)->getKind() >= RK_Op_LinalgIROp_GroupedQueryAttentionDecodeOp \
-         && (v)->getKind() <= RK_Op_LinalgIROp_GroupedQueryAttentionDecodeOp
 
 #define RTTI_RK_OP_LINALGIROP_CAUSALDEPTHWISECONV1DOP_IMPL(v)       \
   return (v)->getKind() >= RK_Op_LinalgIROp_CausalDepthwiseConv1DOp \

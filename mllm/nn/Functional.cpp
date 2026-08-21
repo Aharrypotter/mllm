@@ -6,7 +6,6 @@
 #include "mllm/core/aops/ElewiseOps.hpp"
 #include "mllm/core/aops/FlashAttention2Op.hpp"
 #include "mllm/core/aops/GatherOp.hpp"
-#include "mllm/core/aops/GroupedQueryAttentionDecodeOp.hpp"
 #include "mllm/core/aops/GroupedQueryAttentionOp.hpp"
 #include "mllm/core/aops/MatMulOp.hpp"
 #include "mllm/core/aops/LinearOp.hpp"
@@ -90,8 +89,7 @@ Tensor flashAttention2(const Tensor& Q, const Tensor& K, const Tensor& V) {
 }
 
 Tensor groupedQueryAttentionDecode(const Tensor& query, const Tensor& key, const Tensor& value) {
-  return Context::instance().buildOpAndSubmitTask(OpTypes::kGroupedQueryAttentionDecode,
-                                                  aops::GroupedQueryAttentionDecodeOpOptions{}, {query, key, value})[0];
+  return groupedQueryAttention(query, key, value, aops::GroupedQueryAttentionImplementation::kDecodeNativeKV);
 }
 
 Tensor groupedQueryAttention(const Tensor& query, const Tensor& key, const Tensor& value,

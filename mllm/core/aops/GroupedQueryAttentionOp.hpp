@@ -11,19 +11,30 @@
 
 namespace mllm::aops {
 
+// Grouped-query attention variants over native KV-head history. They differ in
+// reduction order and in the shapes they accept, so the variant is part of the
+// operation contract: callers bound to an exact generation-token oracle cannot
+// be migrated between them silently.
 enum class GroupedQueryAttentionImplementation : int32_t {
+  // Any query length. Masks per query position and accumulates in the order
+  // established by the eager reference.
   kDirectStrided = 0,
+  // Single query position only. Uses the dedicated decode kernel, which is
+  // faster but reduces in a different order.
+  kDecodeNativeKV = 1,
 };
 
 inline const char* groupedQueryAttentionImplementation2Str(GroupedQueryAttentionImplementation implementation) {
   switch (implementation) {
     case GroupedQueryAttentionImplementation::kDirectStrided: return "DirectStrided";
+    case GroupedQueryAttentionImplementation::kDecodeNativeKV: return "DecodeNativeKV";
   }
   return "Unknown";
 }
 
 inline GroupedQueryAttentionImplementation str2GroupedQueryAttentionImplementation(const std::string& value) {
   if (value == "DirectStrided") return GroupedQueryAttentionImplementation::kDirectStrided;
+  if (value == "DecodeNativeKV") return GroupedQueryAttentionImplementation::kDecodeNativeKV;
   throw std::invalid_argument("Unknown GroupedQueryAttention implementation: " + value);
 }
 

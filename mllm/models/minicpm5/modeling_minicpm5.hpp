@@ -63,7 +63,9 @@ class MiniCPM5Attention final : public nn::Module {
     o_proj_ = reg<nn::Linear>("o_proj", query_heads_ * head_dim_, hidden_size_, config.attention_bias, config.linear_impl_type);
     q_rope_ = reg<nn::RoPE>("q_rope", config.rope_theta, config.max_position_embeddings, config.head_dim);
     k_rope_ = reg<nn::RoPE>("k_rope", config.rope_theta, config.max_position_embeddings, config.head_dim);
-    gqa_decode_ = reg<nn::GroupedQueryAttentionDecode>("gqa_decode");
+    gqa_decode_ = reg<nn::GroupedQueryAttention>(
+        "gqa_decode",
+        aops::GroupedQueryAttentionOpOptions{.implementation = aops::GroupedQueryAttentionImplementation::kDecodeNativeKV});
   }
 
   std::vector<Tensor> forward(const std::vector<Tensor>& inputs, const std::vector<AnyValue>& args) override {
@@ -95,7 +97,7 @@ class MiniCPM5Attention final : public nn::Module {
   nn::Linear o_proj_;
   nn::RoPE q_rope_;
   nn::RoPE k_rope_;
-  nn::GroupedQueryAttentionDecode gqa_decode_;
+  nn::GroupedQueryAttention gqa_decode_;
   int32_t hidden_size_ = 0;
   int32_t head_dim_ = 0;
   int32_t query_heads_ = 0;

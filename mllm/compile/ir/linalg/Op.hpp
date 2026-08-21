@@ -35,7 +35,6 @@ class X2XOp;
 class ViewOp;
 class SplitOp;
 class FlashAttention2Op;
-class GroupedQueryAttentionDecodeOp;
 class CausalDepthwiseConv1DOp;
 class GroupedQueryAttentionOp;
 class ParallelLinearOp;
@@ -201,7 +200,6 @@ LINALG_AOPS_DEFINE(ViewOp, VIEWOP);
 LINALG_AOPS_DEFINE(SplitOp, SPLITOP);
 
 LINALG_AOPS_DEFINE(FlashAttention2Op, FLASHATTENTION2OP);
-LINALG_AOPS_DEFINE(GroupedQueryAttentionDecodeOp, GROUPEDQUERYATTENTIONDECODEOP);
 LINALG_AOPS_DEFINE(CausalDepthwiseConv1DOp, CAUSALDEPTHWISECONV1DOP);
 LINALG_AOPS_DEFINE(GroupedQueryAttentionOp, GROUPEDQUERYATTENTIONOP);
 LINALG_AOPS_DEFINE(ParallelLinearOp, PARALLELLINEAROP);

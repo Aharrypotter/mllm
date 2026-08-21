@@ -48,6 +48,14 @@ void GroupedQueryAttentionOp::reshape(const std::vector<Tensor>& inputs, std::ve
   if (query.device() != key.device() || query.device() != value.device()) {
     throw std::invalid_argument("GroupedQueryAttention inputs must be on the same device");
   }
+  if (options_.implementation == GroupedQueryAttentionImplementation::kDecodeNativeKV) {
+    if (q_shape[2] != 1) {
+      throw std::invalid_argument("GroupedQueryAttention DecodeNativeKV accepts a single query position only");
+    }
+    if (query.dtype() != kFloat32) {
+      throw std::invalid_argument("GroupedQueryAttention DecodeNativeKV supports float32 only");
+    }
+  }
   outputs.emplace_back(Tensor::empty({q_shape[0], q_shape[1], q_shape[2], v_shape[3]}, value.dtype(), value.device()));
 }
 

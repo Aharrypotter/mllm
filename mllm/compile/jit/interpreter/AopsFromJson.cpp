@@ -22,7 +22,6 @@
 #include "mllm/core/aops/SplitOp.hpp"
 #include "mllm/core/aops/STFTOp.hpp"
 #include "mllm/core/aops/FlashAttention2Op.hpp"
-#include "mllm/core/aops/GroupedQueryAttentionDecodeOp.hpp"
 #include "mllm/core/aops/CausalDepthwiseConv1DOp.hpp"
 #include "mllm/core/aops/GroupedQueryAttentionOp.hpp"
 #include "mllm/core/aops/ParallelLinearOp.hpp"
@@ -613,13 +612,17 @@ BaseOp::ptr_t __flashAttention2FromJson(const nlohmann::json& json) {
   return op;
 }
 
+// Compatibility entry for graphs serialized while decode-only grouped-query
+// attention was a separate operation. It now reconstructs as the
+// DecodeNativeKV implementation, which reaches the same kernel.
 BaseOp::ptr_t __groupedQueryAttentionDecodeFromJson(const nlohmann::json& json) {
-  aops::GroupedQueryAttentionDecodeOpOptions options;
+  aops::GroupedQueryAttentionOpOptions options;
+  options.implementation = aops::GroupedQueryAttentionImplementation::kDecodeNativeKV;
 
   DeviceTypes backend = DeviceTypes::kCPU;
   if (json.contains("backend")) { backend = str2DeviceType(json["backend"]); }
 
-  return Context::instance().getBackend(backend)->createOp(OpTypes::kGroupedQueryAttentionDecode, options);
+  return Context::instance().getBackend(backend)->createOp(OpTypes::kGroupedQueryAttention, options);
 }
 
 BaseOp::ptr_t __causalDepthwiseConv1DFromJson(const nlohmann::json& json) {

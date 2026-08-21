@@ -46,18 +46,6 @@ class GroupedQueryAttentionTraceModule final : public mllm::nn::Module {
   }
 };
 
-mllm::ir::linalg::GroupedQueryAttentionDecodeOp::ptr_t findGroupedQueryAttentionDecodeOp(const mllm::ir::node_ptr_t& node) {
-  if (node->isa_<mllm::ir::linalg::GroupedQueryAttentionDecodeOp>()) {
-    return node->cast_<mllm::ir::linalg::GroupedQueryAttentionDecodeOp>();
-  }
-  if (!node->isa_<mllm::ir::Op>()) { return nullptr; }
-  for (const auto& region : node->cast_<mllm::ir::Op>()->regions()) {
-    for (const auto& op : region->ops()) {
-      if (auto found = findGroupedQueryAttentionDecodeOp(op)) { return found; }
-    }
-  }
-  return nullptr;
-}
 
 mllm::ir::linalg::GroupedQueryAttentionOp::ptr_t findGroupedQueryAttentionOp(const mllm::ir::node_ptr_t& node) {
   if (node->isa_<mllm::ir::linalg::GroupedQueryAttentionOp>()) {
@@ -337,17 +325,27 @@ TEST_F(GroupedQueryAttentionTest, DecodeOpTraceAndSerializationRoundTrip) {
   auto ir_ctx = mllm::ir::trace(module, Tensor::empty({1, 4, 1, 5}, mllm::kFloat32, mllm::kCPU),
                                 Tensor::empty({1, 2, 4, 5}, mllm::kFloat32, mllm::kCPU),
                                 Tensor::empty({1, 2, 4, 3}, mllm::kFloat32, mllm::kCPU));
-  auto ir_op = findGroupedQueryAttentionDecodeOp(ir_ctx->topLevelOp());
+  auto ir_op = findGroupedQueryAttentionOp(ir_ctx->topLevelOp());
   ASSERT_NE(ir_op, nullptr);
   ASSERT_NE(ir_op->getAOp(), nullptr);
-  EXPECT_EQ(ir_op->getAOp()->getOpType(), mllm::OpTypes::kGroupedQueryAttentionDecode);
+  EXPECT_EQ(ir_op->getAOp()->getOpType(), mllm::OpTypes::kGroupedQueryAttention);
 
   const auto options = mllm::jit::binary::dumpLinalgIROptions(ir_op);
-  EXPECT_TRUE(options.empty());
-  const nlohmann::json encoded = {{"op_type", "GroupedQueryAttentionDecode"}, {"backend", "CPU"}, {"op_options", options}};
+  EXPECT_EQ(options.at("implementation"), "DecodeNativeKV");
+  const nlohmann::json encoded = {{"op_type", "GroupedQueryAttention"}, {"backend", "CPU"}, {"op_options", options}};
   const auto restored = mllm::jit::interpreter::aopsFromJson(encoded);
   ASSERT_NE(restored, nullptr);
-  EXPECT_EQ(restored->getOpType(), mllm::OpTypes::kGroupedQueryAttentionDecode);
+  EXPECT_EQ(restored->getOpType(), mllm::OpTypes::kGroupedQueryAttention);
+}
+
+// Graphs serialized before the decode-only operation was folded into
+// GroupedQueryAttention must still reconstruct.
+TEST_F(GroupedQueryAttentionTest, LegacyDecodeOpTypeStringStillReconstructs) {
+  const nlohmann::json encoded = {
+      {"op_type", "GroupedQueryAttentionDecode"}, {"backend", "CPU"}, {"op_options", nlohmann::json::object()}};
+  const auto restored = mllm::jit::interpreter::aopsFromJson(encoded);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_EQ(restored->getOpType(), mllm::OpTypes::kGroupedQueryAttention);
 }
 
 TEST_F(GroupedQueryAttentionTest, SupportsTransposedNonContiguousHeadViews) {
