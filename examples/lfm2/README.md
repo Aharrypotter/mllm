@@ -57,11 +57,9 @@ build/bin/mllm-lfm2-runner \
   --print_token_ids
 ```
 
-For the Android ARM build, keep runtime OpenMP enabled but configure the CPU
-backend without backend-wide OpenMP. LFM2.5 still selects the shared W4A32
-I8MM prefill path and retained KAI decode workspace; avoiding OpenMP regions in
-every backend operator preserves decode latency for its 8-attention / 22-conv
-hybrid schedule.
+For the Android ARM build, select the repository's OpenMP thread vendor. The
+CPU backend applies OpenMP only to translation units that own a parallel region;
+the LFM2.5 runner does not require a model-specific OpenMP build option.
 
 ```bash
 cmake -S . -B build-android \
@@ -71,7 +69,9 @@ cmake -S . -B build-android \
   -DMLLM_CROSS_COMPILE=ON \
   -DMLLM_BUILD_ARM_BACKEND=ON \
   -DMLLM_ENABLE_EXAMPLE=ON \
-  -DMLLM_ARM_CPU_BACKEND_USE_OPENMP=OFF
+  -DMLLM_KERNEL_USE_THREADS=ON \
+  -DMLLM_KERNEL_THREADS_VENDOR_OPENMP=ON \
+  -DMLLM_KERNEL_USE_THREADS_VENDOR_MLLM=OFF
 
 cmake --build build-android --target mllm-lfm2-runner -j
 ```

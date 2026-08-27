@@ -147,20 +147,44 @@ if(MLLM_KERNEL_USE_THREADS AND MLLM_KERNEL_THREADS_VENDOR_OPENMP)
     target_compile_options(MllmRT PRIVATE ${OpenMP_CXX_FLAGS})
     target_include_directories(MllmRT PUBLIC ${OpenMP_CXX_INCLUDE_DIR})
 
-    # ARM CPU kernels contain the OpenMP regions used by the mobile product
-    # path. Keep x86 CPU kernels on the existing MllmRT-only configuration so
-    # unrelated kernels are not recompiled with OpenMP as part of ARM support.
-    if(MLLM_BUILD_ARM_BACKEND AND MLLM_ARM_CPU_BACKEND_USE_OPENMP)
-      target_link_libraries(MllmCPUBackend PUBLIC ${OpenMP_CXX_FLAGS})
-      target_compile_options(MllmCPUBackend PRIVATE ${OpenMP_CXX_FLAGS})
-      target_include_directories(MllmCPUBackend PUBLIC ${OpenMP_CXX_INCLUDE_DIR})
-    elseif(MLLM_BUILD_ARM_BACKEND AND MLLM_ARM_KAI_USE_OPENMP)
-      # The KAI linear helper owns its tile-parallel loops.  Compiling only
-      # this translation unit with OpenMP lets quantized Linear reuse those
-      # loops without adding parallel-region overhead to every CPU operator.
-      set_source_files_properties(
+    if(MLLM_BUILD_ARM_BACKEND)
+      # OpenMP is a translation-unit concern: compile only sources that own a
+      # parallel region, including operators that instantiate one from a
+      # header-only kernel. Keep this list grouped by ownership so adding a
+      # parallel region does not silently broaden the whole backend target.
+      set(MLLM_CPU_BACKEND_OPENMP_SOURCES
+        # Backend operators with an in-file parallel region.
+        ${CMAKE_CURRENT_LIST_DIR}/ops/AvgPool1dOp.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/ops/Conv1DOp.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/ops/EmbeddingOp.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/ops/GroupedQueryAttentionOp.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/ops/LayerNormOp.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/ops/RMSNormOp.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/ops/SoftmaxOp.cpp
+
+        # Operators that instantiate parallel header-only attention kernels.
+        ${CMAKE_CURRENT_LIST_DIR}/ops/FlashAttention2Op.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/ops/FlashAttn2WithSinkAndSwaOp.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/ops/PagedAttnOp.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/ops/RadixAttnDiffDimOp.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/ops/RadixAttnOp.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/ops/RadixAttnWithSinkAndSwaDiffDimOp.cpp
+
+        # Kernel translation units with an in-file parallel region.
+        ${CMAKE_CURRENT_LIST_DIR}/kernels/arm/cast_types.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/kernels/arm/elementwise.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/kernels/arm/gelu.cpp
         ${CMAKE_CURRENT_LIST_DIR}/kernels/arm/linear/kai.cpp
-        PROPERTIES COMPILE_OPTIONS "${OpenMP_CXX_FLAGS}")
+        ${CMAKE_CURRENT_LIST_DIR}/kernels/arm/mllm_blas/mllm_blas_sgemm.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/kernels/arm/relu.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/kernels/arm/sigmoid.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/kernels/arm/silu.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/kernels/common/gdn/gated_delta_net.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/kernels/common/ggml/matmul.cpp)
+
+      set_property(
+        SOURCE ${MLLM_CPU_BACKEND_OPENMP_SOURCES}
+        APPEND PROPERTY COMPILE_OPTIONS ${OpenMP_CXX_FLAGS})
       target_link_libraries(MllmCPUBackend PUBLIC ${OpenMP_CXX_FLAGS})
       target_include_directories(MllmCPUBackend PUBLIC ${OpenMP_CXX_INCLUDE_DIR})
     endif()
