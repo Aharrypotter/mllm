@@ -8,9 +8,6 @@ namespace mllm::nn {
 CausalDepthwiseConv1D::CausalDepthwiseConv1D()
     : Layer(OpTypes::kCausalDepthwiseConv1D, aops::CausalDepthwiseConv1DOpOptions{}) {}
 
-CausalDepthwiseConv1D::CausalDepthwiseConv1D(const aops::CausalDepthwiseConv1DOpOptions& options)
-    : Layer(OpTypes::kCausalDepthwiseConv1D, options) {}
-
 CausalDepthwiseConv1D::CausalDepthwiseConv1D(int32_t channels, int32_t kernel_size, bool bias, bool state_inplace,
                                              aops::CausalDepthwiseConv1DAccumulationOrder accumulation_order)
     : Layer(OpTypes::kCausalDepthwiseConv1D, aops::CausalDepthwiseConv1DOpOptions{.channels = channels,
