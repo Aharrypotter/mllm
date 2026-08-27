@@ -23,6 +23,8 @@ struct Lfm2Config : protected ConfigFile {
     intermediate_size = cfg.at("intermediate_size");
     num_hidden_layers = cfg.at("num_hidden_layers");
     num_attention_heads = cfg.at("num_attention_heads");
+    // head_dim's default divides by this below, which runs before validate().
+    if (num_attention_heads <= 0) { throw std::invalid_argument("LFM2 num_attention_heads must be positive"); }
     num_key_value_heads = cfg.at("num_key_value_heads");
     max_position_embeddings = cfg.at("max_position_embeddings");
     vocab_size = cfg.at("vocab_size");
