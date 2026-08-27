@@ -11,7 +11,7 @@ namespace mllm::nn {
 class GroupedQueryAttention : public Layer {
  public:
   GroupedQueryAttention();
-  explicit GroupedQueryAttention(const aops::GroupedQueryAttentionOpOptions& options);
+  explicit GroupedQueryAttention(aops::GroupedQueryAttentionImplementation implementation);
 
   MLLM_LAYER_ANY_INPUTS_1_OUTPUTS_FORWARD
 };

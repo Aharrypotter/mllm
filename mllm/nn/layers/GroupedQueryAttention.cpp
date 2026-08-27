@@ -8,7 +8,7 @@ namespace mllm::nn {
 GroupedQueryAttention::GroupedQueryAttention()
     : Layer(OpTypes::kGroupedQueryAttention, aops::GroupedQueryAttentionOpOptions{}) {}
 
-GroupedQueryAttention::GroupedQueryAttention(const aops::GroupedQueryAttentionOpOptions& options)
-    : Layer(OpTypes::kGroupedQueryAttention, options) {}
+GroupedQueryAttention::GroupedQueryAttention(aops::GroupedQueryAttentionImplementation implementation)
+    : Layer(OpTypes::kGroupedQueryAttention, aops::GroupedQueryAttentionOpOptions{.implementation = implementation}) {}
 
 }  // namespace mllm::nn

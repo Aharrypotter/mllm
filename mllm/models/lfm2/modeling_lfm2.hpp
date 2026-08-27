@@ -78,9 +78,7 @@ class Lfm2Attention final : public nn::Module {
     k_layernorm_ = reg<nn::RMSNorm>("k_layernorm", cfg.norm_eps, false);
     q_rope_ = reg<nn::RoPE>("q_rope", cfg.rope_theta, cfg.max_position_embeddings, head_dim_);
     k_rope_ = reg<nn::RoPE>("k_rope", cfg.rope_theta, cfg.max_position_embeddings, head_dim_);
-    gqa_ = reg<nn::GroupedQueryAttention>(
-        "gqa",
-        aops::GroupedQueryAttentionOpOptions{.implementation = aops::GroupedQueryAttentionImplementation::kDirectStrided});
+    gqa_ = reg<nn::GroupedQueryAttention>("gqa", aops::GroupedQueryAttentionImplementation::kDirectStrided);
   }
 
   std::vector<Tensor> forward(const std::vector<Tensor>& inputs, const std::vector<AnyValue>& args) override {
