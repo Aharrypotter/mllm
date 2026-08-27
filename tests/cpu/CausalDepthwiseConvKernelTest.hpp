@@ -6,12 +6,12 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <iostream>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "mllm/backends/cpu/kernels/common/causal_conv/depthwise_causal_conv.hpp"
+#include "mllm/mllm.hpp"
 
 #include "KernelTestHelper.hpp"
 
@@ -20,15 +20,7 @@ class CausalDepthwiseConvKernelTest : public KernelTest {
   CausalDepthwiseConvKernelTest() = default;
   ~CausalDepthwiseConvKernelTest() override = default;
 
-  bool testHistoryFirstK3MatchesScalarReferenceBitwise(const std::vector<std::unordered_map<std::string, int32_t>>& cfgs) {
-    for (const auto& cfg : cfgs) {
-      if (!testOneCase(cfg)) { return false; }
-    }
-    return true;
-  }
-
- private:
-  static bool testOneCase(const std::unordered_map<std::string, int32_t>& cfg) {
+  bool testHistoryFirstK3Once(const std::unordered_map<std::string, int32_t>& cfg) {
     constexpr int kKernel = 3;
     const int batch = cfg.at("B");
     const int sequence = cfg.at("S");
@@ -52,14 +44,27 @@ class CausalDepthwiseConvKernelTest : public KernelTest {
     referenceDepthwiseCausalConvHistoryFirst(input, weight, reference_state, reference_output, batch, sequence, channels,
                                              kKernel);
 
-    if (kernel_output != reference_output || kernel_state != reference_state) {
-      std::cerr << "history-first mismatch for B=" << batch << " S=" << sequence << " C=" << channels
-                << " history=" << (non_zero_history ? "non-zero" : "zero") << '\n';
+    if (kernel_output != reference_output) {
+      mllm::print("history-first output mismatch for B=", batch, "S=", sequence, "C=", channels,
+                  "history=", non_zero_history ? "non-zero" : "zero");
+      return false;
+    }
+    if (kernel_state != reference_state) {
+      mllm::print("history-first state mismatch for B=", batch, "S=", sequence, "C=", channels,
+                  "history=", non_zero_history ? "non-zero" : "zero");
       return false;
     }
     return true;
   }
 
+  bool testHistoryFirstK3(const std::vector<std::unordered_map<std::string, int32_t>>& cfgs) {
+    for (const auto& cfg : cfgs) {
+      if (!testHistoryFirstK3Once(cfg)) { return false; }
+    }
+    return true;
+  }
+
+ private:
   static float patternValue(std::size_t index, int salt) {
     const auto scaled = static_cast<float>((index * 37U + static_cast<unsigned>(salt) * 11U) % 251U);
     return (scaled - 125.0F) / 64.0F;

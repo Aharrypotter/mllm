@@ -538,15 +538,22 @@ TEST_F(ElementwiseKernelTest, DivScalarInt32) {
 //===----------------------------------------------------------------------===//
 #include "CausalDepthwiseConvKernelTest.hpp"
 TEST_F(CausalDepthwiseConvKernelTest, HistoryFirstK3MatchesScalarReferenceBitwise) {
-  EXPECT_EQ(testHistoryFirstK3MatchesScalarReferenceBitwise({
+  EXPECT_EQ(testHistoryFirstK3({
+                // Scalar path.
                 {{"B", 1}, {"S", 1}, {"C", 1}, {"non_zero_history", 0}},
                 {{"B", 1}, {"S", 1}, {"C", 1}, {"non_zero_history", 1}},
-                {{"B", 2}, {"S", 2}, {"C", 3}, {"non_zero_history", 0}},
-                {{"B", 2}, {"S", 2}, {"C", 3}, {"non_zero_history", 1}},
+
+                // One exact NEON vector block.
                 {{"B", 1}, {"S", 28}, {"C", 4}, {"non_zero_history", 0}},
                 {{"B", 1}, {"S", 28}, {"C", 4}, {"non_zero_history", 1}},
+
+                // NEON vector loop with scalar tails.
+                {{"B", 2}, {"S", 2}, {"C", 3}, {"non_zero_history", 0}},
+                {{"B", 2}, {"S", 2}, {"C", 3}, {"non_zero_history", 1}},
                 {{"B", 2}, {"S", 2}, {"C", 5}, {"non_zero_history", 0}},
                 {{"B", 2}, {"S", 2}, {"C", 5}, {"non_zero_history", 1}},
+
+                // LFM production-width exact block and tail coverage.
                 {{"B", 1}, {"S", 225}, {"C", 2045}, {"non_zero_history", 0}},
                 {{"B", 1}, {"S", 225}, {"C", 2045}, {"non_zero_history", 1}},
                 {{"B", 2}, {"S", 28}, {"C", 2048}, {"non_zero_history", 0}},
