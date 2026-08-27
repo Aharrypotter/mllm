@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "mllm/backends/cpu/kernels/arm/linear/kai.hpp"
+#include "mllm/mllm.hpp"
 
 namespace {
 
@@ -250,6 +251,7 @@ void runPair(std::string_view pair_name, std::string_view baseline, std::string_
 
 int main(int argc, char** argv) {
   try {
+    mllm::initializeContext();
     if (argc < 4 || argc > 5) {
       std::fprintf(stderr, "usage: %s <gate_up|qkv> <M> <threads> [schedule_repeats]\n", argv[0]);
       return 2;
