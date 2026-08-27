@@ -36,11 +36,13 @@ void CPUParallelLinearOp::load(const ParameterFile::ptr_t& ploader) {
   }
 }
 
-Tensor CPUParallelLinearOp::acquireKaiWorkspace(int32_t workspace_size) {
-  if (kai_workspace_.isNil() || kai_workspace_.numel() < static_cast<size_t>(workspace_size)) {
-    kai_workspace_ = Tensor::empty({workspace_size}, kInt8, kCPU).alloc();
+Tensor CPUParallelLinearOp::acquireKaiWorkspace(int32_t workspace_size, int m) {
+  if (m != 1) { return Tensor::empty({workspace_size}, kInt8, kCPU).alloc(); }
+
+  if (kai_decode_workspace_.isNil() || kai_decode_workspace_.numel() < static_cast<size_t>(workspace_size)) {
+    kai_decode_workspace_ = Tensor::empty({workspace_size}, kInt8, kCPU).alloc();
   }
-  return kai_workspace_;
+  return kai_decode_workspace_;
 }
 
 bool CPUParallelLinearOp::tryForwardSharedInputKai(const Tensor& input, std::vector<Tensor>& outputs) {
@@ -93,7 +95,7 @@ bool CPUParallelLinearOp::tryForwardSharedInputKai(const Tensor& input, std::vec
   KaiHelper kai_helper;
   const size_t workspace_size = kai_helper.workspace_size(m, options_.in_channels, tile);
   if (workspace_size == 0 || workspace_size > static_cast<size_t>(std::numeric_limits<int32_t>::max())) { return false; }
-  auto workspace = acquireKaiWorkspace(static_cast<int32_t>(workspace_size));
+  auto workspace = acquireKaiWorkspace(static_cast<int32_t>(workspace_size), m);
   if (!kai_helper.matmul_shared_input(input.ptr<mllm_fp32_t>(), projections.data(), weights_.size(), workspace.ptr<void>(), m,
                                       options_.in_channels, tile, thread_count)) {
     return false;

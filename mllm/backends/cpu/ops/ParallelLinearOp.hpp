@@ -20,10 +20,13 @@ class CPUParallelLinearOp final : public aops::ParallelLinearOp {
 
  private:
   bool tryForwardSharedInputKai(const Tensor& input, std::vector<Tensor>& outputs);
-  Tensor acquireKaiWorkspace(int32_t workspace_size);
+  Tensor acquireKaiWorkspace(int32_t workspace_size, int m);
 
   std::vector<std::unique_ptr<CPULinearOp>> fallback_ops_;
-  Tensor kai_workspace_;
+  // Only the decode-sized (m == 1) buffer is retained; a prefill workspace is
+  // two orders of magnitude larger and must not stay resident for the rest of
+  // the process, which CPULinearOp already avoids the same way.
+  Tensor kai_decode_workspace_;
 };
 
 class CPUParallelLinearOpFactory : public TypedOpFactory<OpTypes::kParallelLinear, aops::ParallelLinearOpOptions> {
