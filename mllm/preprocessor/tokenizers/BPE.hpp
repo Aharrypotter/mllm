@@ -39,6 +39,11 @@ class BPE {
   std::unordered_map<std::wstring, int64_t> vocab_;
   std::unordered_map<int64_t, std::wstring> vocab_inverse_;
   std::unordered_map<std::pair<std::wstring, std::wstring>, int64_t, BPEPairHash> bpe_ranks_;
+  // HuggingFace `model.ignore_merges`. When the checkpoint sets it, a token
+  // that is already a vocabulary entry is emitted whole instead of being
+  // rebuilt from the merge table. Roughly 2% of such entries are unreachable
+  // by merges alone, so ignoring the flag silently changes the token ids.
+  bool ignore_merges_ = false;
 };
 
 }  // namespace mllm::preprocessor

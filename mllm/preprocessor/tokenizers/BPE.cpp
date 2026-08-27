@@ -27,6 +27,8 @@ bool BPE::initFromSentencePieceJson(const std::string& file_path) {
     return false;
   }
 
+  ignore_merges_ = json_data["model"].value("ignore_merges", false);
+
   for (const auto& [key, value] : json_data["model"]["vocab"].items()) {
     auto str = utf8string2WideString(key);
     vocab_.insert({
@@ -73,6 +75,11 @@ bool BPE::initFromSentencePieceJson(const std::string& file_path) {
 
 std::vector<std::wstring> BPE::_bpe(const std::wstring& token) {
   // TODO check cache
+
+  // Checkpoints with ignore_merges keep whole vocabulary entries intact; the
+  // merge table cannot reconstruct all of them, so re-deriving would change
+  // the ids the checkpoint's own tokenizer produces.
+  if (ignore_merges_ && vocab_.count(token)) return {token};
 
   std::vector<std::wstring> word;
   for (const auto& w : token) word.emplace_back(std::wstring{w});

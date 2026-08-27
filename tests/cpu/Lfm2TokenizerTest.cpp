@@ -57,6 +57,19 @@ TEST(Lfm2TokenizerTest, MatchesPinnedCheckpointOracleWhenProvided) {
     EXPECT_EQ(tool_input.ptr<int64_t>()[index], tool_expected[index]);
   }
 
+  // "Croatia" is a vocabulary entry the merge table cannot rebuild, so it only
+  // survives as one id when the checkpoint's ignore_merges flag is honoured.
+  // Both other oracle strings above happen to avoid such words, which is why a
+  // merge-only BPE passed them while producing wrong ids for ordinary prose.
+  auto merge_unreachable = tokenizer.convertMessage({.prompt = "Croatia joined the European Union in 2013."}).at("sequence");
+  const std::vector<int64_t> merge_unreachable_expected = {124894, 124899, 5922,  207,   116168, 8904,   278,
+                                                           4964,   6188,   296,   229,   523,    27,     22,
+                                                           124900, 207,    124899, 63514, 207,    124901};
+  ASSERT_EQ(merge_unreachable.shape()[1], merge_unreachable_expected.size());
+  for (size_t index = 0; index < merge_unreachable_expected.size(); ++index) {
+    EXPECT_EQ(merge_unreachable.ptr<int64_t>()[index], merge_unreachable_expected[index]);
+  }
+
   const std::string multilingual = "你好 LFM2.5!";
   const auto ordinary_tokens = tokenizer.tokenize(multilingual);
   const auto ordinary_ids = tokenizer.convert2Ids(ordinary_tokens);
