@@ -29,20 +29,12 @@ class ParallelLinearTest : public testing::Test {
   static void SetUpTestSuite() { mllm::initializeContext(); }
 };
 
-mllm::aops::ParallelLinearOpOptions options(bool bias) {
-  return {.in_channels = 2,
-          .out_channels = {2, 1},
-          .projection_names = {"left", "right"},
-          .bias = bias,
-          .impl_type = mllm::aops::LinearImplTypes::kGGUF,
-          .kai_w4a32_decode_thread_cap = 4,
-          .kai_w4a32_prefill_thread_cap = 6};
-}
-
 class ParallelLinearModule final : public mllm::nn::Module {
  public:
   ParallelLinearModule(std::string name, bool bias) : Module(std::move(name)) {
-    projections_ = reg<mllm::nn::ParallelLinear>("pair", options(bias));
+    projections_ =
+        reg<mllm::nn::ParallelLinear>("pair", 2, std::vector<int32_t>{2, 1}, std::vector<std::string>{"left", "right"}, bias,
+                                      mllm::aops::LinearImplTypes::kGGUF, 4, 6);
   }
 
   std::vector<Tensor> forward(const std::vector<Tensor>& inputs, const std::vector<mllm::AnyValue>&) override {

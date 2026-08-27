@@ -563,6 +563,12 @@ TEST_F(CausalDepthwiseConvKernelTest, HistoryFirstK3MatchesScalarReferenceBitwis
 }
 
 //===----------------------------------------------------------------------===//
+// Parallel linear
+//===----------------------------------------------------------------------===//
+#include "ParallelLinearKernelTest.hpp"
+TEST_F(ParallelLinearKernelTest, KaiW4A32DispatchPolicy) { EXPECT_EQ(testKaiW4A32DispatchPolicy(), true); }
+
+//===----------------------------------------------------------------------===//
 // CausalMaskOp
 //===----------------------------------------------------------------------===//
 #include "CausalMaskOpTest.hpp"

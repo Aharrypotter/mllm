@@ -6,12 +6,9 @@
 #include <cstdio>
 #include <cstdlib>
 
-#if defined(__linux__)
-#include <sys/auxv.h>
-#endif
-
 #include "mllm/backends/cpu/ops/LinearOp.hpp"
 #include "mllm/backends/cpu/kernels/Kernels.hpp"
+#include "mllm/backends/cpu/kernels/common/linear/kai_w4a32_dispatch.hpp"
 #include "mllm/core/DataTypes.hpp"
 #include "mllm/core/aops/LinearOp.hpp"
 
@@ -32,18 +29,8 @@ bool environmentFlagEnabled(const char* name) {
   return value != nullptr && value[0] == '1' && value[1] == '\0';
 }
 
-bool cpuSupportsI8mm() {
-#if defined(__linux__) && defined(__aarch64__)
-  constexpr unsigned long kHwcap2I8mm = 1UL << 13;
-  static const bool supported = (getauxval(AT_HWCAP2) & kHwcap2I8mm) != 0;
-  return supported;
-#else
-  return false;
-#endif
-}
-
 KaiW4A32Tile selectKaiW4A32PrefillTile(int m) {
-  if (detail::shouldUseKaiW4A32I8mmPrefill(m)) { return kKaiW4A32I8mmTile; }
+  if (kai_w4a32::shouldUseI8mmPrefill(m)) { return kKaiW4A32I8mmTile; }
   return kKaiW4A32DotProdTile;
 }
 
@@ -60,7 +47,7 @@ void traceKaiW4A32PrefillTile(KaiW4A32Tile tile, int m, int k, int n, int thread
   if (tile == kKaiW4A32I8mmTile) {
     std::fprintf(stderr, "MLLM_KAI_PREFILL_I8MM_ACTIVATED m=%d k=%d n=%d threads=%d\n", m, k, n, threads);
   } else {
-    const char* reason = environmentFlagEnabled("MLLM_KAI_PREFILL_I8MM_DISABLE") ? "disabled" : "unsupported";
+    const char* reason = kai_w4a32::i8mmPrefillDisabled() ? "disabled" : "unsupported";
     std::fprintf(stderr, "MLLM_KAI_PREFILL_DOTPROD_FALLBACK reason=%s m=%d k=%d n=%d threads=%d\n", reason, m, k, n, threads);
   }
 }
@@ -69,21 +56,11 @@ void traceKaiW4A32PrefillTile(KaiW4A32Tile tile, int m, int k, int n, int thread
 
 }  // namespace
 
-bool detail::shouldUseKaiW4A32I8mmPrefill(int m) {
-#if defined(MLLM_HOST_ARCH_ARM64) || defined(MLLM_HOST_ARCH_ARM)
-  static const bool disabled = environmentFlagEnabled("MLLM_KAI_PREFILL_I8MM_DISABLE");
-  return shouldUseKaiW4A32I8mmPrefill(m, disabled, cpuSupportsI8mm());
-#else
-  (void)m;
-  return false;
-#endif
-}
-
 CPULinearOp::CPULinearOp(const aops::LinearOpOptions& options) : LinearOp(options) {}
 
 int CPULinearOp::kaiW4A32ThreadCount(int m) const {
-  return detail::kaiW4A32ThreadCount(m, options_.getThreads(), options_.kai_w4a32_decode_thread_cap,
-                                     options_.kai_w4a32_prefill_thread_cap);
+  return kai_w4a32::threadCount(m, options_.getThreads(), options_.kai_w4a32_decode_thread_cap,
+                                options_.kai_w4a32_prefill_thread_cap);
 }
 
 Tensor CPULinearOp::acquireKaiWorkspace(int32_t workspace_size, int m) {

@@ -34,7 +34,7 @@ class ParallelLinearOp : public BaseOp {
   void setup(const std::vector<Tensor>& inputs, std::vector<Tensor>& outputs) override;
   ParameterFile::ptr_t getParams() override;
 
-  inline const ParallelLinearOpOptions& options() const { return options_; }
+  [[nodiscard]] inline const ParallelLinearOpOptions& options() const { return options_; }
 
  protected:
   [[nodiscard]] std::string projectionParameterName(size_t index, const char* suffix) const;

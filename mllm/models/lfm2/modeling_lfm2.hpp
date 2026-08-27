@@ -24,6 +24,9 @@ namespace mllm::models::lfm2 {
 using common::makeRoPEInvFreq;
 using common::makeRotaryPosEmbedding;
 
+inline constexpr int32_t kLfm2KaiDecodeThreadCap = 4;
+inline constexpr int32_t kLfm2KaiPrefillThreadCap = 6;
+
 inline auto makeLfm2LinearOptions(int32_t in_channels, int32_t out_channels, bool bias, aops::LinearImplTypes impl_type)
     -> aops::LinearOpOptions {
   return {.in_channels = in_channels,
@@ -32,20 +35,8 @@ inline auto makeLfm2LinearOptions(int32_t in_channels, int32_t out_channels, boo
           .impl_type = impl_type,
           // Source-bound OnePlus 13T screening selected six workers for I8MM
           // prefill and four workers to avoid decode GEMV oversubscription.
-          .kai_w4a32_decode_thread_cap = 4,
-          .kai_w4a32_prefill_thread_cap = 6};
-}
-
-inline auto makeLfm2ParallelLinearOptions(int32_t in_channels, std::vector<int32_t> out_channels,
-                                          std::vector<std::string> projection_names, bool bias, aops::LinearImplTypes impl_type)
-    -> aops::ParallelLinearOpOptions {
-  return {.in_channels = in_channels,
-          .out_channels = std::move(out_channels),
-          .projection_names = std::move(projection_names),
-          .bias = bias,
-          .impl_type = impl_type,
-          .kai_w4a32_decode_thread_cap = 4,
-          .kai_w4a32_prefill_thread_cap = 6};
+          .kai_w4a32_decode_thread_cap = kLfm2KaiDecodeThreadCap,
+          .kai_w4a32_prefill_thread_cap = kLfm2KaiPrefillThreadCap};
 }
 
 class Lfm2MLP final : public nn::Module {
@@ -53,8 +44,8 @@ class Lfm2MLP final : public nn::Module {
   Lfm2MLP() = default;
   Lfm2MLP(const std::string& name, const Lfm2Config& cfg) : nn::Module(name) {
     gate_up_proj_ = reg<nn::ParallelLinear>(
-        "gate_up_proj", makeLfm2ParallelLinearOptions(cfg.hidden_size, {cfg.intermediate_size, cfg.intermediate_size},
-                                                      {"w1", "w3"}, false, cfg.linear_impl_type));
+        "gate_up_proj", cfg.hidden_size, std::vector<int32_t>{cfg.intermediate_size, cfg.intermediate_size},
+        std::vector<std::string>{"w1", "w3"}, false, cfg.linear_impl_type, kLfm2KaiDecodeThreadCap, kLfm2KaiPrefillThreadCap);
     w2_ = reg<nn::Linear>("w2", makeLfm2LinearOptions(cfg.intermediate_size, cfg.hidden_size, false, cfg.linear_impl_type));
     silu_ = reg<nn::SiLU>("silu");
   }
@@ -78,9 +69,9 @@ class Lfm2Attention final : public nn::Module {
     query_heads_ = cfg.num_attention_heads;
     kv_heads_ = cfg.num_key_value_heads;
     qkv_proj_ = reg<nn::ParallelLinear>(
-        "qkv_proj",
-        makeLfm2ParallelLinearOptions(hidden_size_, {query_heads_ * head_dim_, kv_heads_ * head_dim_, kv_heads_ * head_dim_},
-                                      {"q_proj", "k_proj", "v_proj"}, false, cfg.linear_impl_type));
+        "qkv_proj", hidden_size_, std::vector<int32_t>{query_heads_ * head_dim_, kv_heads_ * head_dim_, kv_heads_ * head_dim_},
+        std::vector<std::string>{"q_proj", "k_proj", "v_proj"}, false, cfg.linear_impl_type, kLfm2KaiDecodeThreadCap,
+        kLfm2KaiPrefillThreadCap);
     out_proj_ =
         reg<nn::Linear>("out_proj", makeLfm2LinearOptions(query_heads_ * head_dim_, hidden_size_, false, cfg.linear_impl_type));
     q_layernorm_ = reg<nn::RMSNorm>("q_layernorm", cfg.norm_eps, false);
