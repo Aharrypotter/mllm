@@ -59,9 +59,21 @@ bool QNNSiLUPattern::addNode(const std::string& graphName, const ir::op_ptr_t& o
     return false;
   }
 
-  // Add SiLU node to the graph using custom QNN operator from LLaMAPackage
-  qnnBackend->graphAddNode(graphName, qnnSiLUOp->getName(), "SiLU", inputTensorNames, {outputs[0]->name()}, {}, {},
-                           "LLaMAPackage");
+  if (qnnSiLUOp->options().high_precision) {
+    const auto sigmoidTensorName = qnnSiLUOp->getName() + ".sigmoid";
+    if (!qnnBackend->addTensor(graphName, sigmoidTensorName, QNN_TENSOR_TYPE_NATIVE, outputs[0]->tensor_)) {
+      MLLM_ERROR("Failed to add high-precision SiLU intermediate tensor {} to graph {}", sigmoidTensorName, graphName);
+      return false;
+    }
+    qnnBackend->graphAddNode(graphName, qnnSiLUOp->getName() + ".sigmoid", "Sigmoid", inputTensorNames, {sigmoidTensorName}, {},
+                             {});
+    qnnBackend->graphAddNode(graphName, qnnSiLUOp->getName(), "LLaMAMul", {sigmoidTensorName, inputs[0]->name()},
+                             {outputs[0]->name()}, {}, {}, "LLaMAPackage");
+  } else {
+    // Add SiLU node to the graph using custom QNN operator from LLaMAPackage.
+    qnnBackend->graphAddNode(graphName, qnnSiLUOp->getName(), "SiLU", inputTensorNames, {outputs[0]->name()}, {}, {},
+                             "LLaMAPackage");
+  }
 
   return true;
 }

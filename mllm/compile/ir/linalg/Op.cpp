@@ -67,6 +67,9 @@ LINALG_AOPS_DECL(OpTypes::kISTFT, ISTFTOp);
 
 LINALG_AOPS_DECL(OpTypes::kFlashAttention2, FlashAttention2Op);
 LINALG_AOPS_DECL(OpTypes::kGroupedQueryAttentionDecode, GroupedQueryAttentionDecodeOp);
+LINALG_AOPS_DECL(OpTypes::kLinearShadowCorrection, LinearShadowCorrectionOp);
+LINALG_AOPS_DECL(OpTypes::kPatternSparseAttention, PatternSparseAttentionOp);
+LINALG_AOPS_DECL(OpTypes::kSparseSoftmaxValue, SparseSoftmaxValueOp);
 LINALG_AOPS_DECL(OpTypes::kRepeat, RepeatOp);
 LINALG_AOPS_DECL(OpTypes::kPermute, PermuteOp);
 

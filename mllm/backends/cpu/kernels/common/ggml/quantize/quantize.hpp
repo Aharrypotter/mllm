@@ -85,7 +85,25 @@ namespace mllm::cpu {
 static float table_f32_f16[1 << 16];
 static bool table_f32_f16_init = false;
 
-inline static float lookup_fp16_to_fp32(uint16_t f) {
+inline static uint16_t mllm_fp16_to_bits(mllm_fp16_t value) {
+  static_assert(sizeof(mllm_fp16_t) == sizeof(uint16_t));
+  uint16_t bits;
+  memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+inline static mllm_fp16_t mllm_fp16_from_bits(uint16_t bits) {
+  static_assert(sizeof(mllm_fp16_t) == sizeof(uint16_t));
+  mllm_fp16_t value;
+  memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+inline static mllm_fp16_t compute_fp32_to_mllm_fp16(float value) {
+  return mllm_fp16_from_bits(static_cast<uint16_t>(MLLM_COMPUTE_FP32_TO_FP16(value)));
+}
+
+inline static float lookup_fp16_to_fp32(mllm_fp16_t f) {
   if (!table_f32_f16_init) {
     uint16_t ii;
     for (int i = 0; i < (1 << 16); ++i) {
@@ -95,13 +113,11 @@ inline static float lookup_fp16_to_fp32(uint16_t f) {
     }
     table_f32_f16_init = true;
   }
-  uint16_t s;
-  memcpy(&s, &f, sizeof(uint16_t));
-  return table_f32_f16[s];
+  return table_f32_f16[mllm_fp16_to_bits(f)];
 }
 
 #define MLLM_FP16_TO_FP32(x) lookup_fp16_to_fp32(x)
-#define MLLM_FP32_TO_FP16(x) MLLM_COMPUTE_FP32_TO_FP16(x)
+#define MLLM_FP32_TO_FP16(x) compute_fp32_to_mllm_fp16(x)
 
 #else
 namespace mllm::cpu {
@@ -111,7 +127,25 @@ namespace mllm::cpu {
 static float table_f32_f16[1 << 16];
 static bool table_f32_f16_init = false;
 
-inline static float lookup_fp16_to_fp32(uint16_t f) {
+inline static uint16_t mllm_fp16_to_bits(mllm_fp16_t value) {
+  static_assert(sizeof(mllm_fp16_t) == sizeof(uint16_t));
+  uint16_t bits;
+  memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+inline static mllm_fp16_t mllm_fp16_from_bits(uint16_t bits) {
+  static_assert(sizeof(mllm_fp16_t) == sizeof(uint16_t));
+  mllm_fp16_t value;
+  memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+inline static mllm_fp16_t compute_fp32_to_mllm_fp16(float value) {
+  return mllm_fp16_from_bits(static_cast<uint16_t>(MLLM_COMPUTE_FP32_TO_FP16(value)));
+}
+
+inline static float lookup_fp16_to_fp32(mllm_fp16_t f) {
   if (!table_f32_f16_init) {
     uint16_t ii;
     for (int i = 0; i < (1 << 16); ++i) {
@@ -121,16 +155,14 @@ inline static float lookup_fp16_to_fp32(uint16_t f) {
     }
     table_f32_f16_init = true;
   }
-  uint16_t s;
-  memcpy(&s, &f, sizeof(uint16_t));
-  return table_f32_f16[s];
+  return table_f32_f16[mllm_fp16_to_bits(f)];
 }
 
 #ifndef MLLM_FP16_TO_FP32
 #define MLLM_FP16_TO_FP32(x) lookup_fp16_to_fp32(x)
 #endif
 #ifndef MLLM_FP32_TO_FP16
-#define MLLM_FP32_TO_FP16(x) MLLM_COMPUTE_FP32_TO_FP16(x)
+#define MLLM_FP32_TO_FP16(x) compute_fp32_to_mllm_fp16(x)
 #endif
 #endif
 
@@ -141,7 +173,7 @@ inline void init_table_exp_f16() {
   for (int i = 0; i < (1 << 16); ++i) {
     uint16_t ui = i;
     memcpy(&ii, &ui, sizeof(ii));
-    const float f = MLLM_COMPUTE_FP16_TO_FP32(ii);
+    const float f = MLLM_FP16_TO_FP32(ii);
     table_exp_f16[i] = MLLM_FP32_TO_FP16(expf(f));
     //        float val = MLLM_FP16_TO_FP32(expf(f));
     //        std::cout<<i<<"  "<<f<<" "<<expf(f)<<"  "<<val<<std::endl;
@@ -179,7 +211,7 @@ inline void init_table_gelu_f16() {
   for (int i = 0; i < (1 << 16); ++i) {
     uint16_t ui = i;
     memcpy(&ii, &ui, sizeof(ii));
-    const float f = MLLM_COMPUTE_FP16_TO_FP32(ii);
+    const float f = MLLM_FP16_TO_FP32(ii);
     mllm_table_gelu_f16[i] = MLLM_FP32_TO_FP16(mllm_gelu_f32(f));
   }
 }
@@ -200,7 +232,7 @@ inline void init_table_gelu_quick_f16() {
   for (int i = 0; i < (1 << 16); ++i) {
     uint16_t ui = i;
     memcpy(&ii, &ui, sizeof(ii));
-    const float f = MLLM_COMPUTE_FP16_TO_FP32(ii);
+    const float f = MLLM_FP16_TO_FP32(ii);
     mllm_table_gelu_quick_f16[i] = MLLM_FP32_TO_FP16(mllm_gelu_quick_f32(f));
   }
 }
@@ -220,7 +252,7 @@ inline void init_table_silu_f16() {
   for (int i = 0; i < (1 << 16); ++i) {
     uint16_t ui = i;
     memcpy(&ii, &ui, sizeof(ii));
-    const float f = MLLM_COMPUTE_FP16_TO_FP32(ii);
+    const float f = MLLM_FP16_TO_FP32(ii);
     mllm_table_silu_f16[i] = MLLM_FP32_TO_FP16(mllm_silu_f32(f));
   }
 }

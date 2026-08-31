@@ -8,6 +8,19 @@
 
 /// Kernel tests
 #include "ElementwiseKernelTest.hpp"
+#include "INT8TopKKernelTest.hpp"
+#include "PatternSparseAttentionKernelTest.hpp"
+#include "HMXPipelineSchedulerTest.hpp"
+#include "ArmQ4KernelTest.hpp"
+
+//===----------------------------------------------------------------------===//
+// ARM Q4 scalar dot-product correctness and output-boundary contract.
+//===----------------------------------------------------------------------===//
+TEST_F(ArmQ4KernelTest, Q4ScaleEncodingIsPortableIEEEBinary16) { EXPECT_TRUE(q4ScaleEncodingIsPortableIEEEBinary16()); }
+
+TEST_F(ArmQ4KernelTest, ScalarQ4Q8DotDoesNotOverwriteNeighbors) { EXPECT_TRUE(scalarQ4Q8DotDoesNotOverwriteNeighbors()); }
+
+TEST_F(ArmQ4KernelTest, SingleRowQ4Q8LlamafileMatchesReference) { EXPECT_TRUE(singleRowQ4Q8LlamafileMatchesReference()); }
 
 //===----------------------------------------------------------------------===//
 // Element wise ADD.
@@ -251,6 +264,43 @@ TEST_F(ElementwiseKernelTest, DivFloat16) {
                 {128, 128, 128},
             }),
             true);
+}
+
+//===----------------------------------------------------------------------===//
+// ShadowNPU exact signed-INT8 Top-k.
+//===----------------------------------------------------------------------===//
+TEST_F(INT8TopKKernelTest, HandlesTiesAndSignedExtremes) { handlesTiesAndSignedExtremes(); }
+
+TEST_F(INT8TopKKernelTest, RandomRowsMatchStableReference) { randomRowsMatchStableReference(); }
+
+TEST_F(INT8TopKKernelTest, RepeatedScoresRemainExactAcrossCounterBoundary) { repeatedScoresRemainExactAcrossCounterBoundary(); }
+
+TEST_F(INT8TopKKernelTest, CausalRowBlocksMatchStableReference) { causalRowBlocksMatchStableReference(); }
+
+TEST_F(INT8TopKKernelTest, CausalRowBlocksHandleTiesAndRemainder) { causalRowBlocksHandleTiesAndRemainder(); }
+
+TEST_F(INT8TopKKernelTest, DisjointCausalRowRangesMatchWholeHead) { disjointCausalRowRangesMatchWholeHead(); }
+
+TEST_F(INT8TopKKernelTest, RejectsInvalidArguments) { rejectsInvalidArguments(); }
+
+TEST_F(PatternSparseAttentionKernelTest, StructuredPatternUsesEndpointUniformHistoryAndLocalSuffix) {
+  structuredPatternUsesEndpointUniformHistoryAndLocalSuffix();
+}
+
+TEST_F(PatternSparseAttentionKernelTest, StructuredPatternHonorsPrefixAndKeepOneRule) {
+  structuredPatternHonorsPrefixAndKeepOneRule();
+}
+
+TEST_F(PatternSparseAttentionKernelTest, RandomPatternIsExactSortedAndRepeatable) { randomPatternIsExactSortedAndRepeatable(); }
+
+TEST_F(PatternSparseAttentionKernelTest, RandomPatternKeepsAllKeysInOrder) { randomPatternKeepsAllKeysInOrder(); }
+
+TEST_F(PatternSparseAttentionKernelTest, DisjointMatrixAndRowRangesMatchWholeExternalSelection) {
+  disjointMatrixAndRowRangesMatchWholeExternalSelection();
+}
+
+TEST_F(PatternSparseAttentionKernelTest, HmxFp16RangeMatchesGenericExternalSelectionWithDimensionTail) {
+  hmxFp16RangeMatchesGenericExternalSelectionWithDimensionTail();
 }
 
 //===----------------------------------------------------------------------===//
@@ -982,8 +1032,8 @@ TEST_F(Conv2DKernelTest, im2col) {
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
   mllm::initializeContext();
-  { auto ret = RUN_ALL_TESTS(); }
+  const int ret = RUN_ALL_TESTS();
   mllm::memoryReport();
   mllm::shutdownContext();
-  return 0;
+  return ret;
 }

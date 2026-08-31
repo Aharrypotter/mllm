@@ -5,8 +5,19 @@
 
 namespace mllm {
 
+namespace {
+
+int iterationCount(const HpcThreadPoolTask& task) {
+  MLLM_RT_ASSERT(task.step > 0);
+  const int64_t distance = static_cast<int64_t>(task.end) - static_cast<int64_t>(task.start);
+  if (distance <= 0) { return 0; }
+  return static_cast<int>(1 + (distance - 1) / task.step);
+}
+
+}  // namespace
+
 void HpcThreadPool::push(HpcThreadPoolTask&& task, int task_slot_idx) {
-  int tiles_num = (task.end - task.start) / task.step;
+  int tiles_num = iterationCount(task);
 
   // There is no need to fall in back to thread pool
   if (tiles_num <= 1 || task_slot_idx < 0) {
@@ -81,11 +92,11 @@ void HpcThreadPool::splitTask(HpcThreadPoolTask&& task, int task_slot_idx) {
     for (int i = task.start; i < task.end; i += task.step) { task.func(i); }
     return;
   }
-  int tiles_num = (task.end - task.start) / task.step;
+  int tiles_num = iterationCount(task);
 
-  int _cnt = 0;
-  std::vector<int> true_idx(tiles_num);
-  for (int i = task.start; i < task.end; i += task.step) { true_idx[_cnt++] = i; }
+  std::vector<int> true_idx;
+  true_idx.reserve(tiles_num);
+  for (int i = task.start; i < task.end; i += task.step) { true_idx.push_back(i); }
 
   // When tiles_num > thread_cnt. We need to nested for loops. Which means static attach works to one thread.
   //

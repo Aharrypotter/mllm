@@ -82,31 +82,33 @@ uint8_t QNNGraphBuildPass::run(const ir::node_ptr_t& op) {
   }
 
   // QNN Graph build and compile
-  for (auto& graph_ir : graphs_ir_to_be_compiled) { buildQnnGraph(graph_ir); }
+  for (auto& graph_ir : graphs_ir_to_be_compiled) {
+    if (!buildQnnGraph(graph_ir)) { return ir::PASS_RET_FAILURE; }
+  }
 
   return ir::PASS_RET_SUCCESS;
 }
 
-void QNNGraphBuildPass::buildQnnGraph(const ir::graph::SubGraphOp::ptr_t& sub_graph_op) {
+bool QNNGraphBuildPass::buildQnnGraph(const ir::graph::SubGraphOp::ptr_t& sub_graph_op) {
   auto& mllm_ctx = mllm::Context::instance();
   auto backend = mllm_ctx.getBackend(kQNN);
 
   if (!backend) {
     MLLM_ERROR("QNN backend not found in context");
-    return;
+    return false;
   }
 
   // Cast to QNN backend to access QNN-specific methods
   auto qnn_backend = std::dynamic_pointer_cast<QNNBackend>(backend);
   if (!qnn_backend) {
     MLLM_ERROR("Failed to cast backend to QNN backend");
-    return;
+    return false;
   }
 
   auto graph_region = sub_graph_op->getTopRegion();
   if (!graph_region) {
     MLLM_ERROR("SubGraphOp has no top region");
-    return;
+    return false;
   }
 
   std::string graph_name = sub_graph_op->getSymbolAttr()->str();
@@ -115,8 +117,15 @@ void QNNGraphBuildPass::buildQnnGraph(const ir::graph::SubGraphOp::ptr_t& sub_gr
   auto qnn_model = qnn_backend->createQnnGraph(graph_name);
   if (!qnn_model) {
     MLLM_ERROR("Failed to create QNN model for graph '{}'", graph_name);
-    return;
+    return false;
   }
+
+  // A loaded context already owns finalized graph tensors, nodes, and weights.
+  // Re-adding trace inputs would report duplicate tensors and, worse, can hide
+  // a partial rebuild behind a nominally successful pass. The trace is still
+  // needed to bind mllm execution ops to these graph names, but QNN graph
+  // construction must be skipped.
+  if (qnn_model->isGraphFinalized()) { return true; }
 
   // Add graph inputs first
   for (auto& input : sub_graph_op->inputs()) {
@@ -134,7 +143,7 @@ void QNNGraphBuildPass::buildQnnGraph(const ir::graph::SubGraphOp::ptr_t& sub_gr
         qnn_model->addTensor(input_tensor->name(), QNN_TENSOR_TYPE_APP_WRITE, input_tensor->tensor_, quantize_param);
     if (err != MODEL_NO_ERROR) {
       MLLM_ERROR("Failed to add input tensor {} to graph '{}'", input_tensor->name(), graph_name);
-      return;
+      return false;
     }
   }
 
@@ -158,7 +167,7 @@ void QNNGraphBuildPass::buildQnnGraph(const ir::graph::SubGraphOp::ptr_t& sub_gr
         auto pattern = patterns_[op_types];
         if (!pattern->addNode(graph_name, linalg_op, op_inputs, op_outputs)) {
           MLLM_ERROR("Failed to add node for op type: {} in graph '{}'", optype2Str(op_types), graph_name);
-          return;
+          return false;
         }
       } else {
         MLLM_WARN("No pattern registered for op type: {}", optype2Str(op_types));
@@ -173,8 +182,9 @@ void QNNGraphBuildPass::buildQnnGraph(const ir::graph::SubGraphOp::ptr_t& sub_gr
   // Finalize the QNN graph
   if (!qnn_backend->graphFinalize(graph_name)) {
     MLLM_ERROR("Failed to finalize QNN graph '{}'", graph_name);
-    return;
+    return false;
   }
+  return true;
 }
 
 }  // namespace mllm::qnn

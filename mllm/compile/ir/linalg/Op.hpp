@@ -36,6 +36,9 @@ class ViewOp;
 class SplitOp;
 class FlashAttention2Op;
 class GroupedQueryAttentionDecodeOp;
+class LinearShadowCorrectionOp;
+class PatternSparseAttentionOp;
+class SparseSoftmaxValueOp;
 class RepeatOp;
 class PermuteOp;
 class Conv1DOp;
@@ -199,6 +202,9 @@ LINALG_AOPS_DEFINE(SplitOp, SPLITOP);
 
 LINALG_AOPS_DEFINE(FlashAttention2Op, FLASHATTENTION2OP);
 LINALG_AOPS_DEFINE(GroupedQueryAttentionDecodeOp, GROUPEDQUERYATTENTIONDECODEOP);
+LINALG_AOPS_DEFINE(LinearShadowCorrectionOp, LINEARSHADOWCORRECTIONOP);
+LINALG_AOPS_DEFINE(PatternSparseAttentionOp, PATTERNSPARSEATTENTIONOP);
+LINALG_AOPS_DEFINE(SparseSoftmaxValueOp, SPARSESOFTMAXVALUEOP);
 LINALG_AOPS_DEFINE(RepeatOp, REPEATOP);
 LINALG_AOPS_DEFINE(PermuteOp, PERMUTEOP);
 

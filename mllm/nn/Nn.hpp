@@ -8,12 +8,15 @@
 #include "mllm/nn/Layer.hpp"       // IWYU pragma: export
 
 #include "mllm/nn/layers/Linear.hpp"          // IWYU pragma: export
+#include "mllm/nn/layers/LinearShadowCorrection.hpp"  // IWYU pragma: export
 #include "mllm/nn/layers/RMSNorm.hpp"         // IWYU pragma: export
 #include "mllm/nn/layers/SiLU.hpp"            // IWYU pragma: export
 #include "mllm/nn/layers/Sigmoid.hpp"         // IWYU pragma: export
 #include "mllm/nn/layers/Embedding.hpp"       // IWYU pragma: export
 #include "mllm/nn/layers/GELU.hpp"            // IWYU pragma: export
 #include "mllm/nn/layers/GroupedQueryAttentionDecode.hpp"  // IWYU pragma: export
+#include "mllm/nn/layers/PatternSparseAttention.hpp"  // IWYU pragma: export
+#include "mllm/nn/layers/SparseSoftmaxValue.hpp"       // IWYU pragma: export
 #include "mllm/nn/layers/QuickGELU.hpp"       // IWYU pragma: export
 #include "mllm/nn/layers/ReLU.hpp"            // IWYU pragma: export
 #include "mllm/nn/layers/LayerNorm.hpp"       // IWYU pragma: export

@@ -3,6 +3,7 @@
 
 #include "CustomLayers.hpp"
 #include <memory>
+#include "mllm/backends/qnn/QNNUtils.hpp"
 #include "mllm/core/DataTypes.hpp"
 #include "mllm/core/DeviceTypes.hpp"
 #include "mllm/mllm.hpp"
@@ -27,12 +28,14 @@ DequantizeAdd::DequantizeAdd(DataTypes dtype, int32_t out_channels)
 // -------------------- Custom QNN Ops --------------------
 namespace mllm::qnn {
 void DequantizeAddOp::load(const mllm::ParameterFile::ptr_t& ploader) {
-  std::string weight_name = getName();
+  std::string parameter_prefix = getName();
   // find the ".dequantize" suffix and replace it with ".bias"
-  auto pos = weight_name.find("dequantize");
-  if (pos != -1) { weight_name.erase(pos, 10); }
-  weight_name += "bias";
-
+  const auto pos = parameter_prefix.rfind("dequantize");
+  if (pos == std::string::npos || pos + 10 != parameter_prefix.size()) {
+    MLLM_ERROR_EXIT(1, "DequantizeAdd op name must end in dequantize: {}", getName());
+  }
+  parameter_prefix.erase(pos, 10);
+  const std::string weight_name = parameter_prefix + "bias";
   switch (ploader->version()) {
     case ModelFileVersion::kV1: {
       weight_ = ploader->pull(weight_name);
@@ -47,6 +50,7 @@ void DequantizeAddOp::load(const mllm::ParameterFile::ptr_t& ploader) {
     }
     default: NYI("Unsupported model file version")
   }
+
 }
 
 void DequantizeAddOp::trace(void* trace_context, const std::vector<mllm::Tensor>& inputs, std::vector<mllm::Tensor>& outputs) {

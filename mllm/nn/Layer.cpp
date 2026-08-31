@@ -12,23 +12,24 @@ void LayerImpl::load(const ParameterFile::ptr_t& ploader) { instanced_op_->load(
 
 void LayerImpl::to(DeviceTypes device_type) {
   auto& ctx = Context::instance();
+  auto backend = ctx.getBackend(device_type);
+  const bool migrate_weights = device_type != kCPU && backend->isWeightOnDevice();
+  auto temp_params_loader = ParameterFile::create();
 
-  if (device_type != kCPU && ctx.getBackend(device_type)->isWeightOnDevice()) {
-    auto temp_params_loader = ParameterFile::create();
-    if (instanced_op_) {
-      auto params = instanced_op_->getParams();
-      for (auto& param : *params) {
-        auto t = param.second;
-        if (t) { temp_params_loader->push(param.first, t.to(device_type)); }
-      }
+  if (migrate_weights && instanced_op_) {
+    auto params = instanced_op_->getParams();
+    for (auto& param : *params) {
+      auto t = param.second;
+      if (t) { temp_params_loader->push(param.first, t.to(device_type)); }
     }
-
-    instanced_op_ = nullptr;
-    instanced_op_ = ctx.getBackend(device_type)->createOp(op_type_, options_);
-    instanced_op_->setName(getAbsoluteName());
-
-    instanced_op_->load(temp_params_loader);
   }
+
+  // Backend selection and weight placement are independent. QNN keeps weights
+  // host-backed, but it still needs QNN-specific op instances for graph build.
+  instanced_op_ = backend->createOp(op_type_, options_);
+  instanced_op_->setName(getAbsoluteName());
+
+  if (migrate_weights) { instanced_op_->load(temp_params_loader); }
 
   device_type_ = device_type;
 }

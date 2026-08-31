@@ -21,3 +21,8 @@ target_include_directories(Mllm-Test-Engine-Service PRIVATE ${MLLM_INCLUDE_DIR})
 add_executable(Mllm-Test-Engine-RandomStates RandomStatesTest.cpp)
 target_link_libraries(Mllm-Test-Engine-RandomStates PRIVATE MllmRT MllmCPUBackend)
 target_include_directories(Mllm-Test-Engine-RandomStates PRIVATE ${MLLM_INCLUDE_DIR})
+
+add_executable(Mllm-Test-Engine-HpcThreadPool HpcThreadPoolTest.cpp)
+target_link_libraries(Mllm-Test-Engine-HpcThreadPool PRIVATE gtest_main MllmRT)
+target_include_directories(Mllm-Test-Engine-HpcThreadPool PRIVATE ${MLLM_INCLUDE_DIR})
+add_test(NAME HpcThreadPoolNonDivisibleStep COMMAND Mllm-Test-Engine-HpcThreadPool)
