@@ -9,6 +9,7 @@
 #include "mllm/backends/cpu/ops/AvgPool1dOp.hpp"
 #include "mllm/backends/cpu/ops/CastTypeOp.hpp"
 #include "mllm/backends/cpu/ops/CausalMaskOp.hpp"
+#include "mllm/backends/cpu/ops/CausalDepthwiseConv1DOp.hpp"
 #include "mllm/backends/cpu/ops/CloneOp.hpp"
 #include "mllm/backends/cpu/ops/CmpOp.hpp"
 #include "mllm/backends/cpu/ops/ConcatOp.hpp"
@@ -24,11 +25,12 @@
 #include "mllm/backends/cpu/ops/FlashAttn2WithSinkAndSwaOp.hpp"
 #include "mllm/backends/cpu/ops/GELUOp.hpp"
 #include "mllm/backends/cpu/ops/GatherOp.hpp"
-#include "mllm/backends/cpu/ops/GroupedQueryAttentionDecodeOp.hpp"
+#include "mllm/backends/cpu/ops/GroupedQueryAttentionOp.hpp"
 #include "mllm/backends/cpu/ops/InterpolateOp.hpp"
 #include "mllm/backends/cpu/ops/LayerNorm2DOp.hpp"
 #include "mllm/backends/cpu/ops/MaskedScatterOp.hpp"
 #include "mllm/backends/cpu/ops/PadOp.hpp"
+#include "mllm/backends/cpu/ops/ParallelLinearOp.hpp"
 #include "mllm/backends/cpu/ops/RadixAttnDiffDimOp.hpp"
 #include "mllm/backends/cpu/ops/RadixAttnOp.hpp"
 #include "mllm/backends/cpu/ops/RadixAttnWithSinkAndSwaDiffDimOp.hpp"
@@ -84,7 +86,8 @@ CPUBackend::CPUBackend() : Backend(kCPU, createCPUAllocator()) {
                CPUConv2DOpFactory, CPULayerNorm2DOpFactory, CPUInterpolateOpFactory, CPUPadOpFactory, CPUMaskedScatterOpFactory,
                CPUArgsortOpFactory, CPUCloneOpFactory, CPUAvgPool1dOpFactory, CPUFlashAttention2SwaSinkOpFactory,
                CPURadixAttnRelaxOpFactory, CPURadixAttnSwaSinkOpFactory, CPUEqualOpFactory, CPUWhereOpFactory,
-               CPUGatherOpFactory, CPUGroupedQueryAttentionDecodeOpFactory>();
+               CPUGatherOpFactory, CPUCausalDepthwiseConv1DOpFactory,
+               CPUGroupedQueryAttentionOpFactory, CPUParallelLinearOpFactory>();
 }
 
 CPUBackend::~CPUBackend() {

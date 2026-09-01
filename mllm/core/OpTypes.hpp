@@ -97,8 +97,14 @@ enum class OpTypes : int32_t {
 
   kSigmoid = 75,
 
-  // Phase-specific native KV-head attention.
-  kGroupedQueryAttentionDecode = 76,
+  // 76 is retired: the decode-only grouped-query attention operation became
+  // the DecodeNativeKV implementation of kGroupedQueryAttention. Do not reuse
+  // the value, so an older serialized graph can never alias a new operation.
+
+  // Reusable model primitives introduced by hybrid mobile decoders.
+  kCausalDepthwiseConv1D = 77,
+  kGroupedQueryAttention = 78,
+  kParallelLinear = 79,
 
   // Dynamic Op Start for user to register there own ops.
   kDynamicOp_Start = 4096,
@@ -184,7 +190,9 @@ inline std::string optype2Str(OpTypes type) {
     case OpTypes::kEqual: return "Equal";
     case OpTypes::kWhere: return "Where";
     case OpTypes::kSigmoid: return "Sigmoid";
-    case OpTypes::kGroupedQueryAttentionDecode: return "GroupedQueryAttentionDecode";
+    case OpTypes::kCausalDepthwiseConv1D: return "CausalDepthwiseConv1D";
+    case OpTypes::kGroupedQueryAttention: return "GroupedQueryAttention";
+    case OpTypes::kParallelLinear: return "ParallelLinear";
     case OpTypes::kDynamicOp_Start: return "DynamicOp_Start";
     case OpTypes::kOpType_End: return "OpType_End";
     default: return "Unknown";

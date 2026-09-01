@@ -93,6 +93,13 @@ class Layer {
     return {outs[0], outs[1], outs[2]};                                       \
   }
 
+#define MLLM_LAYER_ANY_INPUTS_ANY_OUTPUTS_FORWARD                             \
+  template<typename... Args>                                                  \
+  std::vector<Tensor> operator()(Args&&... args) {                            \
+    auto inputs = std::vector<Tensor>{std::forward<decltype(args)>(args)...}; \
+    return __main(inputs);                                                    \
+  }
+
 #define MLLM_LAYER_ENABLE_INPLACE_ATTRIBUTE(__CXX_CLASS_NAME__)                                                           \
   inline __CXX_CLASS_NAME__& inplace() {                                                                                  \
     auto& opts = const_cast<::mllm::aops::__CXX_CLASS_NAME__##OpOptions&>(                                                \

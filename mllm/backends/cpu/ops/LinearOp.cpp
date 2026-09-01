@@ -6,12 +6,9 @@
 #include <cstdio>
 #include <cstdlib>
 
-#if defined(__linux__)
-#include <sys/auxv.h>
-#endif
-
 #include "mllm/backends/cpu/ops/LinearOp.hpp"
 #include "mllm/backends/cpu/kernels/Kernels.hpp"
+#include "mllm/backends/cpu/kernels/common/linear/kai_w4a32_dispatch.hpp"
 #include "mllm/core/DataTypes.hpp"
 #include "mllm/core/aops/LinearOp.hpp"
 
@@ -32,19 +29,8 @@ bool environmentFlagEnabled(const char* name) {
   return value != nullptr && value[0] == '1' && value[1] == '\0';
 }
 
-bool cpuSupportsI8mm() {
-#if defined(__linux__) && defined(__aarch64__)
-  constexpr unsigned long kHwcap2I8mm = 1UL << 13;
-  static const bool supported = (getauxval(AT_HWCAP2) & kHwcap2I8mm) != 0;
-  return supported;
-#else
-  return false;
-#endif
-}
-
 KaiW4A32Tile selectKaiW4A32PrefillTile(int m) {
-  static const bool disabled = environmentFlagEnabled("MLLM_KAI_PREFILL_I8MM_DISABLE");
-  if (detail::shouldUseKaiW4A32I8mmPrefill(m, disabled, cpuSupportsI8mm())) { return kKaiW4A32I8mmTile; }
+  if (kai_w4a32::shouldUseI8mmPrefill(m)) { return kKaiW4A32I8mmTile; }
   return kKaiW4A32DotProdTile;
 }
 
@@ -61,7 +47,7 @@ void traceKaiW4A32PrefillTile(KaiW4A32Tile tile, int m, int k, int n, int thread
   if (tile == kKaiW4A32I8mmTile) {
     std::fprintf(stderr, "MLLM_KAI_PREFILL_I8MM_ACTIVATED m=%d k=%d n=%d threads=%d\n", m, k, n, threads);
   } else {
-    const char* reason = environmentFlagEnabled("MLLM_KAI_PREFILL_I8MM_DISABLE") ? "disabled" : "unsupported";
+    const char* reason = kai_w4a32::i8mmPrefillDisabled() ? "disabled" : "unsupported";
     std::fprintf(stderr, "MLLM_KAI_PREFILL_DOTPROD_FALLBACK reason=%s m=%d k=%d n=%d threads=%d\n", reason, m, k, n, threads);
   }
 }
@@ -71,6 +57,11 @@ void traceKaiW4A32PrefillTile(KaiW4A32Tile tile, int m, int k, int n, int thread
 }  // namespace
 
 CPULinearOp::CPULinearOp(const aops::LinearOpOptions& options) : LinearOp(options) {}
+
+int CPULinearOp::kaiW4A32ThreadCount(int m) const {
+  return kai_w4a32::threadCount(m, options_.getThreads(), options_.kai_w4a32_decode_thread_cap,
+                                options_.kai_w4a32_prefill_thread_cap);
+}
 
 Tensor CPULinearOp::acquireKaiWorkspace(int32_t workspace_size, int m) {
   if (m != 1) { return Tensor::empty({workspace_size}, kInt8, kCPU).alloc(); }
@@ -248,10 +239,11 @@ void CPULinearOp::forward(const std::vector<Tensor>& inputs, std::vector<Tensor>
       int32_t work_space_size = kai_helper.workspace_size(
           M, K, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp1x8_qsi4c32p4x8_1x4x32);
       auto workspace = acquireKaiWorkspace(work_space_size, M);
+      const int thread_count = kaiW4A32ThreadCount(M);
 
       kai_helper.matmul(o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(), weight_.ptr<mllm_byte_t>(), workspace.ptr<void>(), M, K,
                         N, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp1x8_qsi4c32p4x8_1x4x32,
-                        options_.getThreads());
+                        thread_count);
       return;
     }
     case aops::LinearImplTypes::kKaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_qai8dxp1x8_qsi4c32p8x8_1x8x32: {
@@ -262,7 +254,8 @@ void CPULinearOp::forward(const std::vector<Tensor>& inputs, std::vector<Tensor>
 
       KaiW4A32Helper kai_helper;
       const auto tile = selectKaiW4A32PrefillTile(M);
-      traceKaiW4A32PrefillTile(tile, M, K, N, options_.getThreads());
+      const int thread_count = kaiW4A32ThreadCount(M);
+      traceKaiW4A32PrefillTile(tile, M, K, N, thread_count);
 
       // FIXME:
       // Can be optimized for better performance.
@@ -270,7 +263,7 @@ void CPULinearOp::forward(const std::vector<Tensor>& inputs, std::vector<Tensor>
       auto workspace = acquireKaiWorkspace(work_space_size, M);
 
       kai_helper.matmul(o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(), weight_.ptr<mllm_byte_t>(), workspace.ptr<void>(), M, K,
-                        N, tile, options_.getThreads());
+                        N, tile, thread_count);
       return;
     }
     case aops::LinearImplTypes::kKaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_qai8dxp4x8_qsi4c32p4x8_8x4x32: {
@@ -287,10 +280,11 @@ void CPULinearOp::forward(const std::vector<Tensor>& inputs, std::vector<Tensor>
       int32_t work_space_size = kai_helper.workspace_size(
           M, K, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp4x8_qsi4c32p4x8_8x4x32);
       auto workspace = acquireKaiWorkspace(work_space_size, M);
+      const int thread_count = kaiW4A32ThreadCount(M);
 
       kai_helper.matmul(o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(), weight_.ptr<mllm_byte_t>(), workspace.ptr<void>(), M, K,
                         N, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp4x8_qsi4c32p4x8_8x4x32,
-                        options_.getThreads());
+                        thread_count);
       return;
     }
     case aops::LinearImplTypes::kKaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_qai8dxp4x8_qsi4c32p4x8_16x4x32: {
@@ -305,10 +299,11 @@ void CPULinearOp::forward(const std::vector<Tensor>& inputs, std::vector<Tensor>
       int32_t work_space_size = kai_helper.workspace_size(
           M, K, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp4x8_qsi4c32p4x8_16x4x32);
       auto workspace = acquireKaiWorkspace(work_space_size, M);
+      const int thread_count = kaiW4A32ThreadCount(M);
 
       kai_helper.matmul(o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(), weight_.ptr<mllm_byte_t>(), workspace.ptr<void>(), M, K,
                         N, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp4x8_qsi4c32p4x8_16x4x32,
-                        options_.getThreads());
+                        thread_count);
       return;
     }
     case aops::LinearImplTypes::kKaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_qai8dxp4x8_qsi4c32p8x8_4x8x32: {
@@ -325,10 +320,11 @@ void CPULinearOp::forward(const std::vector<Tensor>& inputs, std::vector<Tensor>
       int32_t work_space_size = kai_helper.workspace_size(
           M, K, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp4x8_qsi4c32p8x8_4x8x32);
       auto workspace = acquireKaiWorkspace(work_space_size, M);
+      const int thread_count = kaiW4A32ThreadCount(M);
 
       kai_helper.matmul(o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(), weight_.ptr<mllm_byte_t>(), workspace.ptr<void>(), M, K,
                         N, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp4x8_qsi4c32p8x8_4x8x32,
-                        options_.getThreads());
+                        thread_count);
       return;
     }
     case aops::LinearImplTypes::kKaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_qai8dxp1x4_qsi4c32p4x4_1x4: {
@@ -343,10 +339,11 @@ void CPULinearOp::forward(const std::vector<Tensor>& inputs, std::vector<Tensor>
       int32_t work_space_size = kai_helper.workspace_size(
           M, K, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp1x4_qsi4c32p4x4_1x4);
       auto workspace = acquireKaiWorkspace(work_space_size, M);
+      const int thread_count = kaiW4A32ThreadCount(M);
 
       kai_helper.matmul(o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(), weight_.ptr<mllm_byte_t>(), workspace.ptr<void>(), M, K,
                         N, ::mllm::cpu::arm::KaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk::Tiles::qai8dxp1x4_qsi4c32p4x4_1x4,
-                        options_.getThreads());
+                        thread_count);
       return;
     }
 #endif

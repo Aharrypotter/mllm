@@ -14,4 +14,12 @@ add_executable(Mllm-Test-Nn-GroupedQueryAttention GroupedQueryAttentionTest.cpp)
 target_link_libraries(Mllm-Test-Nn-GroupedQueryAttention PRIVATE gtest_main MllmRT MllmCPUBackend)
 target_include_directories(Mllm-Test-Nn-GroupedQueryAttention PRIVATE ${MLLM_INCLUDE_DIR})
 
+add_executable(Mllm-Test-Nn-CausalDepthwiseConv1D CausalDepthwiseConv1DTest.cpp)
+target_link_libraries(Mllm-Test-Nn-CausalDepthwiseConv1D PRIVATE gtest_main MllmRT MllmCPUBackend)
+target_include_directories(Mllm-Test-Nn-CausalDepthwiseConv1D PRIVATE ${MLLM_INCLUDE_DIR})
+
+add_executable(Mllm-Test-Nn-ParallelLinear ParallelLinearTest.cpp)
+target_link_libraries(Mllm-Test-Nn-ParallelLinear PRIVATE gtest_main MllmRT MllmCPUBackend)
+target_include_directories(Mllm-Test-Nn-ParallelLinear PRIVATE ${MLLM_INCLUDE_DIR})
+
 include(GoogleTest)

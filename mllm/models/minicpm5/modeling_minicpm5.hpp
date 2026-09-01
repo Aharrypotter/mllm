@@ -10,6 +10,7 @@
 
 #include "mllm/mllm.hpp"
 #include "mllm/models/ARGeneration.hpp"
+#include "mllm/models/common/rope_tables.hpp"
 #include "mllm/models/minicpm5/configuration_minicpm5.hpp"
 #include "mllm/nn/Functional.hpp"
 #include "mllm/nn/Module.hpp"
@@ -20,39 +21,10 @@
 
 namespace mllm::models::minicpm5 {
 
-inline auto makeMiniCPM5RoPEInvFreq(int32_t output_dim, float rope_theta) -> Tensor {
-  auto inv_freq = Tensor::empty({output_dim / 2}, kFloat32, kCPU).alloc();
-  for (int32_t dim = 0; dim < output_dim / 2; ++dim) {
-    inv_freq.ptr<float>()[dim] = 1.0F / std::pow(rope_theta, 2.0F * static_cast<float>(dim) / output_dim);
-  }
-  return inv_freq;
-}
-
-inline auto makeMiniCPM5RotaryPosEmbedding(const Tensor& position_ids, const Tensor& inv_freq) -> std::pair<Tensor, Tensor> {
-  const int32_t batch = position_ids.shape()[0];
-  const int32_t sequence = position_ids.shape()[1];
-  const int32_t half_dim = inv_freq.shape()[0];
-  const int32_t dim = half_dim * 2;
-  auto sin_embedding = Tensor::empty({batch, sequence, dim}, kFloat32, kCPU).alloc();
-  auto cos_embedding = Tensor::empty({batch, sequence, dim}, kFloat32, kCPU).alloc();
-
-  for (int32_t batch_index = 0; batch_index < batch; ++batch_index) {
-    for (int32_t sequence_index = 0; sequence_index < sequence; ++sequence_index) {
-      const auto position = position_ids.ptr<int64_t>()[batch_index * sequence + sequence_index];
-      for (int32_t index = 0; index < half_dim; ++index) {
-        const float frequency = static_cast<float>(position) * inv_freq.ptr<float>()[index];
-        const float sine = std::sin(frequency);
-        const float cosine = std::cos(frequency);
-        const auto offset = (batch_index * sequence + sequence_index) * dim + index;
-        sin_embedding.ptr<float>()[offset] = sine;
-        sin_embedding.ptr<float>()[offset + half_dim] = sine;
-        cos_embedding.ptr<float>()[offset] = cosine;
-        cos_embedding.ptr<float>()[offset + half_dim] = cosine;
-      }
-    }
-  }
-  return {sin_embedding, cos_embedding};
-}
+// Rotation itself remains the registered nn::RoPE operation; only the
+// immutable analytical tables are materialized here.
+using common::makeRoPEInvFreq;
+using common::makeRotaryPosEmbedding;
 
 class MiniCPM5MLP final : public nn::Module {
  public:
@@ -91,7 +63,7 @@ class MiniCPM5Attention final : public nn::Module {
     o_proj_ = reg<nn::Linear>("o_proj", query_heads_ * head_dim_, hidden_size_, config.attention_bias, config.linear_impl_type);
     q_rope_ = reg<nn::RoPE>("q_rope", config.rope_theta, config.max_position_embeddings, config.head_dim);
     k_rope_ = reg<nn::RoPE>("k_rope", config.rope_theta, config.max_position_embeddings, config.head_dim);
-    gqa_decode_ = reg<nn::GroupedQueryAttentionDecode>("gqa_decode");
+    gqa_decode_ = reg<nn::GroupedQueryAttention>("gqa_decode", aops::GroupedQueryAttentionImplementation::kDecodeNativeKV);
   }
 
   std::vector<Tensor> forward(const std::vector<Tensor>& inputs, const std::vector<AnyValue>& args) override {
@@ -123,7 +95,7 @@ class MiniCPM5Attention final : public nn::Module {
   nn::Linear o_proj_;
   nn::RoPE q_rope_;
   nn::RoPE k_rope_;
-  nn::GroupedQueryAttentionDecode gqa_decode_;
+  nn::GroupedQueryAttention gqa_decode_;
   int32_t hidden_size_ = 0;
   int32_t head_dim_ = 0;
   int32_t query_heads_ = 0;
@@ -188,7 +160,7 @@ class MiniCPM5ForCausalLM final : public ARGeneration, public nn::Module {
     max_length_ = config.max_cache_length;
     model_ = reg<MiniCPM5Text>("model", config);
     lm_head_ = reg<nn::Linear>("lm_head", config.hidden_size, config.vocab_size, false, config.linear_impl_type);
-    registerBuffer("inv_freq", makeMiniCPM5RoPEInvFreq(config.head_dim, config.rope_theta));
+    registerBuffer("inv_freq", makeRoPEInvFreq(config.head_dim, config.rope_theta));
   }
 
   ARGenerationOutputPast forward(const ARGenerationOutputPast& input, const ARGenerationArgs& args) override {
@@ -211,7 +183,7 @@ class MiniCPM5ForCausalLM final : public ARGeneration, public nn::Module {
 
     auto position_ids = Tensor::empty({1, shape[1]}, kInt64, kCPU).alloc();
     for (int32_t index = 0; index < shape[1]; ++index) { position_ids.ptr<int64_t>()[index] = cached_tokens + index; }
-    auto [sine, cosine] = makeMiniCPM5RotaryPosEmbedding(position_ids, getBuffer("inv_freq"));
+    auto [sine, cosine] = makeRotaryPosEmbedding(position_ids, getBuffer("inv_freq"));
     auto hidden = model_(sequence, sine, cosine, AnyValue(&kv_cache_))[0];
     hidden = hidden[{kAll, {hidden.shape()[1] - 1}, kAll}];
 

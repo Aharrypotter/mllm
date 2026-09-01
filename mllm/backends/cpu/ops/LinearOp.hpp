@@ -7,14 +7,6 @@
 
 namespace mllm::cpu {
 
-namespace detail {
-
-constexpr bool shouldUseKaiW4A32I8mmPrefill(int m, bool disabled, bool cpu_supports_i8mm) {
-  return m >= 4 && !disabled && cpu_supports_i8mm;
-}
-
-}  // namespace detail
-
 class CPULinearOp final : public aops::LinearOp {
  public:
   explicit CPULinearOp(const aops::LinearOpOptions& options);
@@ -27,6 +19,8 @@ class CPULinearOp final : public aops::LinearOp {
 
  private:
   Tensor acquireKaiWorkspace(int32_t workspace_size, int m);
+
+  [[nodiscard]] int kaiW4A32ThreadCount(int m) const;
 
   Tensor kai_decode_workspace_;
 };
