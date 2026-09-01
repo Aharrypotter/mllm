@@ -25,6 +25,7 @@
 #include "mllm/backends/cpu/ops/FlashAttn2WithSinkAndSwaOp.hpp"
 #include "mllm/backends/cpu/ops/GELUOp.hpp"
 #include "mllm/backends/cpu/ops/GatherOp.hpp"
+#include "mllm/backends/cpu/ops/GatedDeltaRuleOp.hpp"
 #include "mllm/backends/cpu/ops/GroupedQueryAttentionOp.hpp"
 #include "mllm/backends/cpu/ops/InterpolateOp.hpp"
 #include "mllm/backends/cpu/ops/LayerNorm2DOp.hpp"
@@ -86,7 +87,7 @@ CPUBackend::CPUBackend() : Backend(kCPU, createCPUAllocator()) {
                CPUConv2DOpFactory, CPULayerNorm2DOpFactory, CPUInterpolateOpFactory, CPUPadOpFactory, CPUMaskedScatterOpFactory,
                CPUArgsortOpFactory, CPUCloneOpFactory, CPUAvgPool1dOpFactory, CPUFlashAttention2SwaSinkOpFactory,
                CPURadixAttnRelaxOpFactory, CPURadixAttnSwaSinkOpFactory, CPUEqualOpFactory, CPUWhereOpFactory,
-               CPUGatherOpFactory, CPUCausalDepthwiseConv1DOpFactory,
+               CPUGatherOpFactory, CPUCausalDepthwiseConv1DOpFactory, CPUGatedDeltaRuleOpFactory,
                CPUGroupedQueryAttentionOpFactory, CPUParallelLinearOpFactory>();
 }
 

@@ -40,6 +40,7 @@ nlohmann::json dumpFlashAttention2OpIROptions(const ir::linalg::LinalgIROp::ptr_
 nlohmann::json dumpCausalDepthwiseConv1DOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op);
 nlohmann::json dumpGroupedQueryAttentionOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op);
 nlohmann::json dumpParallelLinearOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op);
+nlohmann::json dumpGatedDeltaRuleOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op);
 nlohmann::json dumpRepeatOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op);
 nlohmann::json dumpPermuteOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op);
 nlohmann::json dumpConv1DOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op);

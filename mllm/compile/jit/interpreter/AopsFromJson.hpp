@@ -38,6 +38,7 @@ BaseOp::ptr_t __groupedQueryAttentionDecodeFromJson(const nlohmann::json& json);
 BaseOp::ptr_t __causalDepthwiseConv1DFromJson(const nlohmann::json& json);
 BaseOp::ptr_t __groupedQueryAttentionFromJson(const nlohmann::json& json);
 BaseOp::ptr_t __parallelLinearFromJson(const nlohmann::json& json);
+BaseOp::ptr_t __gatedDeltaRuleFromJson(const nlohmann::json& json);
 BaseOp::ptr_t __repeatFromJson(const nlohmann::json& json);
 BaseOp::ptr_t __permuteFromJson(const nlohmann::json& json);
 BaseOp::ptr_t __conv2dFromJson(const nlohmann::json& json);

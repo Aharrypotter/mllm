@@ -44,6 +44,7 @@ enum NodeKind : uint32_t {
   RK_Op_LinalgIROp_CausalDepthwiseConv1DOp,
   RK_Op_LinalgIROp_GroupedQueryAttentionOp,
   RK_Op_LinalgIROp_ParallelLinearOp,
+  RK_Op_LinalgIROp_GatedDeltaRuleOp,
   RK_Op_LinalgIROp_RepeatOp,
   RK_Op_LinalgIROp_PermuteOp,
   RK_Op_LinalgIROp_Conv1DOp,
