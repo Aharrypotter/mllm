@@ -20,7 +20,6 @@
 #include "mllm/models/qwen3_5/configuration_qwen3_5.hpp"
 #include "mllm/models/qwen3_5/modeling_qwen3_5_vision.hpp"
 #include "mllm/models/qwen3_5/multimodal_qwen3_5.hpp"
-#include "mllm/backends/cpu/kernels/common/gdn/gated_delta_net.hpp"
 #include "mllm/utils/Enumerate.hpp"
 #include "mllm/models/ARGeneration.hpp"
 
@@ -263,8 +262,9 @@ class Qwen3_5GDNLayer final : public nn::Module {
   nn::Linear in_proj_a_;    // hidden → num_v_heads (decay gate)
   nn::Linear in_proj_b_;    // hidden → num_v_heads (beta gate)
 
-  // Causal Conv1D for sequence mixing
-  nn::Conv1D conv1d_;
+  // Stateful sequence primitives and their checkpoint-owned parameters.
+  nn::CausalDepthwiseConv1D causal_conv_;
+  nn::GatedDeltaRule gated_delta_rule_;
 
   // Learnable parameters for gating
   nn::Param A_log_;    // [num_v_heads]
@@ -310,15 +310,15 @@ class Qwen3_5GDNLayer final : public nn::Module {
     in_proj_a_ = reg<nn::Linear>("in_proj_a", hidden_size_, num_v_heads_, false, cfg.linear_impl_type);
     in_proj_b_ = reg<nn::Linear>("in_proj_b", hidden_size_, num_v_heads_, false, cfg.linear_impl_type);
 
-    // Causal Conv1D: groups = channels (depthwise), no bias, padding = kernel-1 for causal
     int conv_channels = key_dim_ * 2 + value_dim_;
-    conv1d_ = reg<nn::Conv1D>("conv1d", conv_channels, conv_channels, conv_kernel_size_,
-                              /*stride=*/1, /*padding=*/conv_kernel_size_ - 1, /*dilation=*/1,
-                              /*groups=*/conv_channels, /*bias=*/false);
+    causal_conv_ = reg<nn::CausalDepthwiseConv1D>(
+        "conv1d", conv_channels, conv_kernel_size_, /*bias=*/false, /*state_inplace=*/true,
+        aops::CausalDepthwiseConv1DAccumulationOrder::kCurrentFirst);
+    gated_delta_rule_ = reg<nn::GatedDeltaRule>("gated_delta_rule", /*state_inplace=*/true);
 
     // Learnable gating parameters (loaded from weight file)
-    A_log_ = reg<nn::Param>("A_log", getModuleName() + ".A_log");
-    dt_bias_ = reg<nn::Param>("dt_bias", getModuleName() + ".dt_bias");
+    A_log_ = reg<nn::Param>("A_log", getModuleName() + ".A_log", Tensor::shape_t{num_v_heads_});
+    dt_bias_ = reg<nn::Param>("dt_bias", getModuleName() + ".dt_bias", Tensor::shape_t{num_v_heads_});
 
     // Gated RMSNorm — standard (NOT GemmaRMSNorm, no add_unit_offset)
     norm_ = reg<nn::RMSNorm>("norm", cfg.rms_norm_eps, /*add_unit_offset=*/false);
@@ -342,7 +342,6 @@ class Qwen3_5GDNLayer final : public nn::Module {
     int B = x.shape()[0];
     int S = x.shape()[1];
     int conv_dim = key_dim_ * 2 + value_dim_;
-    int K = conv_kernel_size_;
 
     // Lazy init recurrent + conv state. A batch-size change starts a new
     // independent sequence set and therefore cannot reuse the old states.
@@ -358,17 +357,15 @@ class Qwen3_5GDNLayer final : public nn::Module {
     // intentionally stay in float32. Mobile quantized Linear implementations
     // dequantize to float32 before this numerically sensitive recurrence.
     auto mixed_qkv_pre = mixed_qkv.contiguous();
-    auto conv_weight = conv1d_.weight();
-    auto a_log = A_log_.weight();
-    auto dt_bias = dt_bias_.weight();
-    if (mixed_qkv_pre.dtype() != kFloat32 || conv_weight.dtype() != kFloat32 || a_proj.dtype() != kFloat32
-        || b_proj.dtype() != kFloat32 || a_log.dtype() != kFloat32 || dt_bias.dtype() != kFloat32) {
+    auto a_log = A_log_();
+    auto dt_bias = dt_bias_();
+    if (mixed_qkv_pre.dtype() != kFloat32 || a_proj.dtype() != kFloat32 || b_proj.dtype() != kFloat32
+        || a_log.dtype() != kFloat32 || dt_bias.dtype() != kFloat32) {
       throw std::invalid_argument("Qwen3.5 GDN currently requires float32 activations and recurrent parameters");
     }
 
-    auto conv_out = Tensor::empty({B, S, conv_dim}, kFloat32, kCPU).alloc();
-    ::mllm::cpu::gdn::depthwiseCausalConvF32(mixed_qkv_pre.ptr<float>(), conv_weight.ptr<float>(), conv_state_.ptr<float>(),
-                                             conv_out.ptr<float>(), B, S, conv_dim, K);
+    auto [conv_out, updated_conv_state] = causal_conv_(mixed_qkv_pre, conv_state_);
+    conv_state_ = updated_conv_state;
 
     // Qwen3.5 applies SiLU to the depthwise-convolution result before
     // splitting it into q, k and v.
@@ -383,11 +380,8 @@ class Qwen3_5GDNLayer final : public nn::Module {
     a_proj = a_proj.contiguous();
     b_proj = b_proj.contiguous();
 
-    auto output = Tensor::empty({B, S, num_v_heads_, head_v_dim_}, kFloat32, kCPU).alloc();
-    ::mllm::cpu::gdn::gatedDeltaRuleF32(q.ptr<float>(), k.ptr<float>(), v.ptr<float>(), a_proj.ptr<float>(),
-                                        b_proj.ptr<float>(), a_log.ptr<float>(), dt_bias.ptr<float>(),
-                                        recurrent_state_.ptr<float>(), output.ptr<float>(), B, S, num_k_heads_, num_v_heads_,
-                                        head_k_dim_, head_v_dim_);
+    auto [output, updated_recurrent_state] = gated_delta_rule_(q, k, v, a_proj, b_proj, a_log, dt_bias, recurrent_state_);
+    recurrent_state_ = updated_recurrent_state;
 
     // [B, S, num_v_heads, head_v_dim] -> [B, S, value_dim]
     output = output.view({B, S, value_dim_});

@@ -25,6 +25,7 @@
 #include "mllm/core/aops/CausalDepthwiseConv1DOp.hpp"
 #include "mllm/core/aops/GroupedQueryAttentionOp.hpp"
 #include "mllm/core/aops/ParallelLinearOp.hpp"
+#include "mllm/core/aops/GatedDeltaRuleOp.hpp"
 #include "mllm/core/aops/RepeatOp.hpp"
 #include "mllm/core/aops/PermuteOp.hpp"
 #include "mllm/core/aops/GELUOp.hpp"
@@ -114,6 +115,8 @@ BaseOp::ptr_t aopsFromJson(const nlohmann::json& json) {
       return __groupedQueryAttentionFromJson(json);
     } else if (op_type == "ParallelLinear") {
       return __parallelLinearFromJson(json);
+    } else if (op_type == "GatedDeltaRule") {
+      return __gatedDeltaRuleFromJson(json);
     } else if (op_type == "Repeat") {
       return __repeatFromJson(json);
     } else if (op_type == "Permute") {
@@ -675,6 +678,16 @@ BaseOp::ptr_t __parallelLinearFromJson(const nlohmann::json& json) {
   DeviceTypes backend = DeviceTypes::kCPU;
   if (json.contains("backend")) { backend = str2DeviceType(json["backend"]); }
   return Context::instance().getBackend(backend)->createOp(OpTypes::kParallelLinear, options);
+}
+
+BaseOp::ptr_t __gatedDeltaRuleFromJson(const nlohmann::json& json) {
+  aops::GatedDeltaRuleOpOptions options;
+  if (json.contains("op_options") && json["op_options"].contains("state_inplace")) {
+    options.state_inplace = json["op_options"]["state_inplace"];
+  }
+  DeviceTypes backend = DeviceTypes::kCPU;
+  if (json.contains("backend")) { backend = str2DeviceType(json["backend"]); }
+  return Context::instance().getBackend(backend)->createOp(OpTypes::kGatedDeltaRule, options);
 }
 
 BaseOp::ptr_t __repeatFromJson(const nlohmann::json& json) {

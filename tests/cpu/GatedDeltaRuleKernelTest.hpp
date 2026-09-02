@@ -1,6 +1,8 @@
 // Copyright (c) MLLM Team.
 // Licensed under the MIT License.
 
+#pragma once
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -9,19 +11,15 @@
 
 #include "mllm/backends/cpu/kernels/common/gdn/gated_delta_net.hpp"
 #include "mllm/mllm.hpp"
+#include "KernelTestHelper.hpp"
 
-namespace {
+namespace gated_delta_rule_kernel_test {
 
-using mllm::cpu::gdn::depthwiseCausalConvF32;
 using mllm::cpu::gdn::gatedDeltaRuleF32;
 
 class ScopedCpuOpThreads {
  public:
   explicit ScopedCpuOpThreads(int32_t thread_count) : original_thread_count_(mllm::Context::instance().getCpuOpThreads()) {
-    // initializeContext() registers the CPU backend; SymbolTable::reg aborts on
-    // a duplicate key, so call it exactly once (the tests have no fixture init).
-    static const bool kContextInitialized = [] { mllm::initializeContext(); return true; }();
-    (void)kContextInitialized;
     mllm::Context::instance().setCpuOpThreads(thread_count);
   }
 
@@ -31,38 +29,17 @@ class ScopedCpuOpThreads {
   int32_t original_thread_count_;
 };
 
-TEST(Qwen35GDNTest, CausalConvChunkingMatchesSinglePrefill) {
-  constexpr int kBatch = 1;
-  constexpr int kSequence = 4;
-  constexpr int kChannels = 2;
-  constexpr int kKernel = 3;
+struct Geometry {
+  int batch;
+  int sequence;
+  int key_heads;
+  int value_heads;
+  int key_dim;
+  int value_dim;
+  int thread_count;
+};
 
-  const std::array<float, kBatch * kSequence * kChannels> input = {
-      1.0F, 10.0F, 2.0F, 20.0F, 3.0F, 30.0F, 4.0F, 40.0F,
-  };
-  const std::array<float, kChannels * kKernel> weight = {
-      0.25F, 0.5F, 1.0F, -0.5F, 0.25F, 2.0F,
-  };
-  std::array<float, kBatch * kChannels*(kKernel - 1)> full_state = {};
-  std::array<float, kBatch * kChannels*(kKernel - 1)> chunked_state = {};
-  std::array<float, input.size()> full_output = {};
-  std::array<float, input.size()> chunked_output = {};
-
-  depthwiseCausalConvF32(input.data(), weight.data(), full_state.data(), full_output.data(), kBatch, kSequence, kChannels,
-                         kKernel);
-  depthwiseCausalConvF32(input.data(), weight.data(), chunked_state.data(), chunked_output.data(), kBatch,
-                         /*sequence_length=*/1, kChannels, kKernel);
-  depthwiseCausalConvF32(input.data() + kChannels, weight.data(), chunked_state.data(), chunked_output.data() + kChannels,
-                         kBatch, kSequence - 1, kChannels, kKernel);
-
-  EXPECT_EQ(full_output, chunked_output);
-  EXPECT_EQ(full_state, chunked_state);
-  EXPECT_FLOAT_EQ(full_output[0], 1.0F);
-  EXPECT_FLOAT_EQ(full_output[2], 2.5F);
-  EXPECT_FLOAT_EQ(full_output[6], 6.0F);
-}
-
-TEST(Qwen35GDNTest, DeltaRuleChunkingMatchesSinglePrefill) {
+inline void testChunkingMatchesSinglePrefill() {
   constexpr int kBatch = 1;
   constexpr int kSequence = 3;
   constexpr int kKeyHeads = 1;
@@ -115,7 +92,7 @@ TEST(Qwen35GDNTest, DeltaRuleChunkingMatchesSinglePrefill) {
   }
 }
 
-TEST(Qwen35GDNTest, RepeatedKeyHeadsMatchExplicitExpansion) {
+inline void testGroupedKeyHeadsMatchExplicitExpansion() {
   constexpr int kBatch = 1;
   constexpr int kSequence = 3;
   constexpr int kKeyHeads = 2;
@@ -182,7 +159,7 @@ TEST(Qwen35GDNTest, RepeatedKeyHeadsMatchExplicitExpansion) {
   }
 }
 
-TEST(Qwen35GDNTest, RejectsIncompatibleHeadCounts) {
+inline void testRejectsIncompatibleHeadCounts() {
   float scalar = 0.0F;
   EXPECT_THROW(gatedDeltaRuleF32(&scalar, &scalar, &scalar, &scalar, &scalar, &scalar, &scalar, &scalar, &scalar,
                                  /*batch_size=*/1, /*sequence_length=*/1,
@@ -191,7 +168,7 @@ TEST(Qwen35GDNTest, RejectsIncompatibleHeadCounts) {
                std::invalid_argument);
 }
 
-TEST(Qwen35GDNTest, MatchesOfficialL2NormalizationEpsilonPlacement) {
+inline void testMatchesFrozenL2NormalizationEpsilonPlacement() {
   const std::array<float, 2> q = {1.0e-4F, 0.0F};
   const std::array<float, 2> k = {1.0e-4F, 0.0F};
   const std::array<float, 1> v = {1.0F};
@@ -206,25 +183,20 @@ TEST(Qwen35GDNTest, MatchesOfficialL2NormalizationEpsilonPlacement) {
                     /*batch_size=*/1, /*sequence_length=*/1, /*num_key_heads=*/1,
                     /*num_value_heads=*/1, /*key_head_dim=*/2, /*value_head_dim=*/1);
 
-  // Qwen3.5/FLA normalizes with rsqrt(sum(x^2) + 1e-6), then applies
+  // The frozen operation normalizes with rsqrt(sum(x^2) + 1e-6), then applies
   // 1/sqrt(key_head_dim) to q. Placing epsilon outside sqrt changes this
   // tiny-vector result by two orders of magnitude.
   EXPECT_NEAR(output[0], 0.0035005286F, 1.0e-8F);
 }
 
-TEST(Qwen35GDNTest, ParallelBatchValueHeadsMatchSerialBitwise) {
-  constexpr int kBatch = 2;
-  constexpr int kSequence = 4;
-  // Qwen3.5 4B/9B GDN geometry: each normalized key head is shared by
-  // two independently scheduled value-head recurrence tasks.
-  constexpr int kKeyHeads = 16;
-  constexpr int kValueHeads = 32;
-  constexpr int kKeyDim = 128;
-  constexpr int kValueDim = 128;
-  // Exercises the parallel lane partition up to the 8-lane cap
-  // (kMaxParallelGDNLanes); tasks are disjoint so output must be bitwise
-  // identical regardless of how many lanes the scheduler picks.
-  constexpr int kThreadCount = 8;
+inline void testParallelBatchValueHeadsMatchSerialBitwise(const Geometry& geometry) {
+  const int kBatch = geometry.batch;
+  const int kSequence = geometry.sequence;
+  const int kKeyHeads = geometry.key_heads;
+  const int kValueHeads = geometry.value_heads;
+  const int kKeyDim = geometry.key_dim;
+  const int kValueDim = geometry.value_dim;
+  const int kThreadCount = geometry.thread_count;
 
   std::vector<float> q(kBatch * kSequence * kKeyHeads * kKeyDim);
   std::vector<float> k(q.size());
@@ -272,18 +244,16 @@ TEST(Qwen35GDNTest, ParallelBatchValueHeadsMatchSerialBitwise) {
   }
 }
 
-// 4B real geometry (B=1, S=69, 16 key heads, 32 value heads, 128 dims) at the
-// 8-lane cap — exercises the full task fan-out (32 tasks) that the small
-// geometry above does not. Guards against the device crash observed on
-// OnePlus with the 8-lane product build.
-TEST(Qwen35GDNTest, FourBGeometry8LaneDoesNotCrash) {
-  constexpr int kBatch = 1;
-  constexpr int kSequence = 69;
-  constexpr int kKeyHeads = 16;
-  constexpr int kValueHeads = 32;
-  constexpr int kKeyDim = 128;
-  constexpr int kValueDim = 128;
-  constexpr int kThreadCount = 8;
+// Full production geometry at the 8-lane cap exercises the 32-task fan-out
+// that the small geometry above does not.
+inline void testProductionGroupedHeadGeometryIsBitwiseStable(const Geometry& geometry, int repeats) {
+  const int kBatch = geometry.batch;
+  const int kSequence = geometry.sequence;
+  const int kKeyHeads = geometry.key_heads;
+  const int kValueHeads = geometry.value_heads;
+  const int kKeyDim = geometry.key_dim;
+  const int kValueDim = geometry.value_dim;
+  const int kThreadCount = geometry.thread_count;
 
   std::vector<float> q(kBatch * kSequence * kKeyHeads * kKeyDim);
   std::vector<float> k(q.size());
@@ -302,7 +272,10 @@ TEST(Qwen35GDNTest, FourBGeometry8LaneDoesNotCrash) {
     a[i] = 0.001F * static_cast<float>(static_cast<int>(i % 3));
     b[i] = 0.001F * static_cast<float>(static_cast<int>(i % 9));
   }
-  for (int i = 0; i < kValueHeads; ++i) { a_log[i] = -1.0F; dt_bias[i] = 0.0F; }
+  for (int i = 0; i < kValueHeads; ++i) {
+    a_log[i] = -1.0F;
+    dt_bias[i] = 0.0F;
+  }
 
   std::vector<float> state(kBatch * kValueHeads * kValueDim * kKeyDim, 0.0F);
   std::vector<float> output(v.size());
@@ -314,18 +287,14 @@ TEST(Qwen35GDNTest, FourBGeometry8LaneDoesNotCrash) {
                     ref_output.data(), kBatch, kSequence, kKeyHeads, kValueHeads, kKeyDim, kValueDim,
                     /*thread_count=*/1);
   const ScopedCpuOpThreads scoped_threads(kThreadCount);
-  gatedDeltaRuleF32(q.data(), k.data(), v.data(), a.data(), b.data(), a_log.data(), dt_bias.data(), state.data(),
-                    output.data(), kBatch, kSequence, kKeyHeads, kValueHeads, kKeyDim, kValueDim, kThreadCount);
+  gatedDeltaRuleF32(q.data(), k.data(), v.data(), a.data(), b.data(), a_log.data(), dt_bias.data(), state.data(), output.data(),
+                    kBatch, kSequence, kKeyHeads, kValueHeads, kKeyDim, kValueDim, kThreadCount);
 
-  for (std::size_t i = 0; i < output.size(); ++i) {
-    ASSERT_EQ(ref_output[i], output[i]) << "output index " << i;
-  }
-  for (std::size_t i = 0; i < state.size(); ++i) {
-    ASSERT_EQ(ref_state[i], state[i]) << "state index " << i;
-  }
+  for (std::size_t i = 0; i < output.size(); ++i) { ASSERT_EQ(ref_output[i], output[i]) << "output index " << i; }
+  for (std::size_t i = 0; i < state.size(); ++i) { ASSERT_EQ(ref_state[i], state[i]) << "state index " << i; }
 
-  // Repeat the full 4B GDN pass 24 times (one per layer) to mimic the real
-  // model's layer loop, which interleaves the recurrence with other parallel
+  // Repeat the full recurrence 24 times to mimic a deep model layer loop,
+  // which interleaves the recurrence with other parallel
   // ops on the shared thread pool. Context init is now once-only (see
   // ScopedCpuOpThreads), so this exercises multi-call thread-pool reuse.
   // Run the recurrence 24 times on a FRESH copy of the initial state each
@@ -333,7 +302,7 @@ TEST(Qwen35GDNTest, FourBGeometry8LaneDoesNotCrash) {
   // and compare each run's output to the serial reference for that same input.
   // This exercises repeated thread-pool push/acquire/release cycles — the
   // multi-call reuse pattern that crashed on device.
-  for (int layer = 0; layer < 24; ++layer) {
+  for (int layer = 0; layer < repeats; ++layer) {
     std::vector<float> layer_state(state.size(), 0.0F);
     std::vector<float> layer_ref_state(state.size(), 0.0F);
     gatedDeltaRuleF32(q.data(), k.data(), v.data(), a.data(), b.data(), a_log.data(), dt_bias.data(), layer_ref_state.data(),
@@ -346,4 +315,27 @@ TEST(Qwen35GDNTest, FourBGeometry8LaneDoesNotCrash) {
   }
 }
 
-}  // namespace
+}  // namespace gated_delta_rule_kernel_test
+
+class GatedDeltaRuleKernelTest : public KernelTest {
+ public:
+  void testChunkingMatchesSinglePrefill() { gated_delta_rule_kernel_test::testChunkingMatchesSinglePrefill(); }
+
+  void testGroupedKeyHeadsMatchExplicitExpansion() {
+    gated_delta_rule_kernel_test::testGroupedKeyHeadsMatchExplicitExpansion();
+  }
+
+  void testRejectsIncompatibleHeadCounts() { gated_delta_rule_kernel_test::testRejectsIncompatibleHeadCounts(); }
+
+  void testMatchesFrozenL2NormalizationEpsilonPlacement() {
+    gated_delta_rule_kernel_test::testMatchesFrozenL2NormalizationEpsilonPlacement();
+  }
+
+  void testParallelBatchValueHeadsMatchSerialBitwise(const gated_delta_rule_kernel_test::Geometry& geometry) {
+    gated_delta_rule_kernel_test::testParallelBatchValueHeadsMatchSerialBitwise(geometry);
+  }
+
+  void testProductionGroupedHeadGeometryIsBitwiseStable(const gated_delta_rule_kernel_test::Geometry& geometry, int repeats) {
+    gated_delta_rule_kernel_test::testProductionGroupedHeadGeometryIsBitwiseStable(geometry, repeats);
+  }
+};

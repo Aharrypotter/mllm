@@ -26,6 +26,7 @@
 #include "mllm/core/aops/RadixAttnDiffDimOp.hpp"
 #include "mllm/core/aops/RadixAttnWithSinkAndSwaDiffDimOp.hpp"
 #include "mllm/core/aops/WhereOp.hpp"
+#include "mllm/core/aops/GatedDeltaRuleOp.hpp"
 #include "mllm/engine/Context.hpp"
 
 namespace mllm::nn::functional {
@@ -97,6 +98,14 @@ Tensor groupedQueryAttention(const Tensor& query, const Tensor& key, const Tenso
   return Context::instance().buildOpAndSubmitTask(OpTypes::kGroupedQueryAttention,
                                                   aops::GroupedQueryAttentionOpOptions{.implementation = implementation},
                                                   {query, key, value})[0];
+}
+
+std::array<Tensor, 2> gatedDeltaRule(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& a, const Tensor& b,
+                                     const Tensor& a_log, const Tensor& dt_bias, const Tensor& state, bool state_inplace) {
+  auto outputs = Context::instance().buildOpAndSubmitTask(OpTypes::kGatedDeltaRule,
+                                                          aops::GatedDeltaRuleOpOptions{.state_inplace = state_inplace},
+                                                          {q, k, v, a, b, a_log, dt_bias, state});
+  return {outputs[0], outputs[1]};
 }
 
 Tensor softmax(const Tensor& x, int32_t dim) {

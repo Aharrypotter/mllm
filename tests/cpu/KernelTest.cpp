@@ -562,6 +562,74 @@ TEST_F(CausalDepthwiseConvKernelTest, HistoryFirstK3MatchesScalarReferenceBitwis
             true);
 }
 
+#include "CausalDepthwiseConvCurrentFirstKernelTest.hpp"
+TEST_F(CausalDepthwiseConvCurrentFirstKernelTest, MatchesScalarReferenceAcrossFocusedMatrix) {
+  EXPECT_NO_FATAL_FAILURE(
+      testMatchesScalarReferenceMatrix({1, 2}, {1, 2, 16, 69, 128, 517}, {1, 2, 3, 4, 5, 7, 130}, {2, 3, 4, 5}, {false, true}));
+}
+
+TEST_F(CausalDepthwiseConvCurrentFirstKernelTest, MatchesScalarReferenceAtProductionChannelWidths) {
+  // Exact vector blocks at the production channel widths.
+  EXPECT_NO_FATAL_FAILURE(testMatchesScalarReferenceMatrix({1}, {1, 16, 69, 128, 517}, {6144, 8192}, {4}, {true}));
+}
+
+TEST_F(CausalDepthwiseConvCurrentFirstKernelTest, MatchesScalarReferenceWithChannelTailAtProductionScale) {
+  // Production width minus one, two, and three channels exercises vector tails.
+  EXPECT_NO_FATAL_FAILURE(testMatchesScalarReferenceMatrix({1}, {69}, {6141, 8189, 8190, 8191}, {4}, {true}));
+}
+
+TEST_F(CausalDepthwiseConvCurrentFirstKernelTest, ChunkedPartitionsMatchOneShot) {
+  EXPECT_NO_FATAL_FAILURE(testChunkedPartitionsMatchOneShot({
+      {8192, 4, {517}},
+      {8192, 4, {1, 516}},
+      {8192, 4, {128, 128, 128, 128, 5}},
+      {130, 4, {1, 15, 53}},
+      {7, 5, {1, 1, 14}},
+      {6144, 4, {69}},
+      {6144, 4, {16, 16, 16, 21}},
+  }));
+}
+
+TEST_F(CausalDepthwiseConvCurrentFirstKernelTest, ResetBetweenRequestsReproducesFirstRequest) {
+  EXPECT_NO_FATAL_FAILURE(testResetBetweenRequestsReproducesFirstRequest(/*channels=*/8192, /*kernel=*/4, /*sequence=*/69));
+}
+
+TEST_F(CausalDepthwiseConvCurrentFirstKernelTest, RejectsNullBuffersAndInvalidGeometry) {
+  EXPECT_NO_FATAL_FAILURE(testRejectsNullBuffersAndInvalidGeometry());
+}
+
+//===----------------------------------------------------------------------===//
+// Gated delta rule
+//===----------------------------------------------------------------------===//
+#include "GatedDeltaRuleKernelTest.hpp"
+TEST_F(GatedDeltaRuleKernelTest, ChunkingMatchesSinglePrefill) { EXPECT_NO_FATAL_FAILURE(testChunkingMatchesSinglePrefill()); }
+
+TEST_F(GatedDeltaRuleKernelTest, GroupedKeyHeadsMatchExplicitExpansion) {
+  EXPECT_NO_FATAL_FAILURE(testGroupedKeyHeadsMatchExplicitExpansion());
+}
+
+TEST_F(GatedDeltaRuleKernelTest, RejectsIncompatibleHeadCounts) {
+  EXPECT_NO_FATAL_FAILURE(testRejectsIncompatibleHeadCounts());
+}
+
+TEST_F(GatedDeltaRuleKernelTest, MatchesFrozenL2NormalizationEpsilonPlacement) {
+  EXPECT_NO_FATAL_FAILURE(testMatchesFrozenL2NormalizationEpsilonPlacement());
+}
+
+TEST_F(GatedDeltaRuleKernelTest, ParallelBatchValueHeadsMatchSerialBitwise) {
+  // Each of 16 key heads is shared by two independently scheduled value heads.
+  EXPECT_NO_FATAL_FAILURE(testParallelBatchValueHeadsMatchSerialBitwise({/*batch=*/2, /*sequence=*/4, /*key_heads=*/16,
+                                                                         /*value_heads=*/32, /*key_dim=*/128, /*value_dim=*/128,
+                                                                         /*thread_count=*/8}));
+}
+
+TEST_F(GatedDeltaRuleKernelTest, ProductionGroupedHeadGeometry8LaneIsBitwiseStable) {
+  EXPECT_NO_FATAL_FAILURE(testProductionGroupedHeadGeometryIsBitwiseStable(
+      {/*batch=*/1, /*sequence=*/69, /*key_heads=*/16, /*value_heads=*/32, /*key_dim=*/128, /*value_dim=*/128,
+       /*thread_count=*/8},
+      /*repeats=*/24));
+}
+
 //===----------------------------------------------------------------------===//
 // Parallel linear
 //===----------------------------------------------------------------------===//

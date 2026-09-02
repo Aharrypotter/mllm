@@ -250,6 +250,7 @@ def define_lianlg_ir(ir: dict):
     op.derive(Cls("CausalDepthwiseConv1DOp"))
     op.derive(Cls("GroupedQueryAttentionOp"))
     op.derive(Cls("ParallelLinearOp"))
+    op.derive(Cls("GatedDeltaRuleOp"))
     op.derive(Cls("RepeatOp"))
     op.derive(Cls("PermuteOp"))
     op.derive(Cls("Conv1DOp"))

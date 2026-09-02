@@ -104,6 +104,9 @@ struct NodeRTTIClassOfImpl {
 #define RTTI_RK_OP_LINALGIROP_PARALLELLINEAROP_IMPL(v) \
   return (v)->getKind() >= RK_Op_LinalgIROp_ParallelLinearOp && (v)->getKind() <= RK_Op_LinalgIROp_ParallelLinearOp
 
+#define RTTI_RK_OP_LINALGIROP_GATEDDELTARULEOP_IMPL(v) \
+  return (v)->getKind() >= RK_Op_LinalgIROp_GatedDeltaRuleOp && (v)->getKind() <= RK_Op_LinalgIROp_GatedDeltaRuleOp
+
 #define RTTI_RK_OP_LINALGIROP_REPEATOP_IMPL(v) \
   return (v)->getKind() >= RK_Op_LinalgIROp_RepeatOp && (v)->getKind() <= RK_Op_LinalgIROp_RepeatOp
 

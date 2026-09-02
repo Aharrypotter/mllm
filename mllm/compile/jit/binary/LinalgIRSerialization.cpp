@@ -14,6 +14,7 @@
 #include "mllm/core/aops/CausalDepthwiseConv1DOp.hpp"
 #include "mllm/core/aops/GroupedQueryAttentionOp.hpp"
 #include "mllm/core/aops/ParallelLinearOp.hpp"
+#include "mllm/core/aops/GatedDeltaRuleOp.hpp"
 #include "mllm/core/aops/KVCacheOp.hpp"
 #include "mllm/core/aops/MultimodalRoPEOp.hpp"
 #include "mllm/core/aops/VisionRoPEOp.hpp"
@@ -75,6 +76,7 @@ nlohmann::json dumpLinalgIROptions(const ir::linalg::LinalgIROp::ptr_t& op) {
     CASE(CausalDepthwiseConv1D)
     CASE(GroupedQueryAttention)
     CASE(ParallelLinear)
+    CASE(GatedDeltaRule)
     CASE(Repeat)
     CASE(Permute)
     CASE(Conv1D)
@@ -153,6 +155,11 @@ nlohmann::json dumpCausalDepthwiseConv1DOpIROptions(const ir::linalg::LinalgIROp
           {"bias", options.bias},
           {"state_inplace", options.state_inplace},
           {"accumulation_order", aops::causalDepthwiseConv1DAccumulationOrder2Str(options.accumulation_order)}};
+}
+
+nlohmann::json dumpGatedDeltaRuleOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op) {
+  const auto options = static_cast<aops::GatedDeltaRuleOp*>(op->getAOp())->options();
+  return {{"state_inplace", options.state_inplace}};
 }
 
 nlohmann::json dumpGroupedQueryAttentionOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op) {

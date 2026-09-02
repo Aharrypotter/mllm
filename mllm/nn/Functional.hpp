@@ -13,6 +13,7 @@
 #include "mllm/core/aops/PadOp.hpp"
 #include "mllm/core/aops/InterpolateOp.hpp"
 #include "mllm/core/aops/GroupedQueryAttentionOp.hpp"
+#include "mllm/core/aops/GatedDeltaRuleOp.hpp"
 #include "mllm/core/aops/RadixAttnWithSinkAndSwaDiffDimOp.hpp"
 #include "mllm/engine/Context.hpp"
 
@@ -116,6 +117,10 @@ Tensor groupedQueryAttentionDecode(const Tensor& query, const Tensor& key, const
 Tensor groupedQueryAttention(
     const Tensor& query, const Tensor& key, const Tensor& value,
     aops::GroupedQueryAttentionImplementation implementation = aops::GroupedQueryAttentionImplementation::kDirectStrided);
+
+std::array<Tensor, 2> gatedDeltaRule(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& a, const Tensor& b,
+                                     const Tensor& a_log, const Tensor& dt_bias, const Tensor& state,
+                                     bool state_inplace = false);
 
 Tensor softmax(const Tensor& x, int32_t dim);
 

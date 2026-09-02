@@ -22,4 +22,9 @@ add_executable(Mllm-Test-Nn-ParallelLinear ParallelLinearTest.cpp)
 target_link_libraries(Mllm-Test-Nn-ParallelLinear PRIVATE gtest_main MllmRT MllmCPUBackend)
 target_include_directories(Mllm-Test-Nn-ParallelLinear PRIVATE ${MLLM_INCLUDE_DIR})
 
+add_executable(Mllm-Test-Nn-GatedDeltaRule GatedDeltaRuleTest.cpp)
+target_link_libraries(Mllm-Test-Nn-GatedDeltaRule PRIVATE gtest_main MllmRT MllmCPUBackend)
+target_include_directories(Mllm-Test-Nn-GatedDeltaRule PRIVATE ${MLLM_INCLUDE_DIR})
+
 include(GoogleTest)
+add_test(NAME GatedDeltaRuleFocused COMMAND Mllm-Test-Nn-GatedDeltaRule)
