@@ -29,6 +29,16 @@ class ScopedCpuOpThreads {
   int32_t original_thread_count_;
 };
 
+struct Geometry {
+  int batch;
+  int sequence;
+  int key_heads;
+  int value_heads;
+  int key_dim;
+  int value_dim;
+  int thread_count;
+};
+
 inline void testChunkingMatchesSinglePrefill() {
   constexpr int kBatch = 1;
   constexpr int kSequence = 3;
@@ -179,19 +189,14 @@ inline void testMatchesFrozenL2NormalizationEpsilonPlacement() {
   EXPECT_NEAR(output[0], 0.0035005286F, 1.0e-8F);
 }
 
-inline void testParallelBatchValueHeadsMatchSerialBitwise() {
-  constexpr int kBatch = 2;
-  constexpr int kSequence = 4;
-  // Production grouped-head geometry: each normalized key head is shared by
-  // two independently scheduled value-head recurrence tasks.
-  constexpr int kKeyHeads = 16;
-  constexpr int kValueHeads = 32;
-  constexpr int kKeyDim = 128;
-  constexpr int kValueDim = 128;
-  // Exercises the parallel lane partition up to the 8-lane cap
-  // (kMaxParallelGDNLanes); tasks are disjoint so output must be bitwise
-  // identical regardless of how many lanes the scheduler picks.
-  constexpr int kThreadCount = 8;
+inline void testParallelBatchValueHeadsMatchSerialBitwise(const Geometry& geometry) {
+  const int kBatch = geometry.batch;
+  const int kSequence = geometry.sequence;
+  const int kKeyHeads = geometry.key_heads;
+  const int kValueHeads = geometry.value_heads;
+  const int kKeyDim = geometry.key_dim;
+  const int kValueDim = geometry.value_dim;
+  const int kThreadCount = geometry.thread_count;
 
   std::vector<float> q(kBatch * kSequence * kKeyHeads * kKeyDim);
   std::vector<float> k(q.size());
@@ -241,14 +246,14 @@ inline void testParallelBatchValueHeadsMatchSerialBitwise() {
 
 // Full production geometry at the 8-lane cap exercises the 32-task fan-out
 // that the small geometry above does not.
-inline void testProductionGroupedHeadGeometry8LaneIsBitwiseStable() {
-  constexpr int kBatch = 1;
-  constexpr int kSequence = 69;
-  constexpr int kKeyHeads = 16;
-  constexpr int kValueHeads = 32;
-  constexpr int kKeyDim = 128;
-  constexpr int kValueDim = 128;
-  constexpr int kThreadCount = 8;
+inline void testProductionGroupedHeadGeometryIsBitwiseStable(const Geometry& geometry, int repeats) {
+  const int kBatch = geometry.batch;
+  const int kSequence = geometry.sequence;
+  const int kKeyHeads = geometry.key_heads;
+  const int kValueHeads = geometry.value_heads;
+  const int kKeyDim = geometry.key_dim;
+  const int kValueDim = geometry.value_dim;
+  const int kThreadCount = geometry.thread_count;
 
   std::vector<float> q(kBatch * kSequence * kKeyHeads * kKeyDim);
   std::vector<float> k(q.size());
@@ -297,7 +302,7 @@ inline void testProductionGroupedHeadGeometry8LaneIsBitwiseStable() {
   // and compare each run's output to the serial reference for that same input.
   // This exercises repeated thread-pool push/acquire/release cycles — the
   // multi-call reuse pattern that crashed on device.
-  for (int layer = 0; layer < 24; ++layer) {
+  for (int layer = 0; layer < repeats; ++layer) {
     std::vector<float> layer_state(state.size(), 0.0F);
     std::vector<float> layer_ref_state(state.size(), 0.0F);
     gatedDeltaRuleF32(q.data(), k.data(), v.data(), a.data(), b.data(), a_log.data(), dt_bias.data(), layer_ref_state.data(),
@@ -312,4 +317,25 @@ inline void testProductionGroupedHeadGeometry8LaneIsBitwiseStable() {
 
 }  // namespace gated_delta_rule_kernel_test
 
-class GatedDeltaRuleKernelTest : public KernelTest {};
+class GatedDeltaRuleKernelTest : public KernelTest {
+ public:
+  void testChunkingMatchesSinglePrefill() { gated_delta_rule_kernel_test::testChunkingMatchesSinglePrefill(); }
+
+  void testGroupedKeyHeadsMatchExplicitExpansion() {
+    gated_delta_rule_kernel_test::testGroupedKeyHeadsMatchExplicitExpansion();
+  }
+
+  void testRejectsIncompatibleHeadCounts() { gated_delta_rule_kernel_test::testRejectsIncompatibleHeadCounts(); }
+
+  void testMatchesFrozenL2NormalizationEpsilonPlacement() {
+    gated_delta_rule_kernel_test::testMatchesFrozenL2NormalizationEpsilonPlacement();
+  }
+
+  void testParallelBatchValueHeadsMatchSerialBitwise(const gated_delta_rule_kernel_test::Geometry& geometry) {
+    gated_delta_rule_kernel_test::testParallelBatchValueHeadsMatchSerialBitwise(geometry);
+  }
+
+  void testProductionGroupedHeadGeometryIsBitwiseStable(const gated_delta_rule_kernel_test::Geometry& geometry, int repeats) {
+    gated_delta_rule_kernel_test::testProductionGroupedHeadGeometryIsBitwiseStable(geometry, repeats);
+  }
+};

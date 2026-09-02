@@ -103,18 +103,14 @@ void expectBitwiseAgreement(const ConvCase& test_case) {
   ASSERT_EQ(kernel_state, reference_state) << "final history mismatch for " << test_case.describe();
 }
 
-inline void testMatchesScalarReferenceAcrossFocusedMatrix() {
-  // Channel counts below, at, and above the natural four-channel vector width,
-  // including several that leave a tail.
-  const int channel_values[] = {1, 2, 3, 4, 5, 7, 130};
-  const int sequence_values[] = {1, 2, 16, 69, 128, 517};
-  const int kernel_values[] = {2, 3, 4, 5};
-
-  for (int batch : {1, 2}) {
+inline void testMatchesScalarReferenceMatrix(const std::vector<int>& batch_values, const std::vector<int>& sequence_values,
+                                             const std::vector<int>& channel_values, const std::vector<int>& kernel_values,
+                                             const std::vector<bool>& non_zero_history_values) {
+  for (int batch : batch_values) {
     for (int sequence : sequence_values) {
       for (int channels : channel_values) {
         for (int kernel : kernel_values) {
-          for (bool non_zero_history : {false, true}) {
+          for (bool non_zero_history : non_zero_history_values) {
             ASSERT_NO_FATAL_FAILURE(expectBitwiseAgreement({batch, sequence, channels, kernel, non_zero_history}));
           }
         }
@@ -123,39 +119,13 @@ inline void testMatchesScalarReferenceAcrossFocusedMatrix() {
   }
 }
 
-inline void testMatchesScalarReferenceAtProductionChannelWidths() {
-  // Representative production widths that are multiples of four and therefore
-  // do not exercise a vector tail on their own.
-  for (int channels : {6144, 8192}) {
-    for (int sequence : {1, 16, 69, 128, 517}) {
-      ASSERT_NO_FATAL_FAILURE(expectBitwiseAgreement({1, sequence, channels, 4, true}));
-    }
-  }
-}
+struct Partition {
+  int channels;
+  int kernel;
+  std::vector<int> chunks;
+};
 
-inline void testMatchesScalarReferenceWithChannelTailAtProductionScale() {
-  // Production width minus one, two, and three channels: a full-width run plus
-  // a tail of three, two, and one channel respectively.
-  for (int channels : {8189, 8190, 8191, 6141}) { ASSERT_NO_FATAL_FAILURE(expectBitwiseAgreement({1, 69, channels, 4, true})); }
-}
-
-inline void testChunkedPartitionsMatchOneShot() {
-  struct Partition {
-    int channels;
-    int kernel;
-    std::vector<int> chunks;
-  };
-
-  const std::vector<Partition> partitions = {
-      {8192, 4, {517}},                    // one-shot reference
-      {8192, 4, {1, 516}},                 // prefill then continuation
-      {8192, 4, {128, 128, 128, 128, 5}},  // multi-chunk
-      {130, 4, {1, 15, 53}},               // tail channels across chunks
-      {7, 5, {1, 1, 14}},                  // generic kernel size, odd channels
-      {6144, 4, {69}},
-      {6144, 4, {16, 16, 16, 21}},
-  };
-
+inline void testChunkedPartitionsMatchOneShot(const std::vector<Partition>& partitions) {
   for (const auto& partition : partitions) {
     int total_sequence = 0;
     for (int chunk : partition.chunks) { total_sequence += chunk; }
@@ -189,31 +159,28 @@ inline void testChunkedPartitionsMatchOneShot() {
   }
 }
 
-inline void testResetBetweenRequestsReproducesFirstRequest() {
-  constexpr int kChannels = 8192;
-  constexpr int kKernel = 4;
-  constexpr int kSequence = 69;
-  constexpr auto kElements = static_cast<std::size_t>(kSequence) * kChannels;
-  constexpr auto kStateCount = static_cast<std::size_t>(kChannels) * (kKernel - 1);
+inline void testResetBetweenRequestsReproducesFirstRequest(int channels, int kernel, int sequence) {
+  const auto element_count = static_cast<std::size_t>(sequence) * channels;
+  const auto state_count = static_cast<std::size_t>(channels) * (kernel - 1);
 
-  const std::vector<float> input = makeBuffer(kElements, 5);
-  const std::vector<float> weight = makeBuffer(static_cast<std::size_t>(kChannels) * kKernel, kKernel);
+  const std::vector<float> input = makeBuffer(element_count, 5);
+  const std::vector<float> weight = makeBuffer(static_cast<std::size_t>(channels) * kernel, kernel);
 
-  std::vector<float> state(kStateCount, 0.0F);
-  std::vector<float> first_output(kElements, 0.0F);
-  depthwiseCausalConvF32(input.data(), weight.data(), state.data(), first_output.data(), 1, kSequence, kChannels, kKernel);
+  std::vector<float> state(state_count, 0.0F);
+  std::vector<float> first_output(element_count, 0.0F);
+  depthwiseCausalConvF32(input.data(), weight.data(), state.data(), first_output.data(), 1, sequence, channels, kernel);
   const std::vector<float> first_state = state;
 
   // A second request that continues the history must differ, proving the
   // history is really being carried.
-  std::vector<float> continued_output(kElements, 0.0F);
-  depthwiseCausalConvF32(input.data(), weight.data(), state.data(), continued_output.data(), 1, kSequence, kChannels, kKernel);
+  std::vector<float> continued_output(element_count, 0.0F);
+  depthwiseCausalConvF32(input.data(), weight.data(), state.data(), continued_output.data(), 1, sequence, channels, kernel);
   ASSERT_NE(continued_output, first_output);
 
   // Resetting the history reproduces the first request bit for bit.
   std::fill(state.begin(), state.end(), 0.0F);
-  std::vector<float> reset_output(kElements, 0.0F);
-  depthwiseCausalConvF32(input.data(), weight.data(), state.data(), reset_output.data(), 1, kSequence, kChannels, kKernel);
+  std::vector<float> reset_output(element_count, 0.0F);
+  depthwiseCausalConvF32(input.data(), weight.data(), state.data(), reset_output.data(), 1, sequence, channels, kernel);
 
   ASSERT_EQ(reset_output, first_output);
   ASSERT_EQ(state, first_state);
@@ -258,4 +225,24 @@ inline void testRejectsNullBuffersAndInvalidGeometry() {
 
 }  // namespace causal_depthwise_conv_current_first_test
 
-class CausalDepthwiseConvCurrentFirstKernelTest : public KernelTest {};
+class CausalDepthwiseConvCurrentFirstKernelTest : public KernelTest {
+ public:
+  void testMatchesScalarReferenceMatrix(const std::vector<int>& batch_values, const std::vector<int>& sequence_values,
+                                        const std::vector<int>& channel_values, const std::vector<int>& kernel_values,
+                                        const std::vector<bool>& non_zero_history_values) {
+    causal_depthwise_conv_current_first_test::testMatchesScalarReferenceMatrix(batch_values, sequence_values, channel_values,
+                                                                               kernel_values, non_zero_history_values);
+  }
+
+  void testChunkedPartitionsMatchOneShot(const std::vector<causal_depthwise_conv_current_first_test::Partition>& partitions) {
+    causal_depthwise_conv_current_first_test::testChunkedPartitionsMatchOneShot(partitions);
+  }
+
+  void testResetBetweenRequestsReproducesFirstRequest(int channels, int kernel, int sequence) {
+    causal_depthwise_conv_current_first_test::testResetBetweenRequestsReproducesFirstRequest(channels, kernel, sequence);
+  }
+
+  void testRejectsNullBuffersAndInvalidGeometry() {
+    causal_depthwise_conv_current_first_test::testRejectsNullBuffersAndInvalidGeometry();
+  }
+};
