@@ -562,6 +562,59 @@ TEST_F(CausalDepthwiseConvKernelTest, HistoryFirstK3MatchesScalarReferenceBitwis
             true);
 }
 
+#include "CausalDepthwiseConvCurrentFirstKernelTest.hpp"
+TEST_F(CausalDepthwiseConvCurrentFirstKernelTest, MatchesScalarReferenceAcrossFocusedMatrix) {
+  causal_depthwise_conv_current_first_test::testMatchesScalarReferenceAcrossFocusedMatrix();
+}
+
+TEST_F(CausalDepthwiseConvCurrentFirstKernelTest, MatchesScalarReferenceAtProductionChannelWidths) {
+  causal_depthwise_conv_current_first_test::testMatchesScalarReferenceAtProductionChannelWidths();
+}
+
+TEST_F(CausalDepthwiseConvCurrentFirstKernelTest, MatchesScalarReferenceWithChannelTailAtProductionScale) {
+  causal_depthwise_conv_current_first_test::testMatchesScalarReferenceWithChannelTailAtProductionScale();
+}
+
+TEST_F(CausalDepthwiseConvCurrentFirstKernelTest, ChunkedPartitionsMatchOneShot) {
+  causal_depthwise_conv_current_first_test::testChunkedPartitionsMatchOneShot();
+}
+
+TEST_F(CausalDepthwiseConvCurrentFirstKernelTest, ResetBetweenRequestsReproducesFirstRequest) {
+  causal_depthwise_conv_current_first_test::testResetBetweenRequestsReproducesFirstRequest();
+}
+
+TEST_F(CausalDepthwiseConvCurrentFirstKernelTest, RejectsNullBuffersAndInvalidGeometry) {
+  causal_depthwise_conv_current_first_test::testRejectsNullBuffersAndInvalidGeometry();
+}
+
+//===----------------------------------------------------------------------===//
+// Gated delta rule
+//===----------------------------------------------------------------------===//
+#include "GatedDeltaRuleKernelTest.hpp"
+TEST_F(GatedDeltaRuleKernelTest, ChunkingMatchesSinglePrefill) {
+  gated_delta_rule_kernel_test::testChunkingMatchesSinglePrefill();
+}
+
+TEST_F(GatedDeltaRuleKernelTest, GroupedKeyHeadsMatchExplicitExpansion) {
+  gated_delta_rule_kernel_test::testGroupedKeyHeadsMatchExplicitExpansion();
+}
+
+TEST_F(GatedDeltaRuleKernelTest, RejectsIncompatibleHeadCounts) {
+  gated_delta_rule_kernel_test::testRejectsIncompatibleHeadCounts();
+}
+
+TEST_F(GatedDeltaRuleKernelTest, MatchesFrozenL2NormalizationEpsilonPlacement) {
+  gated_delta_rule_kernel_test::testMatchesFrozenL2NormalizationEpsilonPlacement();
+}
+
+TEST_F(GatedDeltaRuleKernelTest, ParallelBatchValueHeadsMatchSerialBitwise) {
+  gated_delta_rule_kernel_test::testParallelBatchValueHeadsMatchSerialBitwise();
+}
+
+TEST_F(GatedDeltaRuleKernelTest, ProductionGroupedHeadGeometry8LaneIsBitwiseStable) {
+  gated_delta_rule_kernel_test::testProductionGroupedHeadGeometry8LaneIsBitwiseStable();
+}
+
 //===----------------------------------------------------------------------===//
 // Parallel linear
 //===----------------------------------------------------------------------===//

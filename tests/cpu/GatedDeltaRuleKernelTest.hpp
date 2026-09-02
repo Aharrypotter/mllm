@@ -1,6 +1,8 @@
 // Copyright (c) MLLM Team.
 // Licensed under the MIT License.
 
+#pragma once
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -9,8 +11,9 @@
 
 #include "mllm/backends/cpu/kernels/common/gdn/gated_delta_net.hpp"
 #include "mllm/mllm.hpp"
+#include "KernelTestHelper.hpp"
 
-namespace {
+namespace gated_delta_rule_kernel_test {
 
 using mllm::cpu::gdn::gatedDeltaRuleF32;
 
@@ -26,7 +29,7 @@ class ScopedCpuOpThreads {
   int32_t original_thread_count_;
 };
 
-TEST(GatedDeltaRuleKernelTest, ChunkingMatchesSinglePrefill) {
+inline void testChunkingMatchesSinglePrefill() {
   constexpr int kBatch = 1;
   constexpr int kSequence = 3;
   constexpr int kKeyHeads = 1;
@@ -79,7 +82,7 @@ TEST(GatedDeltaRuleKernelTest, ChunkingMatchesSinglePrefill) {
   }
 }
 
-TEST(GatedDeltaRuleKernelTest, GroupedKeyHeadsMatchExplicitExpansion) {
+inline void testGroupedKeyHeadsMatchExplicitExpansion() {
   constexpr int kBatch = 1;
   constexpr int kSequence = 3;
   constexpr int kKeyHeads = 2;
@@ -146,7 +149,7 @@ TEST(GatedDeltaRuleKernelTest, GroupedKeyHeadsMatchExplicitExpansion) {
   }
 }
 
-TEST(GatedDeltaRuleKernelTest, RejectsIncompatibleHeadCounts) {
+inline void testRejectsIncompatibleHeadCounts() {
   float scalar = 0.0F;
   EXPECT_THROW(gatedDeltaRuleF32(&scalar, &scalar, &scalar, &scalar, &scalar, &scalar, &scalar, &scalar, &scalar,
                                  /*batch_size=*/1, /*sequence_length=*/1,
@@ -155,7 +158,7 @@ TEST(GatedDeltaRuleKernelTest, RejectsIncompatibleHeadCounts) {
                std::invalid_argument);
 }
 
-TEST(GatedDeltaRuleKernelTest, MatchesFrozenL2NormalizationEpsilonPlacement) {
+inline void testMatchesFrozenL2NormalizationEpsilonPlacement() {
   const std::array<float, 2> q = {1.0e-4F, 0.0F};
   const std::array<float, 2> k = {1.0e-4F, 0.0F};
   const std::array<float, 1> v = {1.0F};
@@ -176,7 +179,7 @@ TEST(GatedDeltaRuleKernelTest, MatchesFrozenL2NormalizationEpsilonPlacement) {
   EXPECT_NEAR(output[0], 0.0035005286F, 1.0e-8F);
 }
 
-TEST(GatedDeltaRuleKernelTest, ParallelBatchValueHeadsMatchSerialBitwise) {
+inline void testParallelBatchValueHeadsMatchSerialBitwise() {
   constexpr int kBatch = 2;
   constexpr int kSequence = 4;
   // Production grouped-head geometry: each normalized key head is shared by
@@ -238,7 +241,7 @@ TEST(GatedDeltaRuleKernelTest, ParallelBatchValueHeadsMatchSerialBitwise) {
 
 // Full production geometry at the 8-lane cap exercises the 32-task fan-out
 // that the small geometry above does not.
-TEST(GatedDeltaRuleKernelTest, ProductionGroupedHeadGeometry8LaneIsBitwiseStable) {
+inline void testProductionGroupedHeadGeometry8LaneIsBitwiseStable() {
   constexpr int kBatch = 1;
   constexpr int kSequence = 69;
   constexpr int kKeyHeads = 16;
@@ -307,4 +310,6 @@ TEST(GatedDeltaRuleKernelTest, ProductionGroupedHeadGeometry8LaneIsBitwiseStable
   }
 }
 
-}  // namespace
+}  // namespace gated_delta_rule_kernel_test
+
+class GatedDeltaRuleKernelTest : public KernelTest {};

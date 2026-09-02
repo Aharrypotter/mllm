@@ -1,6 +1,8 @@
 // Copyright (c) MLLM Team.
 // Licensed under the MIT License.
 
+#pragma once
+
 // Focused oracle for current-first depthwise causal convolution.
 //
 // The reference below is an independent scalar implementation of the frozen
@@ -19,8 +21,9 @@
 #include <vector>
 
 #include "mllm/backends/cpu/kernels/common/gdn/gated_delta_net.hpp"
+#include "KernelTestHelper.hpp"
 
-namespace {
+namespace causal_depthwise_conv_current_first_test {
 
 using mllm::cpu::gdn::depthwiseCausalConvF32;
 
@@ -100,7 +103,7 @@ void expectBitwiseAgreement(const ConvCase& test_case) {
   ASSERT_EQ(kernel_state, reference_state) << "final history mismatch for " << test_case.describe();
 }
 
-TEST(CausalDepthwiseConvCurrentFirstKernelTest, MatchesScalarReferenceAcrossFocusedMatrix) {
+inline void testMatchesScalarReferenceAcrossFocusedMatrix() {
   // Channel counts below, at, and above the natural four-channel vector width,
   // including several that leave a tail.
   const int channel_values[] = {1, 2, 3, 4, 5, 7, 130};
@@ -120,7 +123,7 @@ TEST(CausalDepthwiseConvCurrentFirstKernelTest, MatchesScalarReferenceAcrossFocu
   }
 }
 
-TEST(CausalDepthwiseConvCurrentFirstKernelTest, MatchesScalarReferenceAtProductionChannelWidths) {
+inline void testMatchesScalarReferenceAtProductionChannelWidths() {
   // Representative production widths that are multiples of four and therefore
   // do not exercise a vector tail on their own.
   for (int channels : {6144, 8192}) {
@@ -130,13 +133,13 @@ TEST(CausalDepthwiseConvCurrentFirstKernelTest, MatchesScalarReferenceAtProducti
   }
 }
 
-TEST(CausalDepthwiseConvCurrentFirstKernelTest, MatchesScalarReferenceWithChannelTailAtProductionScale) {
+inline void testMatchesScalarReferenceWithChannelTailAtProductionScale() {
   // Production width minus one, two, and three channels: a full-width run plus
   // a tail of three, two, and one channel respectively.
   for (int channels : {8189, 8190, 8191, 6141}) { ASSERT_NO_FATAL_FAILURE(expectBitwiseAgreement({1, 69, channels, 4, true})); }
 }
 
-TEST(CausalDepthwiseConvCurrentFirstKernelTest, ChunkedPartitionsMatchOneShot) {
+inline void testChunkedPartitionsMatchOneShot() {
   struct Partition {
     int channels;
     int kernel;
@@ -186,7 +189,7 @@ TEST(CausalDepthwiseConvCurrentFirstKernelTest, ChunkedPartitionsMatchOneShot) {
   }
 }
 
-TEST(CausalDepthwiseConvCurrentFirstKernelTest, ResetBetweenRequestsReproducesFirstRequest) {
+inline void testResetBetweenRequestsReproducesFirstRequest() {
   constexpr int kChannels = 8192;
   constexpr int kKernel = 4;
   constexpr int kSequence = 69;
@@ -216,7 +219,7 @@ TEST(CausalDepthwiseConvCurrentFirstKernelTest, ResetBetweenRequestsReproducesFi
   ASSERT_EQ(state, first_state);
 }
 
-TEST(CausalDepthwiseConvCurrentFirstKernelTest, RejectsNullBuffersAndInvalidGeometry) {
+inline void testRejectsNullBuffersAndInvalidGeometry() {
   constexpr int kBatch = 1;
   constexpr int kSequence = 2;
   constexpr int kChannels = 4;
@@ -253,4 +256,6 @@ TEST(CausalDepthwiseConvCurrentFirstKernelTest, RejectsNullBuffersAndInvalidGeom
       std::invalid_argument);
 }
 
-}  // namespace
+}  // namespace causal_depthwise_conv_current_first_test
+
+class CausalDepthwiseConvCurrentFirstKernelTest : public KernelTest {};
