@@ -27,4 +27,4 @@ target_link_libraries(Mllm-Test-Nn-GatedDeltaRule PRIVATE gtest_main MllmRT Mllm
 target_include_directories(Mllm-Test-Nn-GatedDeltaRule PRIVATE ${MLLM_INCLUDE_DIR})
 
 include(GoogleTest)
-gtest_discover_tests(Mllm-Test-Nn-GatedDeltaRule TEST_PREFIX "GatedDeltaRuleFocused.")
+add_test(NAME GatedDeltaRuleFocused COMMAND Mllm-Test-Nn-GatedDeltaRule)

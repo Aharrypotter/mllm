@@ -27,9 +27,9 @@ target_link_libraries(Mllm-Test-CPUContiguousOp PRIVATE gtest_main MllmRT MllmCP
 target_include_directories(Mllm-Test-CPUContiguousOp PRIVATE ${MLLM_INCLUDE_DIR})
 
 include(GoogleTest)
-gtest_discover_tests(
-  Mllm-Test-CPUKernel
-  TEST_PREFIX "CPUKernelFocused."
-  TEST_FILTER
-    "CausalDepthwiseConvKernelTest.*:CausalDepthwiseConvCurrentFirstKernelTest.*:GatedDeltaRuleKernelTest.*"
-  PROPERTIES LABELS cpu-kernel)
+add_test(
+  NAME CPUKernelFocused
+  COMMAND
+    Mllm-Test-CPUKernel
+    --gtest_filter=CausalDepthwiseConvKernelTest.*:CausalDepthwiseConvCurrentFirstKernelTest.*:GatedDeltaRuleKernelTest.*)
+set_tests_properties(CPUKernelFocused PROPERTIES LABELS cpu-kernel)
