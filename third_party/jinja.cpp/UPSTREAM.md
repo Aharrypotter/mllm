@@ -19,6 +19,8 @@
     method calls, and the `min` / `max` filters;
   - `{{ value }}` prints non-string values with Python `str()` semantics
     (`None`, `True`, dict/list reprs) like Jinja2;
+  - list concatenation with `+` and namespace attribute updates that write
+    back to the defining scope (both ported from MNN's jinja.cpp fork);
   - a C++14+ `std::make_unique` alias.
 
 To resync: check out the upstream commit, copy the two headers, and re-apply

@@ -19,7 +19,7 @@ nlohmann::ordered_json loadRequest(const std::string& path) {
 
 int main(int argc, char** argv) {
   if (argc != 3) {
-    std::cerr << "usage: Mllm-ChatTemplate-Render <chat_template.jinja> <request.json>\n";
+    std::cerr << "usage: Mllm-ChatTemplate-Render <chat_template.jinja | model directory> <request.json>\n";
     return 2;
   }
 
@@ -32,10 +32,18 @@ int main(int argc, char** argv) {
     // The template's directory doubles as the model directory so special-token
     // variables (bos_token, ...) come from its tokenizer_config.json, exactly as
     // the product path sees them.
+    // A directory uses the product discovery order (chat_template.jinja,
+    // additional_chat_templates/, tokenizer_config.json); a file is explicit.
     const std::filesystem::path template_path = std::filesystem::absolute(argv[1]);
+    mllm::preprocessor::ChatTemplateLoadOptions load_options;
+    if (std::filesystem::is_directory(template_path)) {
+      load_options.model_directory = template_path;
+    } else {
+      load_options.model_directory = template_path.parent_path();
+      load_options.explicit_template_path = template_path;
+    }
     mllm::preprocessor::ChatPreprocessor chat_preprocessor(
-        {.backend = mllm::preprocessor::ChatTemplateBackend::JinjaRequired,
-         .template_options = {.model_directory = template_path.parent_path(), .explicit_template_path = template_path}});
+        {.backend = mllm::preprocessor::ChatTemplateBackend::JinjaRequired, .template_options = load_options});
 
     mllm::preprocessor::ChatTemplateRequest render_request;
     render_request.messages = request.at("messages");

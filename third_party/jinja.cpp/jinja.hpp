@@ -668,6 +668,19 @@ public:
         scopes.back()[name] = std::move(detached);
     }
 
+    // Update a variable in the scope that defines it (namespace mutation from
+    // an inner scope, ported from MNN's jinja.cpp fork); falls back to set().
+    void update(const std::string& name, json val) {
+        json detached(val.raw());
+        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+            if (it->contains(name)) {
+                (*it)[name] = std::move(detached);
+                return;
+            }
+        }
+        scopes.back()[name] = std::move(detached);
+    }
+
     // For modifying a variable in place (e.g. namespace), we rely on get() returning a reference.
 
     void push_scope(json scope = json::object()) {
@@ -1073,6 +1086,13 @@ struct BinaryExpr : Expr {
                  if (l.is_number_float() || r.is_number_float()) return l.get<double>() + r.get<double>();
                  return l.get<int64_t>() + r.get<int64_t>();
             }
+            // List concatenation (ported from MNN's jinja.cpp fork).
+            if (l.is_array() && r.is_array()) {
+                json result = json::array();
+                for (const auto& item : l) result.push_back(item);
+                for (const auto& item : r) result.push_back(item);
+                return result;
+            }
         }
         if (op == "-") {
             if (l.is_number() && r.is_number()) {
@@ -1350,6 +1370,7 @@ struct SetNode : Node {
                  if (!obj.is_null()) {
                      json detached(val.raw());
                      obj[attr->name] = std::move(detached);
+                     context.update(var->name, obj);
                  }
             }
         }

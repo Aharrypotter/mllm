@@ -30,6 +30,35 @@ MODELS = {
         "template_sha256": "7451a05cf1e28a79d97d7c0bc951028c0b1915119bf9046acd06a0e3d931f47c",
         "tokenizer_sha256": "3e065a558a034185fe299917b398685c1facd0169a9eea1e629eb30c171fed81",
     },
+    # Qwen3 dense checkpoints ship the template inside tokenizer_config.json.
+    # The runner sends enable_thinking=false; the official template emits the
+    # empty thinking block for that value.
+    "qwen3": {
+        "revision": "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+        "oracle": "Qwen/Qwen3-1.7B",
+        "template_file": "tokenizer_config.json",
+        "template_sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+        "tokenizer_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+        "product_thinking": False,
+    },
+    # Qwen3-MoE and the Qwen3 Ascend runner reuse the Qwen3 dense template and
+    # tokenizer as the oracle; the MoE checkpoint itself is not pinned here.
+    "qwen3_moe": {
+        "revision": "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+        "oracle": "Qwen/Qwen3-1.7B (family template)",
+        "template_file": "tokenizer_config.json",
+        "template_sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+        "tokenizer_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+        "product_thinking": None,
+    },
+    "qwen_ascend": {
+        "revision": "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+        "oracle": "Qwen/Qwen3-1.7B (family template)",
+        "template_file": "tokenizer_config.json",
+        "template_sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+        "tokenizer_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+        "product_thinking": False,
+    },
 }
 
 TOOL = {
@@ -207,7 +236,8 @@ def main() -> int:
     args = parser.parse_args()
 
     pins = MODELS[args.model]
-    template = args.model_dir / "chat_template.jinja"
+    template = args.model_dir / pins.get("template_file", "chat_template.jinja")
+    render_source = args.model_dir if pins.get("template_file") == "tokenizer_config.json" else template
     tokenizer_json = args.model_dir / "tokenizer.json"
     if sha256(template) != pins["template_sha256"]:
         raise RuntimeError(f"unexpected {args.model} template identity; expected revision {pins['revision']}")
@@ -225,7 +255,7 @@ def main() -> int:
         reference = tokenizer.apply_chat_template(
             case["messages"], tokenize=False, add_generation_prompt=case["add_generation_prompt"], **kwargs
         )
-        candidate = render_cpp(args.renderer, template, case)
+        candidate = render_cpp(args.renderer, render_source, case)
         reference_ids = tokenizer.encode(reference, add_special_tokens=False)
         candidate_ids = tokenizer.encode(candidate, add_special_tokens=False)
         byte_exact = candidate == reference
@@ -255,9 +285,16 @@ def main() -> int:
                 command.append("--enable_thinking")
             legacy = run_json(command + ["--backend", "legacy"])
             jinja = run_json(command + ["--backend", "jinja_required"])
+            # product_thinking: False -> the runner always sends enable_thinking=false;
+            # None -> the runner leaves it undefined (official default); otherwise per case.
+            thinking_kwargs = {}
+            product_thinking = pins.get("product_thinking", "per-case")
+            if product_thinking is False:
+                thinking_kwargs["enable_thinking"] = False
+            elif product_thinking == "per-case":
+                thinking_kwargs["enable_thinking"] = bool(case.get("enable_thinking", False))
             reference_ids = tokenizer.apply_chat_template(
-                product_messages(case), tokenize=True, add_generation_prompt=True,
-                enable_thinking=bool(case.get("enable_thinking", False)),
+                product_messages(case), tokenize=True, add_generation_prompt=True, **thinking_kwargs
             )
             if hasattr(reference_ids, "input_ids"):
                 reference_ids = reference_ids["input_ids"]

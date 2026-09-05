@@ -1,5 +1,5 @@
 --- a/jinja.hpp	2026-09-05 19:36:30
-+++ b/jinja.hpp	2026-09-05 19:57:23
++++ b/jinja.hpp	2026-09-05 22:45:41
 @@ -125,10 +125,14 @@
  
  
@@ -49,7 +49,7 @@
  
          bool first = true;
          for (const auto& key : keys) {
-@@ -649,8 +661,11 @@
+@@ -649,10 +661,26 @@
      }
  
      void set(const std::string& name, json val) {
@@ -62,8 +62,23 @@
 +        scopes.back()[name] = std::move(detached);
      }
  
++    // Update a variable in the scope that defines it (namespace mutation from
++    // an inner scope, ported from MNN's jinja.cpp fork); falls back to set().
++    void update(const std::string& name, json val) {
++        json detached(val.raw());
++        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
++            if (it->contains(name)) {
++                (*it)[name] = std::move(detached);
++                return;
++            }
++        }
++        scopes.back()[name] = std::move(detached);
++    }
++
      // For modifying a variable in place (e.g. namespace), we rely on get() returning a reference.
-@@ -826,6 +841,36 @@
+ 
+     void push_scope(json scope = json::object()) {
+@@ -826,6 +854,36 @@
      json evaluate(Context& context) override {
          json obj_val = object->evaluate(context);
  
@@ -100,7 +115,7 @@
          if (obj_val.is_string()) {
              std::string s = obj_val.get<std::string>();
              if (method == "startswith") {
-@@ -930,6 +975,17 @@
+@@ -930,6 +988,17 @@
                   }
                   return s;
               }
@@ -118,7 +133,21 @@
          } else if (name == "length") {
              if (val.is_array() || val.is_object()) return val.size();
              if (val.is_string()) return val.get<std::string>().length();
-@@ -1260,7 +1316,7 @@
+@@ -1017,6 +1086,13 @@
+                  if (l.is_number_float() || r.is_number_float()) return l.get<double>() + r.get<double>();
+                  return l.get<int64_t>() + r.get<int64_t>();
+             }
++            // List concatenation (ported from MNN's jinja.cpp fork).
++            if (l.is_array() && r.is_array()) {
++                json result = json::array();
++                for (const auto& item : l) result.push_back(item);
++                for (const auto& item : r) result.push_back(item);
++                return result;
++            }
+         }
+         if (op == "-") {
+             if (l.is_number() && r.is_number()) {
+@@ -1260,7 +1336,7 @@
          json val = expr->evaluate(context);
          if (is_undefined(val)) return; // Print nothing
          if (val.is_string()) out += val.get<std::string>();
@@ -127,20 +156,21 @@
      }
  };
  
-@@ -1292,11 +1348,26 @@
+@@ -1292,7 +1368,9 @@
              if (auto* var = dynamic_cast<VarExpr*>(attr->object.get())) {
                   json obj = context.get(var->name);
                   if (!obj.is_null()) {
 -                     obj[attr->name] = val;
 +                     json detached(val.raw());
 +                     obj[attr->name] = std::move(detached);
++                     context.update(var->name, obj);
                   }
              }
          }
-         // If target is tuple, not supported yet.
-+    }
-+};
-+
+@@ -1300,6 +1378,20 @@
+     }
+ };
+ 
 +// {% set name %}...{% endset %}: captures the rendered body into a variable.
 +struct BlockSetNode : Node {
 +    std::string name;
@@ -152,10 +182,13 @@
 +        std::string captured;
 +        for (const auto& node : body) node->render(context, captured);
 +        context.set(name, json(captured));
-     }
- };
- 
-@@ -1328,7 +1399,9 @@
++    }
++};
++
+ struct ForStmt : Node {
+     std::vector<std::string> loop_vars;
+     std::unique_ptr<Expr> iterable;
+@@ -1328,7 +1420,9 @@
                  keys.push_back(it.key());
              }
              // Sort keys to be deterministic/consistent with map behavior
@@ -165,7 +198,7 @@
              for (const auto& key : keys) items.push_back(key);
          }
  
-@@ -1386,9 +1459,13 @@
+@@ -1386,9 +1480,13 @@
               json loop_obj;
               loop_obj["index0"] = index;
               loop_obj["index"] = index + 1;
@@ -179,11 +212,10 @@
               loop_scope["loop"] = loop_obj;
  
               context.push_scope(std::move(loop_scope));
-@@ -1516,6 +1593,33 @@
-     std::unique_ptr<Node> parse_set() {
+@@ -1517,6 +1615,33 @@
          // We consumed {% and 'set'
          std::unique_ptr<Expr> target = parse_expression();
-+
+ 
 +        if (check(Token::BlockEnd)) {
 +            // Block assignment: {% set name %} body {% endset %}
 +            advance(); // eat %}
@@ -210,10 +242,11 @@
 +            }
 +            return make_unique<BlockSetNode>(std::move(name), std::move(body));
 +        }
- 
++
          if (check(Token::Operator) && peek().value == "=") {
              advance();
-@@ -2140,4 +2244,4 @@
+         } else {
+@@ -2140,4 +2265,4 @@
      return render(context);
  }
  
@@ -221,7 +254,7 @@
 \ No newline at end of file
 +} // namespace jinja
 --- a/ujson.hpp	2026-09-05 19:36:30
-+++ b/ujson.hpp	2026-09-05 19:57:23
++++ b/ujson.hpp	2026-09-05 22:45:41
 @@ -411,7 +411,11 @@
  
  class json {

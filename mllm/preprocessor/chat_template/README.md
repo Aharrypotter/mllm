@@ -34,10 +34,11 @@ Migrated entry points:
 | Qwen3 service / probing | `Qwen3Session` | `config.json` | model directory |
 | Qwen3.5 (text, image, video) | `Qwen3_5Tokenizer::convertMessage` | `Qwen3_5Config` | next to `tokenizer.json` |
 | MiniCPM5 | `MiniCPM5Tokenizer::convertMessage` | `MiniCPM5Config` | next to `tokenizer.json` |
+| Qwen3 runner, Qwen3-MoE, Qwen Ascend, MiniCPM4, Qwen NPU | `<Model>Tokenizer::convertMessage` via `LegacyChatMl.hpp` | model config | next to `tokenizer.json` |
 
 The `legacy` renderers accept only the request shapes their runners have ever
-produced (Qwen3.5: one user turn; MiniCPM5: optional system plus one user
-turn). Anything else fails closed so a missing template is never approximated.
+produced (Qwen3.5: one user turn; MiniCPM5 and the ChatML runners: optional
+system plus one user turn). Anything else fails closed so a missing template is never approximated.
 The one intentional difference between `legacy` and the official templates is
 that the official Qwen3.5 template trims message content; the parity gate uses
 prompts without leading or trailing whitespace.

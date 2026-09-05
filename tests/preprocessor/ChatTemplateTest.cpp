@@ -9,6 +9,7 @@
 #include "mllm/models/qwen3/chat_template_qwen3.hpp"
 #include "mllm/models/qwen3_5/chat_template_qwen3_5.hpp"
 #include "mllm/preprocessor/chat_template/ChatTemplate.hpp"
+#include "mllm/preprocessor/chat_template/LegacyChatMl.hpp"
 
 #ifndef MLLM_ENABLE_JINJA_CHAT_TEMPLATE
 #define MLLM_ENABLE_JINJA_CHAT_TEMPLATE 0
@@ -226,6 +227,41 @@ TEST(ChatTemplateLoaderTest, RejectsMalformedSpecialTokens) {
                ChatTemplateError);
 }
 #endif
+
+#if MLLM_ENABLE_JINJA_CHAT_TEMPLATE
+TEST(JinjaChatTemplateTest, ConcatenatesListsAndUpdatesNamespacesAcrossScopes) {
+  auto tpl = inMemoryTemplate(
+      "{% set ns = namespace(n=0, seen=[]) %}{% for m in messages %}{% set ns.n = ns.n + 1 %}"
+      "{% set ns.seen = ns.seen + [m.role] %}{% endfor %}{{ ns.n }}:{{ ns.seen|length }}:{{ ([1] + [2, 3])|length }}");
+  ChatTemplateRequest request;
+  request.messages = {{{"role", "user"}, {"content", "a"}}, {{"role", "assistant"}, {"content", "b"}}};
+  EXPECT_EQ(tpl.render(request), "2:2:3");
+}
+#endif
+
+TEST(LegacyChatMlTest, PreservesTheSingleTurnRunnerPrompts) {
+  ChatPreprocessor preprocessor({.backend = ChatTemplateBackend::Legacy}, renderLegacyChatMlSingleTurn);
+  // Qwen3 / Qwen Ascend runners: enable_thinking=false.
+  EXPECT_EQ(preprocessor.render(makeSingleTurnChatTemplateRequest("你好", "", false)),
+            "<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
+  // Qwen3-MoE / MiniCPM4 runners: enable_thinking undefined.
+  EXPECT_EQ(preprocessor.render(makeSingleTurnChatTemplateRequest("hi")), "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n");
+  // Qwen NPU runner: fixed system prompt.
+  EXPECT_EQ(preprocessor.render(makeSingleTurnChatTemplateRequest("hi", "You are a helpful assistant.")),
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n");
+  // enable_thinking=true renders no empty thinking block, like the official templates.
+  EXPECT_EQ(preprocessor.render(makeSingleTurnChatTemplateRequest("hi", "", true)), "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n");
+}
+
+TEST(LegacyChatMlTest, FailsClosedOutsideTheMigrationShape) {
+  ChatPreprocessor preprocessor({.backend = ChatTemplateBackend::Legacy}, renderLegacyChatMlSingleTurn);
+  ChatTemplateRequest multi_turn;
+  multi_turn.messages = {{{"role", "user"}, {"content", "a"}}, {{"role", "assistant"}, {"content", "b"}}, {{"role", "user"}, {"content", "c"}}};
+  EXPECT_THROW(preprocessor.render(multi_turn), ChatTemplateError);
+  auto tools = makeSingleTurnChatTemplateRequest("a");
+  tools.tools = nlohmann::ordered_json::array();
+  EXPECT_THROW(preprocessor.render(tools), ChatTemplateError);
+}
 
 TEST(Qwen3_5LegacyChatTemplateTest, PreservesTheRunnerPromptBytes) {
   using namespace ::mllm::models::qwen3_5;
