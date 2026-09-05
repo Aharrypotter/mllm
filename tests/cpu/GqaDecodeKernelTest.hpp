@@ -59,158 +59,190 @@ inline std::string describe(const Geometry& geometry) {
          + " D=" + std::to_string(geometry.qk_dim) + " Dv=" + std::to_string(geometry.value_dim);
 }
 
-// Contiguous [B, H, S, D] strides for a single-token query/output (S = 1) or a
-// KV view whose sequence extent is `rows`.
-inline BhsdStrides contiguousStrides(int heads, int rows, int dim) { return {heads * rows * dim, rows * dim, dim, 1}; }
+// A float buffer together with the [B, H, S, D] strides the kernel uses to
+// address it. The strides are part of the contract under test: the production
+// caller hands the kernel views into a larger static cache and transposed
+// query/output tensors, never freshly packed contiguous arrays.
+struct StridedView {
+  std::vector<float> storage;
+  BhsdStrides strides;
+};
 
 inline std::size_t offset(const BhsdStrides& strides, int batch, int head, int row, int column) {
   return static_cast<std::size_t>(batch) * strides.batch + static_cast<std::size_t>(head) * strides.head
          + static_cast<std::size_t>(row) * strides.sequence + static_cast<std::size_t>(column) * strides.dimension;
 }
 
+// Contiguous [B, H, rows, dim] strides.
+inline BhsdStrides contiguousStrides(int heads, int rows, int dim) { return {heads * rows * dim, rows * dim, dim, 1}; }
+
+// Single-token query [B, Hq, 1, D] in contiguous memory.
+inline StridedView makeContiguousQuery(const Geometry& geometry, int salt) {
+  return {makeBuffer(static_cast<std::size_t>(geometry.batch) * geometry.query_heads * geometry.qk_dim, salt),
+          contiguousStrides(geometry.query_heads, 1, geometry.qk_dim)};
+}
+
+// KV cache [B, Hkv, S, dim] whose sequence extent is exactly kv_sequence.
+inline StridedView makeContiguousCache(const Geometry& geometry, int dim, int salt) {
+  return {makeBuffer(static_cast<std::size_t>(geometry.batch) * geometry.kv_heads * geometry.kv_sequence * dim, salt),
+          contiguousStrides(geometry.kv_heads, geometry.kv_sequence, dim)};
+}
+
+// Zero-filled single-token output [B, Hq, 1, Dv] in contiguous memory.
+inline StridedView makeContiguousOutput(const Geometry& geometry) {
+  return {std::vector<float>(static_cast<std::size_t>(geometry.batch) * geometry.query_heads * geometry.value_dim, 0.0F),
+          contiguousStrides(geometry.query_heads, 1, geometry.value_dim)};
+}
+
+// The same cache rows placed inside a static cache [B, Hkv, capacity, dim]
+// with capacity > kv_sequence, as nn::KVHeadStaticCache exposes them. Rows
+// beyond kv_sequence hold unrelated pattern bytes that the kernel must never
+// read.
+inline StridedView makeStaticCacheView(const Geometry& geometry, int capacity, int dim, const StridedView& contiguous,
+                                       int salt) {
+  StridedView view{makeBuffer(static_cast<std::size_t>(geometry.batch) * geometry.kv_heads * capacity * dim, salt),
+                   contiguousStrides(geometry.kv_heads, capacity, dim)};
+  for (int batch = 0; batch < geometry.batch; ++batch) {
+    for (int head = 0; head < geometry.kv_heads; ++head) {
+      for (int row = 0; row < geometry.kv_sequence; ++row) {
+        for (int column = 0; column < dim; ++column) {
+          view.storage[offset(view.strides, batch, head, row, column)] =
+              contiguous.storage[offset(contiguous.strides, batch, head, row, column)];
+        }
+      }
+    }
+  }
+  return view;
+}
+
+// The same query bytes described as a transposed [B, 1, Hq, D] tensor: head
+// stride D, batch and sequence stride Hq * D. With one token the memory order
+// coincides with the contiguous query, so only the stride bookkeeping differs.
+inline StridedView makeTransposedQueryView(const Geometry& geometry, const StridedView& contiguous_query) {
+  return {contiguous_query.storage,
+          {geometry.query_heads * geometry.qk_dim, geometry.qk_dim, geometry.query_heads * geometry.qk_dim, 1}};
+}
+
+inline StridedView makeTransposedOutputView(const Geometry& geometry) {
+  return {std::vector<float>(static_cast<std::size_t>(geometry.batch) * geometry.query_heads * geometry.value_dim, 0.0F),
+          {geometry.query_heads * geometry.value_dim, geometry.value_dim, geometry.query_heads * geometry.value_dim, 1}};
+}
+
+// The kernel's grouped scratch: group_size * kv_sequence probabilities.
+inline std::vector<float> makeScratch(const Geometry& geometry) {
+  return std::vector<float>(static_cast<std::size_t>(geometry.query_heads / geometry.kv_heads) * geometry.kv_sequence, 0.0F);
+}
+
 // Independent scalar reference: per query head, softmax(q . k / sqrt(D)) @ v
 // with double accumulation, honoring the same strided addressing contract.
-inline void referenceDecode(const Geometry& g, const float* query, BhsdStrides qs, const float* key, BhsdStrides ks,
-                            const float* value, BhsdStrides vs, std::vector<double>& output) {
-  const int group_size = g.query_heads / g.kv_heads;
-  const double scale = 1.0 / std::sqrt(static_cast<double>(g.qk_dim));
-  output.assign(static_cast<std::size_t>(g.batch) * g.query_heads * g.value_dim, 0.0);
-  std::vector<double> scores(static_cast<std::size_t>(g.kv_sequence));
-  for (int batch = 0; batch < g.batch; ++batch) {
-    for (int head = 0; head < g.query_heads; ++head) {
+inline void referenceDecode(const Geometry& geometry, const StridedView& query, const StridedView& key,
+                            const StridedView& value, std::vector<double>& output) {
+  const int group_size = geometry.query_heads / geometry.kv_heads;
+  const double scale = 1.0 / std::sqrt(static_cast<double>(geometry.qk_dim));
+  output.assign(static_cast<std::size_t>(geometry.batch) * geometry.query_heads * geometry.value_dim, 0.0);
+  std::vector<double> scores(static_cast<std::size_t>(geometry.kv_sequence));
+  for (int batch = 0; batch < geometry.batch; ++batch) {
+    for (int head = 0; head < geometry.query_heads; ++head) {
       const int kv_head = head / group_size;
       double maximum = -std::numeric_limits<double>::infinity();
-      for (int row = 0; row < g.kv_sequence; ++row) {
+      for (int row = 0; row < geometry.kv_sequence; ++row) {
         double score = 0.0;
-        for (int column = 0; column < g.qk_dim; ++column) {
-          score += static_cast<double>(query[offset(qs, batch, head, 0, column)])
-                   * static_cast<double>(key[offset(ks, batch, kv_head, row, column)]);
+        for (int column = 0; column < geometry.qk_dim; ++column) {
+          score += static_cast<double>(query.storage[offset(query.strides, batch, head, 0, column)])
+                   * static_cast<double>(key.storage[offset(key.strides, batch, kv_head, row, column)]);
         }
         scores[static_cast<std::size_t>(row)] = score * scale;
         maximum = std::max(maximum, scores[static_cast<std::size_t>(row)]);
       }
       double denominator = 0.0;
-      for (int row = 0; row < g.kv_sequence; ++row) {
+      for (int row = 0; row < geometry.kv_sequence; ++row) {
         scores[static_cast<std::size_t>(row)] = std::exp(scores[static_cast<std::size_t>(row)] - maximum);
         denominator += scores[static_cast<std::size_t>(row)];
       }
-      auto* out = output.data() + (static_cast<std::size_t>(batch) * g.query_heads + head) * g.value_dim;
-      for (int row = 0; row < g.kv_sequence; ++row) {
+      auto* out = output.data() + (static_cast<std::size_t>(batch) * geometry.query_heads + head) * geometry.value_dim;
+      for (int row = 0; row < geometry.kv_sequence; ++row) {
         const double probability = scores[static_cast<std::size_t>(row)] / denominator;
-        for (int column = 0; column < g.value_dim; ++column) {
-          out[column] += probability * static_cast<double>(value[offset(vs, batch, kv_head, row, column)]);
+        for (int column = 0; column < geometry.value_dim; ++column) {
+          out[column] += probability * static_cast<double>(value.storage[offset(value.strides, batch, kv_head, row, column)]);
         }
       }
     }
   }
 }
 
-struct Run {
-  std::vector<float> query;
-  std::vector<float> key;
-  std::vector<float> value;
-  std::vector<float> output;
-  std::vector<float> scratch;
-  BhsdStrides qs{};
-  BhsdStrides ks{};
-  BhsdStrides vs{};
-  BhsdStrides os{};
-};
-
-// Contiguous layouts; the KV view is exactly `kv_sequence` rows long.
-inline Run makeContiguousRun(const Geometry& g) {
-  Run run;
-  run.qs = contiguousStrides(g.query_heads, 1, g.qk_dim);
-  run.ks = contiguousStrides(g.kv_heads, g.kv_sequence, g.qk_dim);
-  run.vs = contiguousStrides(g.kv_heads, g.kv_sequence, g.value_dim);
-  run.os = contiguousStrides(g.query_heads, 1, g.value_dim);
-  run.query = makeBuffer(static_cast<std::size_t>(g.batch) * g.query_heads * g.qk_dim, 1);
-  run.key = makeBuffer(static_cast<std::size_t>(g.batch) * g.kv_heads * g.kv_sequence * g.qk_dim, 2);
-  run.value = makeBuffer(static_cast<std::size_t>(g.batch) * g.kv_heads * g.kv_sequence * g.value_dim, 3);
-  run.output.assign(static_cast<std::size_t>(g.batch) * g.query_heads * g.value_dim, 0.0F);
-  run.scratch.assign(static_cast<std::size_t>(g.query_heads / g.kv_heads) * g.kv_sequence, 0.0F);
-  return run;
-}
-
-inline bool invoke(const Geometry& g, Run& run) {
-  return fwdBhsdFp32(g.batch, g.query_heads, g.kv_heads, g.kv_sequence, g.qk_dim, g.value_dim, run.query.data(), run.qs,
-                     run.key.data(), run.ks, run.value.data(), run.vs, run.output.data(), run.os, run.scratch.data());
-}
-
 constexpr float kReferenceTolerance = 1.0e-4F;
 
-inline void expectMatchesReference(const Geometry& g, const Run& run, const std::vector<double>& reference,
+inline void expectMatchesReference(const Geometry& geometry, const StridedView& output, const std::vector<double>& reference,
                                    const std::string& label) {
-  for (int batch = 0; batch < g.batch; ++batch) {
-    for (int head = 0; head < g.query_heads; ++head) {
-      for (int column = 0; column < g.value_dim; ++column) {
-        const auto expected = reference[(static_cast<std::size_t>(batch) * g.query_heads + head) * g.value_dim + column];
-        const auto actual = run.output[offset(run.os, batch, head, 0, column)];
+  for (int batch = 0; batch < geometry.batch; ++batch) {
+    for (int head = 0; head < geometry.query_heads; ++head) {
+      for (int column = 0; column < geometry.value_dim; ++column) {
+        const auto expected =
+            reference[(static_cast<std::size_t>(batch) * geometry.query_heads + head) * geometry.value_dim + column];
+        const auto actual = output.storage[offset(output.strides, batch, head, 0, column)];
         ASSERT_NEAR(actual, expected, kReferenceTolerance)
-            << label << " " << describe(g) << " b=" << batch << " h=" << head << " d=" << column;
+            << label << " " << describe(geometry) << " b=" << batch << " h=" << head << " d=" << column;
       }
     }
   }
 }
 
 inline void testMatchesScalarReference(const std::vector<Geometry>& geometries) {
-  for (const auto& g : geometries) {
-    auto run = makeContiguousRun(g);
-    ASSERT_TRUE(invoke(g, run)) << describe(g);
+  for (const auto& geometry : geometries) {
+    const auto query = makeContiguousQuery(geometry, 1);
+    const auto key = makeContiguousCache(geometry, geometry.qk_dim, 2);
+    const auto value = makeContiguousCache(geometry, geometry.value_dim, 3);
+    auto output = makeContiguousOutput(geometry);
+    auto scratch = makeScratch(geometry);
+
+    ASSERT_TRUE(fwdBhsdFp32(geometry.batch, geometry.query_heads, geometry.kv_heads, geometry.kv_sequence, geometry.qk_dim,
+                            geometry.value_dim, query.storage.data(), query.strides, key.storage.data(), key.strides,
+                            value.storage.data(), value.strides, output.storage.data(), output.strides, scratch.data()))
+        << describe(geometry);
+
     std::vector<double> reference;
-    referenceDecode(g, run.query.data(), run.qs, run.key.data(), run.ks, run.value.data(), run.vs, reference);
-    expectMatchesReference(g, run, reference, "contiguous");
+    referenceDecode(geometry, query, key, value, reference);
+    expectMatchesReference(geometry, output, reference, "contiguous");
   }
 }
 
 // The production consumer hands the kernel a KV view inside a larger static
-// cache ([B, Hkv, max_len, D] with only `kv_sequence` rows valid) and a query
-// that is a transposed [B, 1, Hq, D] view. Both must be addressed through the
-// strides rather than assumed contiguous.
-inline void testNativeCacheAndTransposedQueryStrides(const Geometry& g, int cache_capacity) {
-  ASSERT_GT(cache_capacity, g.kv_sequence);
-  auto contiguous = makeContiguousRun(g);
-  ASSERT_TRUE(invoke(g, contiguous)) << describe(g);
+// cache and a transposed query/output view. Both must be addressed through the
+// strides, and the result must be bitwise identical to the contiguous
+// computation because the same bytes are read in the same order.
+inline void testNativeCacheAndTransposedQueryStrides(const Geometry& geometry, int cache_capacity) {
+  ASSERT_GT(cache_capacity, geometry.kv_sequence);
+  const auto contiguous_query = makeContiguousQuery(geometry, 1);
+  const auto contiguous_key = makeContiguousCache(geometry, geometry.qk_dim, 2);
+  const auto contiguous_value = makeContiguousCache(geometry, geometry.value_dim, 3);
+  auto contiguous_output = makeContiguousOutput(geometry);
+  auto scratch = makeScratch(geometry);
+  ASSERT_TRUE(fwdBhsdFp32(geometry.batch, geometry.query_heads, geometry.kv_heads, geometry.kv_sequence, geometry.qk_dim,
+                          geometry.value_dim, contiguous_query.storage.data(), contiguous_query.strides,
+                          contiguous_key.storage.data(), contiguous_key.strides, contiguous_value.storage.data(),
+                          contiguous_value.strides, contiguous_output.storage.data(), contiguous_output.strides,
+                          scratch.data()))
+      << describe(geometry);
 
-  Run strided;
-  strided.ks = contiguousStrides(g.kv_heads, cache_capacity, g.qk_dim);
-  strided.vs = contiguousStrides(g.kv_heads, cache_capacity, g.value_dim);
-  // [B, 1, Hq, D] memory order: head stride D, batch stride Hq * D.
-  strided.qs = {g.query_heads * g.qk_dim, g.qk_dim, g.query_heads * g.qk_dim, 1};
-  strided.os = {g.query_heads * g.value_dim, g.value_dim, g.query_heads * g.value_dim, 1};
-  strided.key = makeBuffer(static_cast<std::size_t>(g.batch) * g.kv_heads * cache_capacity * g.qk_dim, 7);
-  strided.value = makeBuffer(static_cast<std::size_t>(g.batch) * g.kv_heads * cache_capacity * g.value_dim, 8);
-  strided.query = contiguous.query;
-  strided.output.assign(contiguous.output.size(), 0.0F);
-  strided.scratch.assign(contiguous.scratch.size(), 0.0F);
-  for (int batch = 0; batch < g.batch; ++batch) {
-    for (int head = 0; head < g.kv_heads; ++head) {
-      for (int row = 0; row < g.kv_sequence; ++row) {
-        for (int column = 0; column < g.qk_dim; ++column) {
-          strided.key[offset(strided.ks, batch, head, row, column)] =
-              contiguous.key[offset(contiguous.ks, batch, head, row, column)];
-        }
-        for (int column = 0; column < g.value_dim; ++column) {
-          strided.value[offset(strided.vs, batch, head, row, column)] =
-              contiguous.value[offset(contiguous.vs, batch, head, row, column)];
-        }
-      }
-    }
-  }
-  ASSERT_TRUE(invoke(g, strided)) << describe(g);
+  const auto query_view = makeTransposedQueryView(geometry, contiguous_query);
+  const auto key_view = makeStaticCacheView(geometry, cache_capacity, geometry.qk_dim, contiguous_key, 7);
+  const auto value_view = makeStaticCacheView(geometry, cache_capacity, geometry.value_dim, contiguous_value, 8);
+  auto output_view = makeTransposedOutputView(geometry);
+  ASSERT_TRUE(fwdBhsdFp32(geometry.batch, geometry.query_heads, geometry.kv_heads, geometry.kv_sequence, geometry.qk_dim,
+                          geometry.value_dim, query_view.storage.data(), query_view.strides, key_view.storage.data(),
+                          key_view.strides, value_view.storage.data(), value_view.strides, output_view.storage.data(),
+                          output_view.strides, scratch.data()))
+      << describe(geometry);
 
   std::vector<double> reference;
-  referenceDecode(g, strided.query.data(), strided.qs, strided.key.data(), strided.ks, strided.value.data(), strided.vs,
-                  reference);
-  expectMatchesReference(g, strided, reference, "strided");
-  for (int batch = 0; batch < g.batch; ++batch) {
-    for (int head = 0; head < g.query_heads; ++head) {
-      for (int column = 0; column < g.value_dim; ++column) {
-        // Same bytes read in the same order: the strided view must be bitwise
-        // identical to the contiguous computation, not merely close.
-        ASSERT_EQ(strided.output[offset(strided.os, batch, head, 0, column)],
-                  contiguous.output[offset(contiguous.os, batch, head, 0, column)])
-            << describe(g) << " b=" << batch << " h=" << head << " d=" << column;
+  referenceDecode(geometry, query_view, key_view, value_view, reference);
+  expectMatchesReference(geometry, output_view, reference, "strided");
+  for (int batch = 0; batch < geometry.batch; ++batch) {
+    for (int head = 0; head < geometry.query_heads; ++head) {
+      for (int column = 0; column < geometry.value_dim; ++column) {
+        ASSERT_EQ(output_view.storage[offset(output_view.strides, batch, head, 0, column)],
+                  contiguous_output.storage[offset(contiguous_output.strides, batch, head, 0, column)])
+            << describe(geometry) << " b=" << batch << " h=" << head << " d=" << column;
       }
     }
   }
@@ -220,45 +252,68 @@ inline void testNativeCacheAndTransposedQueryStrides(const Geometry& g, int cach
 // accumulates its keys in increasing order, so a grouped call must reproduce
 // the per-head single-KV-head call bitwise. This also proves the grouped
 // scratch rows do not leak between heads or batches.
-inline void testGroupedSlicesMatchSingleHeadCallsBitwise(const Geometry& g) {
-  auto grouped = makeContiguousRun(g);
-  ASSERT_TRUE(invoke(g, grouped)) << describe(g);
-  const int group_size = g.query_heads / g.kv_heads;
-  const Geometry single{1, 1, 1, g.kv_sequence, g.qk_dim, g.value_dim};
-  for (int batch = 0; batch < g.batch; ++batch) {
-    for (int head = 0; head < g.query_heads; ++head) {
+inline void testGroupedSlicesMatchSingleHeadCallsBitwise(const Geometry& geometry) {
+  const auto query = makeContiguousQuery(geometry, 1);
+  const auto key = makeContiguousCache(geometry, geometry.qk_dim, 2);
+  const auto value = makeContiguousCache(geometry, geometry.value_dim, 3);
+  auto grouped_output = makeContiguousOutput(geometry);
+  auto grouped_scratch = makeScratch(geometry);
+  ASSERT_TRUE(fwdBhsdFp32(geometry.batch, geometry.query_heads, geometry.kv_heads, geometry.kv_sequence, geometry.qk_dim,
+                          geometry.value_dim, query.storage.data(), query.strides, key.storage.data(), key.strides,
+                          value.storage.data(), value.strides, grouped_output.storage.data(), grouped_output.strides,
+                          grouped_scratch.data()))
+      << describe(geometry);
+
+  const int group_size = geometry.query_heads / geometry.kv_heads;
+  const Geometry single{1, 1, 1, geometry.kv_sequence, geometry.qk_dim, geometry.value_dim};
+  const auto key_head_size = static_cast<std::size_t>(geometry.kv_sequence) * geometry.qk_dim;
+  const auto value_head_size = static_cast<std::size_t>(geometry.kv_sequence) * geometry.value_dim;
+  for (int batch = 0; batch < geometry.batch; ++batch) {
+    for (int head = 0; head < geometry.query_heads; ++head) {
       const int kv_head = head / group_size;
-      Run one;
-      one.qs = contiguousStrides(1, 1, g.qk_dim);
-      one.ks = contiguousStrides(1, g.kv_sequence, g.qk_dim);
-      one.vs = contiguousStrides(1, g.kv_sequence, g.value_dim);
-      one.os = contiguousStrides(1, 1, g.value_dim);
-      one.query.assign(grouped.query.begin() + static_cast<std::ptrdiff_t>(offset(grouped.qs, batch, head, 0, 0)),
-                       grouped.query.begin() + static_cast<std::ptrdiff_t>(offset(grouped.qs, batch, head, 0, 0)) + g.qk_dim);
-      const auto key_begin = static_cast<std::ptrdiff_t>(offset(grouped.ks, batch, kv_head, 0, 0));
-      one.key.assign(grouped.key.begin() + key_begin,
-                     grouped.key.begin() + key_begin + static_cast<std::ptrdiff_t>(g.kv_sequence) * g.qk_dim);
-      const auto value_begin = static_cast<std::ptrdiff_t>(offset(grouped.vs, batch, kv_head, 0, 0));
-      one.value.assign(grouped.value.begin() + value_begin,
-                       grouped.value.begin() + value_begin + static_cast<std::ptrdiff_t>(g.kv_sequence) * g.value_dim);
-      one.output.assign(static_cast<std::size_t>(g.value_dim), 0.0F);
-      one.scratch.assign(static_cast<std::size_t>(g.kv_sequence), 0.0F);
-      ASSERT_TRUE(invoke(single, one)) << describe(g);
-      for (int column = 0; column < g.value_dim; ++column) {
-        ASSERT_EQ(grouped.output[offset(grouped.os, batch, head, 0, column)], one.output[static_cast<std::size_t>(column)])
-            << describe(g) << " b=" << batch << " h=" << head << " d=" << column;
+      // Slice the grouped operands down to one query head and its KV head.
+      const auto* query_head = query.storage.data() + offset(query.strides, batch, head, 0, 0);
+      const auto* key_head = key.storage.data() + offset(key.strides, batch, kv_head, 0, 0);
+      const auto* value_head = value.storage.data() + offset(value.strides, batch, kv_head, 0, 0);
+      const StridedView single_query{std::vector<float>(query_head, query_head + geometry.qk_dim),
+                                     contiguousStrides(1, 1, geometry.qk_dim)};
+      const StridedView single_key{std::vector<float>(key_head, key_head + key_head_size),
+                                   contiguousStrides(1, geometry.kv_sequence, geometry.qk_dim)};
+      const StridedView single_value{std::vector<float>(value_head, value_head + value_head_size),
+                                     contiguousStrides(1, geometry.kv_sequence, geometry.value_dim)};
+      auto single_output = makeContiguousOutput(single);
+      auto single_scratch = makeScratch(single);
+      ASSERT_TRUE(fwdBhsdFp32(single.batch, single.query_heads, single.kv_heads, single.kv_sequence, single.qk_dim,
+                              single.value_dim, single_query.storage.data(), single_query.strides, single_key.storage.data(),
+                              single_key.strides, single_value.storage.data(), single_value.strides,
+                              single_output.storage.data(), single_output.strides, single_scratch.data()))
+          << describe(geometry);
+      for (int column = 0; column < geometry.value_dim; ++column) {
+        ASSERT_EQ(grouped_output.storage[offset(grouped_output.strides, batch, head, 0, column)],
+                  single_output.storage[static_cast<std::size_t>(column)])
+            << describe(geometry) << " b=" << batch << " h=" << head << " d=" << column;
       }
     }
   }
 }
 
-inline void testRepeatedCallsAreBitwiseStable(const Geometry& g, int repeats) {
-  auto first = makeContiguousRun(g);
-  ASSERT_TRUE(invoke(g, first)) << describe(g);
-  for (int repeat = 0; repeat < repeats; ++repeat) {
-    auto again = makeContiguousRun(g);
-    ASSERT_TRUE(invoke(g, again)) << describe(g);
-    ASSERT_EQ(again.output, first.output) << describe(g) << " repeat=" << repeat;
+inline void testRepeatedCallsAreBitwiseStable(const Geometry& geometry, int repeats) {
+  const auto query = makeContiguousQuery(geometry, 1);
+  const auto key = makeContiguousCache(geometry, geometry.qk_dim, 2);
+  const auto value = makeContiguousCache(geometry, geometry.value_dim, 3);
+  std::vector<float> first;
+  for (int repeat = 0; repeat <= repeats; ++repeat) {
+    auto output = makeContiguousOutput(geometry);
+    auto scratch = makeScratch(geometry);
+    ASSERT_TRUE(fwdBhsdFp32(geometry.batch, geometry.query_heads, geometry.kv_heads, geometry.kv_sequence, geometry.qk_dim,
+                            geometry.value_dim, query.storage.data(), query.strides, key.storage.data(), key.strides,
+                            value.storage.data(), value.strides, output.storage.data(), output.strides, scratch.data()))
+        << describe(geometry);
+    if (repeat == 0) {
+      first = output.storage;
+    } else {
+      ASSERT_EQ(output.storage, first) << describe(geometry) << " repeat=" << repeat;
+    }
   }
 }
 
@@ -266,70 +321,79 @@ inline void testRepeatedCallsAreBitwiseStable(const Geometry& g, int repeats) {
 // before any byte of the output is touched; the backend op then takes the
 // reference path.
 inline void testRejectsInvalidGeometryAndStrides() {
-  const Geometry g{1, 4, 2, 3, 8, 8};
-  auto run = makeContiguousRun(g);
-  ASSERT_TRUE(invoke(g, run));
+  const Geometry geometry{1, 4, 2, 3, 8, 8};
+  const auto query = makeContiguousQuery(geometry, 1);
+  const auto key = makeContiguousCache(geometry, geometry.qk_dim, 2);
+  const auto value = makeContiguousCache(geometry, geometry.value_dim, 3);
+  auto output = makeContiguousOutput(geometry);
+  auto scratch = makeScratch(geometry);
+  ASSERT_TRUE(fwdBhsdFp32(geometry.batch, geometry.query_heads, geometry.kv_heads, geometry.kv_sequence, geometry.qk_dim,
+                          geometry.value_dim, query.storage.data(), query.strides, key.storage.data(), key.strides,
+                          value.storage.data(), value.strides, output.storage.data(), output.strides, scratch.data()));
 
-  auto expectRejected = [&](const std::string& label, auto&& mutate) {
-    auto probe = makeContiguousRun(g);
-    Geometry geometry = g;
-    const float sentinel = 123.5F;
-    probe.output.assign(probe.output.size(), sentinel);
-    float* query = probe.query.data();
-    float* key = probe.key.data();
-    float* value = probe.value.data();
-    float* output = probe.output.data();
-    float* scratch = probe.scratch.data();
-    mutate(geometry, probe, query, key, value, output, scratch);
-    EXPECT_FALSE(fwdBhsdFp32(geometry.batch, geometry.query_heads, geometry.kv_heads, geometry.kv_sequence, geometry.qk_dim,
-                             geometry.value_dim, query, probe.qs, key, probe.ks, value, probe.vs, output, probe.os, scratch))
+  constexpr float kSentinel = 123.5F;
+  const auto expectRejected = [&](const std::string& label, int query_heads, int kv_sequence, int qk_dim,
+                                  const float* query_data, const float* key_data, BhsdStrides key_strides,
+                                  const float* value_data, BhsdStrides value_strides, BhsdStrides output_strides,
+                                  float* scratch_data) {
+    std::vector<float> untouched(output.storage.size(), kSentinel);
+    EXPECT_FALSE(fwdBhsdFp32(geometry.batch, query_heads, geometry.kv_heads, kv_sequence, qk_dim, geometry.value_dim,
+                             query_data, query.strides, key_data, key_strides, value_data, value_strides, untouched.data(),
+                             output_strides, scratch_data))
         << label;
-    for (const auto element : probe.output) { EXPECT_EQ(element, sentinel) << label << " touched the output"; }
+    for (const auto element : untouched) { EXPECT_EQ(element, kSentinel) << label << " touched the output"; }
   };
-  using Mutator = void (*)(Geometry&, Run&, float*&, float*&, float*&, float*&, float*&);
-  expectRejected("query heads not a multiple of kv heads",
-                 static_cast<Mutator>(
-                     [](Geometry& geometry, Run&, float*&, float*&, float*&, float*&, float*&) { geometry.query_heads = 3; }));
-  expectRejected("zero kv sequence", static_cast<Mutator>([](Geometry& geometry, Run&, float*&, float*&, float*&, float*&,
-                                                             float*&) { geometry.kv_sequence = 0; }));
-  expectRejected("zero qk dim", static_cast<Mutator>([](Geometry& geometry, Run&, float*&, float*&, float*&, float*&, float*&) {
-                   geometry.qk_dim = 0;
-                 }));
-  expectRejected("null query", static_cast<Mutator>([](Geometry&, Run&, float*& query, float*&, float*&, float*&, float*&) {
-                   query = nullptr;
-                 }));
-  expectRejected("null key",
-                 static_cast<Mutator>([](Geometry&, Run&, float*&, float*& key, float*&, float*&, float*&) { key = nullptr; }));
-  expectRejected("null value", static_cast<Mutator>([](Geometry&, Run&, float*&, float*&, float*& value, float*&, float*&) {
-                   value = nullptr;
-                 }));
-  expectRejected("null scratch", static_cast<Mutator>([](Geometry&, Run&, float*&, float*&, float*&, float*&, float*& scratch) {
-                   scratch = nullptr;
-                 }));
-  expectRejected("non-unit key dimension stride", static_cast<Mutator>([](Geometry&, Run& probe, float*&, float*&, float*&,
-                                                                          float*&, float*&) { probe.ks.dimension = 2; }));
-  expectRejected("non-unit output dimension stride", static_cast<Mutator>([](Geometry&, Run& probe, float*&, float*&, float*&,
-                                                                             float*&, float*&) { probe.os.dimension = 2; }));
-  expectRejected("non-positive value sequence stride", static_cast<Mutator>([](Geometry&, Run& probe, float*&, float*&, float*&,
-                                                                               float*&, float*&) { probe.vs.sequence = 0; }));
+  const auto* query_data = query.storage.data();
+  const auto* key_data = key.storage.data();
+  const auto* value_data = value.storage.data();
+  BhsdStrides non_unit_dimension = key.strides;
+  non_unit_dimension.dimension = 2;
+  BhsdStrides non_unit_output_dimension = output.strides;
+  non_unit_output_dimension.dimension = 2;
+  BhsdStrides zero_sequence = value.strides;
+  zero_sequence.sequence = 0;
+
+  expectRejected("query heads not a multiple of kv heads", 3, geometry.kv_sequence, geometry.qk_dim, query_data, key_data,
+                 key.strides, value_data, value.strides, output.strides, scratch.data());
+  expectRejected("zero kv sequence", geometry.query_heads, 0, geometry.qk_dim, query_data, key_data, key.strides, value_data,
+                 value.strides, output.strides, scratch.data());
+  expectRejected("zero qk dim", geometry.query_heads, geometry.kv_sequence, 0, query_data, key_data, key.strides, value_data,
+                 value.strides, output.strides, scratch.data());
+  expectRejected("null query", geometry.query_heads, geometry.kv_sequence, geometry.qk_dim, nullptr, key_data, key.strides,
+                 value_data, value.strides, output.strides, scratch.data());
+  expectRejected("null key", geometry.query_heads, geometry.kv_sequence, geometry.qk_dim, query_data, nullptr, key.strides,
+                 value_data, value.strides, output.strides, scratch.data());
+  expectRejected("null value", geometry.query_heads, geometry.kv_sequence, geometry.qk_dim, query_data, key_data, key.strides,
+                 nullptr, value.strides, output.strides, scratch.data());
+  expectRejected("null scratch", geometry.query_heads, geometry.kv_sequence, geometry.qk_dim, query_data, key_data, key.strides,
+                 value_data, value.strides, output.strides, nullptr);
+  expectRejected("non-unit key dimension stride", geometry.query_heads, geometry.kv_sequence, geometry.qk_dim, query_data,
+                 key_data, non_unit_dimension, value_data, value.strides, output.strides, scratch.data());
+  expectRejected("non-unit output dimension stride", geometry.query_heads, geometry.kv_sequence, geometry.qk_dim, query_data,
+                 key_data, key.strides, value_data, value.strides, non_unit_output_dimension, scratch.data());
+  expectRejected("non-positive value sequence stride", geometry.query_heads, geometry.kv_sequence, geometry.qk_dim, query_data,
+                 key_data, key.strides, value_data, zero_sequence, output.strides, scratch.data());
 }
 
 }  // namespace gqa_decode_kernel_test
 
 class GqaDecodeKernelTest : public KernelTest {
  public:
-  using Geometry = gqa_decode_kernel_test::Geometry;
-  static void testMatchesScalarReference(const std::vector<Geometry>& geometries) {
+  void testMatchesScalarReference(const std::vector<gqa_decode_kernel_test::Geometry>& geometries) {
     gqa_decode_kernel_test::testMatchesScalarReference(geometries);
   }
-  static void testNativeCacheAndTransposedQueryStrides(const Geometry& geometry, int cache_capacity) {
+
+  void testNativeCacheAndTransposedQueryStrides(const gqa_decode_kernel_test::Geometry& geometry, int cache_capacity) {
     gqa_decode_kernel_test::testNativeCacheAndTransposedQueryStrides(geometry, cache_capacity);
   }
-  static void testGroupedSlicesMatchSingleHeadCallsBitwise(const Geometry& geometry) {
+
+  void testGroupedSlicesMatchSingleHeadCallsBitwise(const gqa_decode_kernel_test::Geometry& geometry) {
     gqa_decode_kernel_test::testGroupedSlicesMatchSingleHeadCallsBitwise(geometry);
   }
-  static void testRepeatedCallsAreBitwiseStable(const Geometry& geometry, int repeats) {
+
+  void testRepeatedCallsAreBitwiseStable(const gqa_decode_kernel_test::Geometry& geometry, int repeats) {
     gqa_decode_kernel_test::testRepeatedCallsAreBitwiseStable(geometry, repeats);
   }
-  static void testRejectsInvalidGeometryAndStrides() { gqa_decode_kernel_test::testRejectsInvalidGeometryAndStrides(); }
+
+  void testRejectsInvalidGeometryAndStrides() { gqa_decode_kernel_test::testRejectsInvalidGeometryAndStrides(); }
 };
