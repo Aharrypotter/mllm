@@ -56,3 +56,15 @@ generation limit:
 The expected completion marker is
 `LING3_RUN_OK prompt_tokens=49 generated_tokens=64`. This is a generation
 correctness demo, not a perplexity, model-quality, or performance benchmark.
+
+## Retained tests
+
+The Ling-specific coverage follows the repository test layout (`ctest` labels
+in parentheses):
+
+| Layer | Target | Notes |
+| --- | --- | --- |
+| KDA kernel | `Mllm-Test-CPUKernel --gtest_filter='KimiDeltaAttentionKernelTest.*'` (`cpu-kernel`) | scalar-reference oracle, bitwise prefill/decode and serial/parallel checks |
+| Public `nn::KimiDeltaAttention` | `Mllm-Test-Nn-KimiDeltaAttention` (`KimiDeltaAttentionFocused`) | eager reference, in-place state, chunked equivalence, trace + serialization |
+| Causal convolution | upstream `Mllm-Test-Nn-CausalDepthwiseConv1D` and the `CausalDepthwiseConv*KernelTest` suites | Ling registers the upstream operation with the current-first order |
+| Model | `Mllm-Test-Ling3-Config`, `Mllm-Test-Ling3-RoPE`, `Mllm-Test-Ling3-Tokenizer` (`ling3`) | set `MLLM_LING3_EXAMPLE_DIR` on a device; the tokenizer test skips unless `LING3_OFFICIAL_TOKENIZER` points at the official `tokenizer.json` |
