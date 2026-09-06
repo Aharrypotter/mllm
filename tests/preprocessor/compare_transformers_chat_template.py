@@ -109,6 +109,14 @@ def renderer_cases(model: str):
             "extra_context": {"enable_thinking": False},
         },
         {
+            # Non-ASCII numerals (\p{N}: Nd, Nl, No) and Unicode white space
+            # (\s: NBSP, ideographic space) exercise the pre-tokenizer classes.
+            "name": "unicode_numerals_and_spaces",
+            "messages": [{"role": "user", "content": "编号①②③，价格٣٤٥元，第Ⅳ章，面积²\u00a0平方\u3000mllm"}],
+            "add_generation_prompt": True,
+            "extra_context": {"enable_thinking": False},
+        },
+        {
             "name": "system_thinking",
             "messages": [
                 {"role": "system", "content": "Answer briefly."},

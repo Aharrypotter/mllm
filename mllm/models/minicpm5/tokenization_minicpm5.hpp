@@ -37,7 +37,7 @@ inline bool miniCPM5TokenizerMatchPattern(const std::wstring& input, size_t& pos
   for (const auto& contraction : contractions) {
     bool matches = position + contraction.size() <= input.size();
     for (size_t index = 0; matches && index < contraction.size(); ++index) {
-      matches = std::towlower(input[position + index]) == contraction[index];
+      matches = preprocessor::toLower(input[position + index]) == contraction[index];
     }
     if (matches) {
       matched = input.substr(position, contraction.size());
@@ -72,11 +72,11 @@ inline bool miniCPM5TokenizerMatchPattern(const std::wstring& input, size_t& pos
     const size_t original_position = position;
     const size_t start = position;
     if (input[position] == L' ') ++position;
-    if (position < input.size() && !std::iswspace(input[position]) && !preprocessor::isLetter(input[position])
+    if (position < input.size() && !preprocessor::isWhitespace(input[position]) && !preprocessor::isLetter(input[position])
         && !preprocessor::isDigit(input[position])) {
       do {
         ++position;
-      } while (position < input.size() && !std::iswspace(input[position]) && !preprocessor::isLetter(input[position])
+      } while (position < input.size() && !preprocessor::isWhitespace(input[position]) && !preprocessor::isLetter(input[position])
                && !preprocessor::isDigit(input[position]));
       while (position < input.size() && (input[position] == L'\r' || input[position] == L'\n')) ++position;
       matched = input.substr(start, position - start);
@@ -89,7 +89,7 @@ inline bool miniCPM5TokenizerMatchPattern(const std::wstring& input, size_t& pos
     const size_t start = position;
     size_t scan = position;
     size_t last_line_break = std::wstring::npos;
-    while (scan < input.size() && std::iswspace(input[scan])) {
+    while (scan < input.size() && preprocessor::isWhitespace(input[scan])) {
       if (input[scan] == L'\r' || input[scan] == L'\n') last_line_break = scan + 1;
       ++scan;
     }
@@ -100,9 +100,9 @@ inline bool miniCPM5TokenizerMatchPattern(const std::wstring& input, size_t& pos
     }
   }
 
-  if (std::iswspace(input[position])) {
+  if (preprocessor::isWhitespace(input[position])) {
     const size_t start = position;
-    while (position < input.size() && std::iswspace(input[position])) ++position;
+    while (position < input.size() && preprocessor::isWhitespace(input[position])) ++position;
     if (position >= input.size()) {
       matched = input.substr(start, position - start);
       return true;
@@ -115,9 +115,9 @@ inline bool miniCPM5TokenizerMatchPattern(const std::wstring& input, size_t& pos
     position = start;
   }
 
-  if (std::iswspace(input[position])) {
+  if (preprocessor::isWhitespace(input[position])) {
     const size_t start = position;
-    while (position < input.size() && std::iswspace(input[position])) ++position;
+    while (position < input.size() && preprocessor::isWhitespace(input[position])) ++position;
     matched = input.substr(start, position - start);
     return true;
   }

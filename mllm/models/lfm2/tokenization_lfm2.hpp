@@ -27,7 +27,7 @@ inline bool tokenizerMatch(const std::wstring& input, size_t& pos, std::wstring&
   for (const auto& contraction : contractions) {
     bool match = pos + contraction.size() <= input.size();
     for (size_t index = 0; match && index < contraction.size(); ++index) {
-      match = std::towlower(input[pos + index]) == contraction[index];
+      match = preprocessor::toLower(input[pos + index]) == contraction[index];
     }
     if (match) {
       matched = input.substr(pos, contraction.size());
@@ -62,9 +62,9 @@ inline bool tokenizerMatch(const std::wstring& input, size_t& pos, std::wstring&
     const auto original = pos;
     const auto start = pos;
     if (input[pos] == L' ') ++pos;
-    if (pos < input.size() && !std::iswspace(input[pos]) && !preprocessor::isLetter(input[pos])
+    if (pos < input.size() && !preprocessor::isWhitespace(input[pos]) && !preprocessor::isLetter(input[pos])
         && !preprocessor::isDigit(input[pos])) {
-      while (pos < input.size() && !std::iswspace(input[pos]) && !preprocessor::isLetter(input[pos])
+      while (pos < input.size() && !preprocessor::isWhitespace(input[pos]) && !preprocessor::isLetter(input[pos])
              && !preprocessor::isDigit(input[pos])) {
         ++pos;
       }
@@ -79,7 +79,7 @@ inline bool tokenizerMatch(const std::wstring& input, size_t& pos, std::wstring&
     const auto start = pos;
     auto scan = pos;
     size_t last_break = std::wstring::npos;
-    while (scan < input.size() && std::iswspace(input[scan])) {
+    while (scan < input.size() && preprocessor::isWhitespace(input[scan])) {
       if (input[scan] == L'\r' || input[scan] == L'\n') last_break = scan + 1;
       ++scan;
     }
@@ -90,9 +90,9 @@ inline bool tokenizerMatch(const std::wstring& input, size_t& pos, std::wstring&
     }
   }
 
-  if (std::iswspace(input[pos])) {
+  if (preprocessor::isWhitespace(input[pos])) {
     const auto start = pos;
-    while (pos < input.size() && std::iswspace(input[pos])) ++pos;
+    while (pos < input.size() && preprocessor::isWhitespace(input[pos])) ++pos;
     if (pos >= input.size()) {
       matched = input.substr(start, pos - start);
       return true;
@@ -104,9 +104,9 @@ inline bool tokenizerMatch(const std::wstring& input, size_t& pos, std::wstring&
     }
     pos = start;
   }
-  if (std::iswspace(input[pos])) {
+  if (preprocessor::isWhitespace(input[pos])) {
     const auto start = pos;
-    while (pos < input.size() && std::iswspace(input[pos])) ++pos;
+    while (pos < input.size() && preprocessor::isWhitespace(input[pos])) ++pos;
     matched = input.substr(start, pos - start);
     return true;
   }

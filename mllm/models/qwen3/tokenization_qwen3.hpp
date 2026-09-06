@@ -79,10 +79,10 @@ inline bool qwen3TokenizerMatchPattern(const std::wstring& str, size_t& pos, std
     if (str[pos] == L' ') { ++pos; }
 
     // Require at least one non-letter/digit/whitespace
-    if (pos < str.size() && !std::iswspace(str[pos]) && !preprocessor::isLetter(str[pos]) && !preprocessor::isDigit(str[pos])) {
+    if (pos < str.size() && !preprocessor::isWhitespace(str[pos]) && !preprocessor::isLetter(str[pos]) && !preprocessor::isDigit(str[pos])) {
       do {
         ++pos;
-      } while (pos < str.size() && !std::iswspace(str[pos]) && !preprocessor::isLetter(str[pos])
+      } while (pos < str.size() && !preprocessor::isWhitespace(str[pos]) && !preprocessor::isLetter(str[pos])
                && !preprocessor::isDigit(str[pos]));
 
       // Capture from start (after optional space) to current pos
@@ -103,7 +103,7 @@ inline bool qwen3TokenizerMatchPattern(const std::wstring& str, size_t& pos, std
   // 5. Match \s*[\r\n]+ (newlines with leading whitespace)
   {
     size_t start = pos;
-    while (pos < str.size() && std::iswspace(str[pos])) ++pos;
+    while (pos < str.size() && preprocessor::isWhitespace(str[pos])) ++pos;
     if (pos < str.size() && (str[pos] == L'\r' || str[pos] == L'\n')) {
       while (pos < str.size() && (str[pos] == L'\r' || str[pos] == L'\n')) ++pos;
       matched = str.substr(start, pos - start);
@@ -114,11 +114,11 @@ inline bool qwen3TokenizerMatchPattern(const std::wstring& str, size_t& pos, std
   }
 
   // 6. Match \s+(?!\S) (whitespace not followed by non-space)
-  if (std::iswspace(str[pos])) {
+  if (preprocessor::isWhitespace(str[pos])) {
     size_t start = pos;
-    while (pos < str.size() && std::iswspace(str[pos])) ++pos;
+    while (pos < str.size() && preprocessor::isWhitespace(str[pos])) ++pos;
     // Check if at end or followed by whitespace
-    if (pos >= str.size() || std::iswspace(str[pos])) {
+    if (pos >= str.size() || preprocessor::isWhitespace(str[pos])) {
       matched = str.substr(start, pos - start);
       return true;
     } else {
@@ -127,9 +127,9 @@ inline bool qwen3TokenizerMatchPattern(const std::wstring& str, size_t& pos, std
   }
 
   // 7. Match remaining whitespace
-  if (std::iswspace(str[pos])) {
+  if (preprocessor::isWhitespace(str[pos])) {
     size_t start = pos;
-    while (pos < str.size() && std::iswspace(str[pos])) ++pos;
+    while (pos < str.size() && preprocessor::isWhitespace(str[pos])) ++pos;
     matched = str.substr(start, pos - start);
     return true;
   }
