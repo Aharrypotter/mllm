@@ -16,6 +16,7 @@
 #include <nlohmann/json.hpp>
 
 #include "mllm/models/ARGeneration.hpp"
+#include "mllm/preprocessor/chat_template/PromptTokenization.hpp"
 #include "mllm/models/minicpm5/chat_template_minicpm5.hpp"
 #include "mllm/models/minicpm5/configuration_minicpm5.hpp"
 #include "mllm/preprocessor/StreamingUtf8Decoder.hpp"
@@ -183,7 +184,8 @@ class MiniCPM5Tokenizer final : public preprocessor::AutoTokenizer {
                               .backend = config.chat_template_backend,
                               .template_options = {.model_directory = model_directory.empty()
                                                                           ? std::filesystem::path(file_path).parent_path()
-                                                                          : std::move(model_directory)}}) {}
+                                                                          : std::move(model_directory)},
+                           .control_token_policy = config.control_token_policy}) {}
 
   preprocessor::ChatTemplateBackend chatTemplateBackend() const noexcept { return chat_preprocessor_.backend(); }
 
@@ -199,9 +201,24 @@ class MiniCPM5Tokenizer final : public preprocessor::AutoTokenizer {
   }
 
   // Renders the prompt through the configured chat-template backend.
-  std::string renderChatTemplate(const MiniCPM5Message& message) const {
-    if (message.prompt.empty()) { throw std::invalid_argument("MiniCPM5 prompt must not be empty"); }
-    return chat_preprocessor_.render(makeMiniCPM5ChatTemplateRequest(message.prompt, message.system, message.enable_thinking));
+  preprocessor::ChatTemplateRequest requestFor(const MiniCPM5Message& message) const {
+    return makeMiniCPM5ChatTemplateRequest(message.prompt, message.system, message.enable_thinking);
+  }
+
+  std::string renderChatTemplate(const MiniCPM5Message& message) const { return chat_preprocessor_.render(requestFor(message)); }
+
+  // Origin-tagged prompt: under control_token_policy=neutralize the official
+  // template's provenance is kept so message content is tokenized without
+  // special-token parsing; otherwise the flat prompt is one template span.
+  std::vector<preprocessor::PromptSpan> renderPromptSpans(const MiniCPM5Message& message) const {
+    if (chat_preprocessor_.controlTokenPolicy() == preprocessor::ControlTokenPolicy::Neutralize) {
+      return chat_preprocessor_.renderSpans(requestFor(message));
+    }
+    return {{renderChatTemplate(message), false}};
+  }
+
+  std::vector<std::wstring> tokenizePrompt(const MiniCPM5Message& message) {
+    return preprocessor::tokenizePromptSpans(*this, renderPromptSpans(message));
   }
 
   std::vector<std::wstring> _tokenize(const std::string& input) override {
@@ -263,7 +280,7 @@ class MiniCPM5Tokenizer final : public preprocessor::AutoTokenizer {
   }
 
   ARGenerationOutputPast convertMessage(const MiniCPM5Message& message) {
-    const auto tokens = tokenize(renderChatTemplate(message));
+    const auto tokens = tokenizePrompt(message);
     auto sequence = Tensor::empty({1, static_cast<int32_t>(tokens.size())}, kInt64, kCPU)
                         .setMemType(kNormal)
                         .setName("minicpm5-tokenizer-i0")

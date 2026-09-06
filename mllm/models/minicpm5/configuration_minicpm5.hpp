@@ -54,6 +54,8 @@ struct MiniCPM5Config : protected ConfigFile {
 
     chat_template_backend = preprocessor::parseChatTemplateBackend(config.value("chat_template_backend", "legacy"));
 
+    control_token_policy = preprocessor::parseControlTokenPolicy(config.value("control_token_policy", "reject"));
+
     if (config.contains("linear_impl_type")) {
       const auto linear_impl_name = config["linear_impl_type"].get<std::string>();
       linear_impl_type = aops::str2LinearImplTypes(linear_impl_name);
@@ -97,6 +99,7 @@ struct MiniCPM5Config : protected ConfigFile {
   int32_t max_cache_length = 2048;
   aops::LinearImplTypes linear_impl_type = aops::LinearImplTypes::kDefault;
   preprocessor::ChatTemplateBackend chat_template_backend = preprocessor::ChatTemplateBackend::Legacy;
+  preprocessor::ControlTokenPolicy control_token_policy = preprocessor::ControlTokenPolicy::Reject;
 };
 
 inline auto matchesOfficialMiniCPM5_1BRuntimeContract(const MiniCPM5Config& config) -> bool {

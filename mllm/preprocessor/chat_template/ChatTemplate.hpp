@@ -54,9 +54,28 @@ struct ChatTemplateLoadOptions {
   std::optional<nlohmann::ordered_json> special_tokens;
 };
 
+// What to do with a control token found inside message or tool content.
+enum class ControlTokenPolicy {
+  // Refuse the request (ChatTemplateInjectionError). Works with both backends.
+  Reject,
+  // Render the request and tokenize input-origin spans without special-token
+  // parsing, so the control token becomes ordinary text. Requires the
+  // jinja_required backend, whose engine tracks provenance; ChatPreprocessor
+  // construction fails otherwise. render() still rejects: only renderSpans()
+  // carries the provenance a tokenizer needs.
+  Neutralize,
+};
+
+// One span of a rendered prompt with its origin.
+struct PromptSpan {
+  std::string text;
+  bool is_input = false;
+};
+
 struct ChatPreprocessorConfig {
   ChatTemplateBackend backend = ChatTemplateBackend::Legacy;
   ChatTemplateLoadOptions template_options;
+  ControlTokenPolicy control_token_policy = ControlTokenPolicy::Reject;
   // The checkpoint's control tokens, normally `BPE::controlTokens()`. Message
   // and tool content carrying one of these is rejected before rendering, so a
   // prompt cannot forge a turn boundary. Leaving this empty disables the check
@@ -93,6 +112,9 @@ class JinjaChatTemplate final {
   JinjaChatTemplate& operator=(const JinjaChatTemplate&) = delete;
 
   std::string render(const ChatTemplateRequest& request) const;
+  // Like render(), but strings under `messages` and `tools` are marked as
+  // input and the output is returned as origin-tagged spans.
+  std::vector<PromptSpan> renderSpans(const ChatTemplateRequest& request) const;
   const ChatTemplateSource& source() const noexcept;
 
  private:
@@ -113,7 +135,13 @@ class ChatPreprocessor final {
   ChatPreprocessor& operator=(const ChatPreprocessor&) = delete;
 
   std::string render(const ChatTemplateRequest& request) const;
+  // Renders to origin-tagged spans. Under ControlTokenPolicy::Reject this
+  // enforces the same check as render(); under Neutralize it lets control
+  // tokens through inside input-origin spans, which the tokenizer must then
+  // tokenize with parse_special=false (see tokenizePromptSpans).
+  std::vector<PromptSpan> renderSpans(const ChatTemplateRequest& request) const;
   ChatTemplateBackend backend() const noexcept;
+  ControlTokenPolicy controlTokenPolicy() const noexcept;
   const ChatTemplateSource* source() const noexcept;
 
   // Supplies the checkpoint's control tokens after construction. A tokenizer
@@ -143,6 +171,8 @@ void rejectControlTokensInContent(const ChatTemplateRequest& request, const std:
 
 bool jinjaChatTemplatesAvailable() noexcept;
 ChatTemplateBackend parseChatTemplateBackend(std::string_view name);
+ControlTokenPolicy parseControlTokenPolicy(std::string_view name);
+const char* controlTokenPolicyName(ControlTokenPolicy policy) noexcept;
 const char* chatTemplateBackendName(ChatTemplateBackend backend) noexcept;
 
 }  // namespace mllm::preprocessor

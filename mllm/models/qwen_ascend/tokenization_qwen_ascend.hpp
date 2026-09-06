@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "mllm/models/ARGeneration.hpp"
+#include "mllm/preprocessor/chat_template/PromptTokenization.hpp"
 #include "mllm/models/qwen_ascend/configuration_qwen_ascend.hpp"
 #include "mllm/preprocessor/chat_template/LegacyChatMl.hpp"
 #include "mllm/models/qwen3/tokenization_qwen3.hpp"
@@ -103,19 +104,34 @@ class QwenAscendTokenizer final : public mllm::preprocessor::AutoTokenizer {
                                 .backend = config.chat_template_backend,
                                 .template_options = {.model_directory = model_directory.empty()
                                                                             ? std::filesystem::path(file_path).parent_path()
-                                                                            : std::move(model_directory)}}) {}
+                                                                            : std::move(model_directory)},
+                           .control_token_policy = config.control_token_policy}) {}
 
   preprocessor::ChatTemplateBackend chatTemplateBackend() const noexcept { return chat_preprocessor_.backend(); }
 
   // Renders the single-turn runner prompt through the configured backend.
-  std::string renderChatTemplate(const QwenAscendMessage& message) const {
-    return chat_preprocessor_.render(preprocessor::makeSingleTurnChatTemplateRequest(message.prompt, "", false));
+  preprocessor::ChatTemplateRequest requestFor(const QwenAscendMessage& message) const {
+    return preprocessor::makeSingleTurnChatTemplateRequest(message.prompt, "", false);
+  }
+
+  std::string renderChatTemplate(const QwenAscendMessage& message) const { return chat_preprocessor_.render(requestFor(message)); }
+
+  // Origin-tagged prompt: under control_token_policy=neutralize the official
+  // template's provenance is kept so message content is tokenized without
+  // special-token parsing; otherwise the flat prompt is one template span.
+  std::vector<preprocessor::PromptSpan> renderPromptSpans(const QwenAscendMessage& message) const {
+    if (chat_preprocessor_.controlTokenPolicy() == preprocessor::ControlTokenPolicy::Neutralize) {
+      return chat_preprocessor_.renderSpans(requestFor(message));
+    }
+    return {{renderChatTemplate(message), false}};
+  }
+
+  std::vector<std::wstring> tokenizePrompt(const QwenAscendMessage& message) {
+    return preprocessor::tokenizePromptSpans(*this, renderPromptSpans(message));
   }
 
   ARGenerationOutputPast convertMessage(const QwenAscendMessage& message) {
-    auto applied_string = renderChatTemplate(message);
-
-    auto sequence_str = tokenize(applied_string);
+    auto sequence_str = tokenizePrompt(message);
     std::vector<int64_t> ids;
     ids.reserve(sequence_str.size());
     for (const auto& str : sequence_str) { ids.emplace_back(bpe_._lookup_vocab(str)); }

@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include "mllm/preprocessor/tokenizers/BPEUTF8.hpp"  //BPEUTF8, MiniCPM4 use LlamaTokenizer!
 #include "mllm/models/ARGeneration.hpp"
+#include "mllm/preprocessor/chat_template/PromptTokenization.hpp"
 #include "mllm/models/minicpm4/configuration_minicpm4.hpp"
 #include "mllm/preprocessor/chat_template/LegacyChatMl.hpp"
 #include "mllm/preprocessor/tokenizers/Unicode.hpp"
@@ -119,19 +120,34 @@ class MiniCPM4Tokenizer final : public mllm::preprocessor::AutoTokenizerUTF8 {
                               .backend = config.chat_template_backend,
                               .template_options = {.model_directory = model_directory.empty()
                                                                           ? std::filesystem::path(file_path).parent_path()
-                                                                          : std::move(model_directory)}}) {}
+                                                                          : std::move(model_directory)},
+                           .control_token_policy = config.control_token_policy}) {}
 
   preprocessor::ChatTemplateBackend chatTemplateBackend() const noexcept { return chat_preprocessor_.backend(); }
 
   // Renders the single-turn runner prompt through the configured backend.
-  std::string renderChatTemplate(const MiniCPM4Message& message) const {
-    return chat_preprocessor_.render(preprocessor::makeSingleTurnChatTemplateRequest(message.prompt, "", std::nullopt));
+  preprocessor::ChatTemplateRequest requestFor(const MiniCPM4Message& message) const {
+    return preprocessor::makeSingleTurnChatTemplateRequest(message.prompt, "", std::nullopt);
+  }
+
+  std::string renderChatTemplate(const MiniCPM4Message& message) const { return chat_preprocessor_.render(requestFor(message)); }
+
+  // Origin-tagged prompt: under control_token_policy=neutralize the official
+  // template's provenance is kept so message content is tokenized without
+  // special-token parsing; otherwise the flat prompt is one template span.
+  std::vector<preprocessor::PromptSpan> renderPromptSpans(const MiniCPM4Message& message) const {
+    if (chat_preprocessor_.controlTokenPolicy() == preprocessor::ControlTokenPolicy::Neutralize) {
+      return chat_preprocessor_.renderSpans(requestFor(message));
+    }
+    return {{renderChatTemplate(message), false}};
+  }
+
+  std::vector<std::string> tokenizePrompt(const MiniCPM4Message& message) {
+    return preprocessor::tokenizePromptSpans(*this, renderPromptSpans(message));
   }
 
   ARGenerationOutputPast convertMessage(const MiniCPM4Message& message) {
-    auto applied_string = renderChatTemplate(message);
-
-    auto tokens = tokenize(applied_string);
+    auto tokens = tokenizePrompt(message);
 
     std::vector<int64_t> ids;
     ids.reserve(tokens.size());

@@ -61,6 +61,8 @@ struct MiniCPM4Config : protected ConfigFile {
 
     chat_template_backend = preprocessor::parseChatTemplateBackend(data().value("chat_template_backend", "legacy"));
 
+    control_token_policy = preprocessor::parseControlTokenPolicy(data().value("control_token_policy", "reject"));
+
     linear_impl_type = aops::str2LinearImplTypes(data()["linear_impl_type"]);
   }
 
@@ -96,6 +98,7 @@ struct MiniCPM4Config : protected ConfigFile {
 
   aops::LinearImplTypes linear_impl_type = aops::LinearImplTypes::kDefault;
   preprocessor::ChatTemplateBackend chat_template_backend = preprocessor::ChatTemplateBackend::Legacy;
+  preprocessor::ControlTokenPolicy control_token_policy = preprocessor::ControlTokenPolicy::Reject;
 };
 
 }  // namespace mllm::models::minicpm4

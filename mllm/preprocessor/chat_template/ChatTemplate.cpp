@@ -242,14 +242,33 @@ class JinjaChatTemplate::Impl {
 #endif
   }
 
-  std::string render(const ChatTemplateRequest& request) const {
 #if MLLM_ENABLE_JINJA_CHAT_TEMPLATE
+  nlohmann::ordered_json buildContext(const ChatTemplateRequest& request) const {
     nlohmann::ordered_json context = default_context_;
     for (const auto& [key, value] : request.extra_context.items()) { context[key] = value; }
     context["messages"] = request.messages;
     context["add_generation_prompt"] = request.add_generation_prompt;
     if (request.tools.has_value()) { context["tools"] = *request.tools; }
-    return template_->render(jinja::json(std::move(context)));
+    return context;
+  }
+#endif
+
+  std::string render(const ChatTemplateRequest& request) const {
+#if MLLM_ENABLE_JINJA_CHAT_TEMPLATE
+    return template_->render(jinja::json(buildContext(request)));
+#else
+    (void)request;
+    throw ChatTemplateError("Jinja chat-template rendering is unavailable in this binary");
+#endif
+  }
+
+  std::vector<PromptSpan> renderSpans(const ChatTemplateRequest& request) const {
+#if MLLM_ENABLE_JINJA_CHAT_TEMPLATE
+    std::vector<PromptSpan> spans;
+    for (auto& part : template_->render_parts(jinja::json(buildContext(request)), {"messages", "tools"})) {
+      spans.push_back({std::move(part.text), part.is_input});
+    }
+    return spans;
 #else
     (void)request;
     throw ChatTemplateError("Jinja chat-template rendering is unavailable in this binary");
@@ -286,15 +305,37 @@ std::string JinjaChatTemplate::render(const ChatTemplateRequest& request) const 
   }
 }
 
+std::vector<PromptSpan> JinjaChatTemplate::renderSpans(const ChatTemplateRequest& request) const {
+  validateRequest(request);
+  try {
+    auto spans = impl_->renderSpans(request);
+    std::size_t total = 0;
+    for (const auto& span : spans) { total += span.text.size(); }
+    if (total > request.max_rendered_bytes) {
+      throw ChatTemplateError("chat template '" + impl_->source_.location + "' exceeded the configured output limit");
+    }
+    return spans;
+  } catch (const ChatTemplateError&) { throw; } catch (const std::exception& error) {
+    throw ChatTemplateError("failed to render chat template '" + impl_->source_.location + "': " + error.what());
+  }
+}
+
 const ChatTemplateSource& JinjaChatTemplate::source() const noexcept { return impl_->source_; }
 
 class ChatPreprocessor::Impl {
  public:
   Impl(ChatPreprocessorConfig config, LegacyChatTemplateRenderer legacy_renderer)
-      : backend_(config.backend), legacy_renderer_(std::move(legacy_renderer)), control_tokens_(config.control_tokens) {
+      : backend_(config.backend),
+        policy_(config.control_token_policy),
+        legacy_renderer_(std::move(legacy_renderer)),
+        control_tokens_(config.control_tokens) {
     switch (backend_) {
       case ChatTemplateBackend::Legacy:
         if (!legacy_renderer_) { throw ChatTemplateError("legacy chat-template backend requires an explicit renderer"); }
+        if (policy_ == ControlTokenPolicy::Neutralize) {
+          throw ChatTemplateError("control_token_policy 'neutralize' requires the jinja_required backend; the legacy "
+                                  "renderer cannot tell template text from message content");
+        }
         return;
       case ChatTemplateBackend::JinjaRequired: {
         if (!jinjaChatTemplatesAvailable()) {
@@ -328,15 +369,27 @@ class ChatPreprocessor::Impl {
     throw ChatTemplateError("unknown chat-template backend");
   }
 
+  const JinjaChatTemplate& jinjaFor(const ChatTemplateRequest& request) const {
+    return (request.tools.has_value() && tool_jinja_template_) ? *tool_jinja_template_ : *jinja_template_;
+  }
+
+  std::vector<PromptSpan> renderSpans(const ChatTemplateRequest& request) const {
+    validateRequest(request);
+    if (backend_ != ChatTemplateBackend::JinjaRequired) {
+      // The legacy renderer has no provenance; keep the string contract.
+      return {{render(request), false}};
+    }
+    if (policy_ == ControlTokenPolicy::Reject) { rejectControlTokensInContent(request, control_tokens_); }
+    return jinjaFor(request).renderSpans(request);
+  }
+
   std::string render(const ChatTemplateRequest& request) const {
     validateRequest(request);
-    // Enforced for both backends: a legacy renderer copies content through just
-    // as literally as an official template does.
+    // Enforced for both backends and both policies: a flat string cannot carry
+    // provenance, so the only safe option is to refuse. A legacy renderer copies
+    // content through just as literally as an official template does.
     rejectControlTokensInContent(request, control_tokens_);
-    if (backend_ == ChatTemplateBackend::JinjaRequired) {
-      if (request.tools.has_value() && tool_jinja_template_) { return tool_jinja_template_->render(request); }
-      return jinja_template_->render(request);
-    }
+    if (backend_ == ChatTemplateBackend::JinjaRequired) { return jinjaFor(request).render(request); }
 
     try {
       auto output = legacy_renderer_(request);
@@ -348,6 +401,7 @@ class ChatPreprocessor::Impl {
   }
 
   ChatTemplateBackend backend_;
+  ControlTokenPolicy policy_;
   LegacyChatTemplateRenderer legacy_renderer_;
   std::vector<std::string> control_tokens_;
   std::unique_ptr<JinjaChatTemplate> jinja_template_;
@@ -363,7 +417,13 @@ ChatPreprocessor& ChatPreprocessor::operator=(ChatPreprocessor&&) noexcept = def
 
 std::string ChatPreprocessor::render(const ChatTemplateRequest& request) const { return impl_->render(request); }
 
+std::vector<PromptSpan> ChatPreprocessor::renderSpans(const ChatTemplateRequest& request) const {
+  return impl_->renderSpans(request);
+}
+
 ChatTemplateBackend ChatPreprocessor::backend() const noexcept { return impl_->backend_; }
+
+ControlTokenPolicy ChatPreprocessor::controlTokenPolicy() const noexcept { return impl_->policy_; }
 
 void ChatPreprocessor::setControlTokens(std::vector<std::string> control_tokens) {
   impl_->control_tokens_ = std::move(control_tokens);
@@ -456,6 +516,20 @@ ChatTemplateBackend parseChatTemplateBackend(std::string_view name) {
   if (name == "jinja_required") { return ChatTemplateBackend::JinjaRequired; }
   throw ChatTemplateError("unsupported chat-template backend '" + std::string(name)
                           + "'; expected 'legacy' or 'jinja_required'");
+}
+
+ControlTokenPolicy parseControlTokenPolicy(std::string_view name) {
+  if (name == "reject") { return ControlTokenPolicy::Reject; }
+  if (name == "neutralize") { return ControlTokenPolicy::Neutralize; }
+  throw ChatTemplateError("unsupported control_token_policy '" + std::string(name) + "'; expected 'reject' or 'neutralize'");
+}
+
+const char* controlTokenPolicyName(ControlTokenPolicy policy) noexcept {
+  switch (policy) {
+    case ControlTokenPolicy::Reject: return "reject";
+    case ControlTokenPolicy::Neutralize: return "neutralize";
+  }
+  return "unknown";
 }
 
 const char* chatTemplateBackendName(ChatTemplateBackend backend) noexcept {
