@@ -166,6 +166,7 @@ class Qwen3Tokenizer final : public mllm::preprocessor::AutoTokenizer {
     preprocessor::makeBytes2UnicodeMap(bytes_2_unicode_dict_);
     for (auto& kv : bytes_2_unicode_dict_) { bytes_2_unicode_dict_inverse_.insert({kv.second, kv.first}); }
     bpe_.initFromSentencePieceJson(file_path);
+    chat_preprocessor_.setControlTokens(bpe_.controlTokens());
     special_tokens_trie_.add(L"<|endoftext|>");
     special_tokens_trie_.add(L"<|im_start|>");
     special_tokens_trie_.add(L"<|im_end|>");
@@ -257,6 +258,9 @@ class Qwen3Tokenizer final : public mllm::preprocessor::AutoTokenizer {
                                                                        : std::move(model_directory)}}) {}
 
   preprocessor::ChatTemplateBackend chatTemplateBackend() const noexcept { return chat_preprocessor_.backend(); }
+
+  // The checkpoint's control tokens; see BPE::controlTokens().
+  const std::vector<std::string>& controlTokens() const { return bpe_.controlTokens(); }
 
   // Renders the single-turn runner prompt through the configured backend.
   std::string renderChatTemplate(const Qwen3Message& message) const {

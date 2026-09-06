@@ -62,6 +62,33 @@ void validateRequest(const ChatTemplateRequest& request) {
   }
 }
 
+// Recursively walks a JSON value looking for any control token inside a string.
+// `messages` and `tools` are data supplied by the caller and, transitively, by
+// the end user; `extra_context` is not scanned because template variables such
+// as bos_token are legitimately control tokens.
+void rejectControlTokensIn(const nlohmann::ordered_json& value, const std::vector<std::string>& control_tokens,
+                           const std::string& path) {
+  if (value.is_string()) {
+    const auto text = value.get<std::string>();
+    for (const auto& token : control_tokens) {
+      if (!token.empty() && text.find(token) != std::string::npos) {
+        throw ChatTemplateInjectionError("chat template " + path + " contains the control token '" + token
+                                         + "'; message and tool content must not open or close a turn");
+      }
+    }
+    return;
+  }
+  if (value.is_object()) {
+    for (const auto& [key, child] : value.items()) { rejectControlTokensIn(child, control_tokens, path + "." + key); }
+    return;
+  }
+  if (value.is_array()) {
+    for (std::size_t index = 0; index < value.size(); ++index) {
+      rejectControlTokensIn(value[index], control_tokens, path + "[" + std::to_string(index) + "]");
+    }
+  }
+}
+
 void validateRenderedSize(const std::string& output, std::size_t max_bytes, const std::string& location) {
   if (output.size() > max_bytes) {
     throw ChatTemplateError("chat template '" + location + "' exceeded the configured output limit");
@@ -264,7 +291,7 @@ const ChatTemplateSource& JinjaChatTemplate::source() const noexcept { return im
 class ChatPreprocessor::Impl {
  public:
   Impl(ChatPreprocessorConfig config, LegacyChatTemplateRenderer legacy_renderer)
-      : backend_(config.backend), legacy_renderer_(std::move(legacy_renderer)) {
+      : backend_(config.backend), legacy_renderer_(std::move(legacy_renderer)), control_tokens_(config.control_tokens) {
     switch (backend_) {
       case ChatTemplateBackend::Legacy:
         if (!legacy_renderer_) { throw ChatTemplateError("legacy chat-template backend requires an explicit renderer"); }
@@ -303,6 +330,9 @@ class ChatPreprocessor::Impl {
 
   std::string render(const ChatTemplateRequest& request) const {
     validateRequest(request);
+    // Enforced for both backends: a legacy renderer copies content through just
+    // as literally as an official template does.
+    rejectControlTokensInContent(request, control_tokens_);
     if (backend_ == ChatTemplateBackend::JinjaRequired) {
       if (request.tools.has_value() && tool_jinja_template_) { return tool_jinja_template_->render(request); }
       return jinja_template_->render(request);
@@ -319,6 +349,7 @@ class ChatPreprocessor::Impl {
 
   ChatTemplateBackend backend_;
   LegacyChatTemplateRenderer legacy_renderer_;
+  std::vector<std::string> control_tokens_;
   std::unique_ptr<JinjaChatTemplate> jinja_template_;
   std::unique_ptr<JinjaChatTemplate> tool_jinja_template_;
 };
@@ -333,6 +364,10 @@ ChatPreprocessor& ChatPreprocessor::operator=(ChatPreprocessor&&) noexcept = def
 std::string ChatPreprocessor::render(const ChatTemplateRequest& request) const { return impl_->render(request); }
 
 ChatTemplateBackend ChatPreprocessor::backend() const noexcept { return impl_->backend_; }
+
+void ChatPreprocessor::setControlTokens(std::vector<std::string> control_tokens) {
+  impl_->control_tokens_ = std::move(control_tokens);
+}
 
 const ChatTemplateSource* ChatPreprocessor::source() const noexcept {
   return impl_->jinja_template_ ? &impl_->jinja_template_->source() : nullptr;
@@ -400,6 +435,12 @@ std::optional<ChatTemplateSource> ChatTemplateLoader::find(const ChatTemplateLoa
   }
   throw ChatTemplateError("unsupported chat_template value in '" + tokenizer_config_path.string()
                           + "'; expected a string or a collection of named templates");
+}
+
+void rejectControlTokensInContent(const ChatTemplateRequest& request, const std::vector<std::string>& control_tokens) {
+  if (control_tokens.empty()) { return; }
+  rejectControlTokensIn(request.messages, control_tokens, "messages");
+  if (request.tools.has_value()) { rejectControlTokensIn(*request.tools, control_tokens, "tools"); }
 }
 
 bool jinjaChatTemplatesAvailable() noexcept {

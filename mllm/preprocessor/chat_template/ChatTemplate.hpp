@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -56,11 +57,24 @@ struct ChatTemplateLoadOptions {
 struct ChatPreprocessorConfig {
   ChatTemplateBackend backend = ChatTemplateBackend::Legacy;
   ChatTemplateLoadOptions template_options;
+  // The checkpoint's control tokens, normally `BPE::controlTokens()`. Message
+  // and tool content carrying one of these is rejected before rendering, so a
+  // prompt cannot forge a turn boundary. Leaving this empty disables the check
+  // and is only appropriate for a caller that has already sanitized its input.
+  std::vector<std::string> control_tokens;
 };
 
 class ChatTemplateError : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
+};
+
+// Raised when message or tool content contains one of the checkpoint's control
+// tokens. Rendering such a request would let the content open or close a turn,
+// so it is refused rather than escaped.
+class ChatTemplateInjectionError : public ChatTemplateError {
+ public:
+  using ChatTemplateError::ChatTemplateError;
 };
 
 using LegacyChatTemplateRenderer = std::function<std::string(const ChatTemplateRequest&)>;
@@ -102,6 +116,12 @@ class ChatPreprocessor final {
   ChatTemplateBackend backend() const noexcept;
   const ChatTemplateSource* source() const noexcept;
 
+  // Supplies the checkpoint's control tokens after construction. A tokenizer
+  // loads its vocabulary in its constructor body, so it cannot pass them
+  // through ChatPreprocessorConfig. Until this is called the injection check is
+  // inactive, so every model that owns a vocabulary must call it.
+  void setControlTokens(std::vector<std::string> control_tokens);
+
  private:
   class Impl;
   std::unique_ptr<Impl> impl_;
@@ -115,6 +135,11 @@ class ChatTemplateLoader final {
   // the file or the fields are absent.
   static nlohmann::ordered_json specialTokenContext(const ChatTemplateLoadOptions& options);
 };
+
+// Throws ChatTemplateInjectionError when any string inside `messages` or
+// `tools` contains one of `control_tokens`. Exposed for tests and for models
+// that build a prompt outside ChatPreprocessor.
+void rejectControlTokensInContent(const ChatTemplateRequest& request, const std::vector<std::string>& control_tokens);
 
 bool jinjaChatTemplatesAvailable() noexcept;
 ChatTemplateBackend parseChatTemplateBackend(std::string_view name);

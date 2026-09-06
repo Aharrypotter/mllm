@@ -905,6 +905,7 @@ class Qwen3ProbingSession final : public ::mllm::service::Session {
     model_ = std::make_shared<Qwen3ProbingForCausalLM>(cfg);
     model_->load(mllm::load((root / "model.mllm").string(), ModelFileVersion::kV2));
     tokenizer_ = std::make_shared<Qwen3Tokenizer>((root / "tokenizer.json").string());
+    chat_preprocessor_->setControlTokens(tokenizer_->controlTokens());
     cache_ = std::make_shared<prefix_cache::Cache>(prefix_cache::CacheOptions{
         .radix_tree_options = {.enable_lru_eviction = false,
                                .eviction_threshold = 0.9f,

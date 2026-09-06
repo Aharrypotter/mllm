@@ -164,6 +164,7 @@ class QwenTokenizer final : public mllm::preprocessor::AutoTokenizer {
     for (auto& kv : bytes_2_unicode_dict_) { bytes_2_unicode_dict_inverse_.insert({kv.second, kv.first}); }
 
     bpe_.initFromSentencePieceJson(vocab_file);
+    chat_preprocessor_.setControlTokens(bpe_.controlTokens());
     initBpeRanks(merge_file);
     initSpecialTokens();
   }

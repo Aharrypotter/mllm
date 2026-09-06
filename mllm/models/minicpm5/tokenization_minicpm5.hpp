@@ -157,6 +157,7 @@ class MiniCPM5Tokenizer final : public preprocessor::AutoTokenizer {
     if (!bpe_.initFromSentencePieceJson(file_path)) {
       throw std::invalid_argument("MiniCPM5 tokenizer JSON must contain a BPE vocabulary and merge table");
     }
+    chat_preprocessor_.setControlTokens(bpe_.controlTokens());
 
     std::ifstream tokenizer_stream(file_path);
     if (!tokenizer_stream) { throw std::invalid_argument("Unable to read MiniCPM5 tokenizer JSON: " + file_path); }
@@ -203,6 +204,9 @@ class MiniCPM5Tokenizer final : public preprocessor::AutoTokenizer {
                                                                           : std::move(model_directory)}}) {}
 
   preprocessor::ChatTemplateBackend chatTemplateBackend() const noexcept { return chat_preprocessor_.backend(); }
+
+  // The checkpoint's control tokens; see BPE::controlTokens().
+  const std::vector<std::string>& controlTokens() const { return bpe_.controlTokens(); }
 
   // Migration formatter: the exact pre-Jinja runner prompt. It stays available
   // as the legacy backend's renderer and as a fixed reference for tests.
