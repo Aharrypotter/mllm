@@ -76,11 +76,19 @@ decode-time grammar constraints remain separate product stages.
 
 ## Engine
 
-`third_party/jinja.cpp` is a vendored copy of `wangzhaode/jinja.cpp` plus the
-patch recorded in its `UPSTREAM.md` (insertion-ordered objects, `loop`
-neighbours, block assignment, mapping methods, `min`/`max`). Every engine gap
-closed for an official template gets a guard in
-`tests/preprocessor/ChatTemplateTest.cpp`.
+`third_party/jinja.cpp` is a submodule of
+[Aharrypotter/jinja.cpp](https://github.com/Aharrypotter/jinja.cpp), a fork of
+`wangzhaode/jinja.cpp` that carries the Transformers-compatibility commits on
+top of upstream `a1d18d5`: opt-in insertion-ordered objects, `loop` neighbours
+and reverse indices, block assignment, mapping methods, `min`/`max`, Python
+`str()` printing, list concatenation, namespace write-back, and a fix for
+object construction from an initializer list. The two opt-in macros are set by
+the `mllm_jinja_cpp` interface target. Upstream's own suite (414 cases across
+31 model templates) passes with and without them.
+
+Every engine gap closed for an official template also gets a guard in
+`tests/preprocessor/ChatTemplateTest.cpp`, so an accidental submodule downgrade
+fails the mllm suite rather than a parity run.
 
 ## Parity gate
 

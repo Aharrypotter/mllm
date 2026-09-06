@@ -1,2 +1,0 @@
-# Unified-diff context lines for blank source lines are a lone space; do not flag them.
-third_party/jinja.cpp/patches/*.patch -whitespace
