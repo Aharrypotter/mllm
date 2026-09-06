@@ -218,17 +218,20 @@ class MiniCPM5Tokenizer final : public preprocessor::AutoTokenizer {
     return result;
   }
 
-  std::vector<std::wstring> tokenize(const std::string& input) override {
-    std::vector<std::wstring> result;
-    for (const auto& segment : special_tokens_trie_.splitSegments(preprocessor::utf8string2WideString(input))) {
+    std::vector<std::wstring> tokenize(const std::string& str) override { return tokenize(str, {}); }
+
+  std::vector<std::wstring> tokenize(const std::string& str, const preprocessor::TokenizeOptions& options) override {
+    std::vector<std::wstring> all_tokens;
+    for (const auto& segment :
+         special_tokens_trie_.splitSegments(preprocessor::utf8string2WideString(str), {.parse_special = options.parse_special})) {
       if (segment.is_special) {
-        result.push_back(segment.text);
+        all_tokens.emplace_back(segment.text);
         continue;
       }
-      auto bpe_tokens = _tokenize(preprocessor::wideString2Utf8String(segment.text));
-      result.insert(result.end(), bpe_tokens.begin(), bpe_tokens.end());
+      auto tmp_tokens = _tokenize(preprocessor::wideString2Utf8String(segment.text));
+      all_tokens.insert(all_tokens.end(), tmp_tokens.begin(), tmp_tokens.end());
     }
-    return result;
+    return all_tokens;
   }
 
   std::wstring _detokenize(int64_t token_id) override { return bpe_._lookup_inverse_vocab(token_id); }

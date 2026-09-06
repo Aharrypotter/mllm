@@ -47,6 +47,13 @@ class BPE {
   // message content, so ChatPreprocessor rejects them in a request.
   const std::vector<std::string>& controlTokens() const { return control_tokens_; }
 
+  // Attribute of a token id: kControl for added tokens with `special: true`,
+  // kUserDefined for the other added tokens, kNormal for vocabulary entries.
+  TokenAttr attrOf(int64_t id) const {
+    const auto it = attr_by_id_.find(id);
+    return it == attr_by_id_.end() ? TokenAttr::kNormal : it->second;
+  }
+
  private:
   std::unordered_set<std::pair<std::wstring, std::wstring>, BPEPairHash> _get_pairs(const std::vector<std::wstring>& word);
 
@@ -59,6 +66,7 @@ class BPE {
   // by merges alone, so ignoring the flag silently changes the token ids.
   bool ignore_merges_ = false;
   std::vector<AddedToken> added_tokens_;
+  std::unordered_map<int64_t, TokenAttr> attr_by_id_;
   std::vector<std::string> control_tokens_;
 };
 

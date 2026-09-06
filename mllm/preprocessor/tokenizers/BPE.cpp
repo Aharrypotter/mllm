@@ -42,6 +42,7 @@ bool BPE::initFromSentencePieceJson(const std::string& file_path) {
   }
 
   added_tokens_.clear();
+  attr_by_id_.clear();
   control_tokens_.clear();
   if (json_data.contains("added_tokens") && json_data["added_tokens"].is_array()) {
     for (const auto& entry : json_data["added_tokens"]) {
@@ -54,6 +55,7 @@ bool BPE::initFromSentencePieceJson(const std::string& file_path) {
       token.single_word = entry.value("single_word", false);
       token.normalized = entry.value("normalized", false);
       if (token.special) { control_tokens_.push_back(token.content); }
+      attr_by_id_[token.id] = token.special ? TokenAttr::kControl : TokenAttr::kUserDefined;
       auto str = utf8string2WideString(token.content);
       vocab_.insert({str, token.id});
       vocab_inverse_.insert({token.id, str});

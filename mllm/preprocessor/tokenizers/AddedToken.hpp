@@ -26,6 +26,10 @@ struct AddedToken {
   bool normalized = false;
 };
 
+// Coarse per-token attribute, the subset of llama.cpp's token attributes that
+// mllm needs today.
+enum class TokenAttr : uint8_t { kNormal, kUserDefined, kControl };
+
 // Match-time attributes kept by the special-token tries.
 struct AddedTokenAttr {
   bool control = false;

@@ -51,15 +51,17 @@ class QwenAscendTokenizer final : public mllm::preprocessor::AutoTokenizer {
     return ret;
   }
 
-  std::vector<std::wstring> tokenize(const std::string& str) override {
-    auto tokens = special_tokens_trie_.split(preprocessor::utf8string2WideString(str));
+    std::vector<std::wstring> tokenize(const std::string& str) override { return tokenize(str, {}); }
+
+  std::vector<std::wstring> tokenize(const std::string& str, const preprocessor::TokenizeOptions& options) override {
     std::vector<std::wstring> all_tokens;
-    for (const auto& token : tokens) {
-      if (special_tokens_trie_.isSpecialToken(token)) {
-        all_tokens.emplace_back(token);
+    for (const auto& segment :
+         special_tokens_trie_.splitSegments(preprocessor::utf8string2WideString(str), {.parse_special = options.parse_special})) {
+      if (segment.is_special) {
+        all_tokens.emplace_back(segment.text);
         continue;
       }
-      auto tmp_tokens = _tokenize(preprocessor::wideString2Utf8String(token));
+      auto tmp_tokens = _tokenize(preprocessor::wideString2Utf8String(segment.text));
       all_tokens.insert(all_tokens.end(), tmp_tokens.begin(), tmp_tokens.end());
     }
     return all_tokens;

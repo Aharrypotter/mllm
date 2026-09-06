@@ -47,13 +47,14 @@ struct Options {
   std::string system;
   bool enable_thinking = false;
   bool tokenize = false;
+  bool parse_special = true;
 };
 
 [[noreturn]] void usage(const std::string& error = "") {
   if (!error.empty()) { std::cerr << error << "\n"; }
   std::cerr << "usage: Mllm-ChatTemplate-Probe --model MODEL --tokenizer tokenizer.json [--merges merges.txt] [--config config.json]\n"
                "       [--model_dir DIR] [--backend legacy|jinja_required] [--prompt TEXT] [--system TEXT]\n"
-               "       [--enable_thinking] [--tokenize]\n";
+               "       [--enable_thinking] [--tokenize [--no_parse_special]]\n";
   std::exit(2);
 }
 
@@ -85,6 +86,8 @@ Options parse(int argc, char** argv) {
       options.enable_thinking = true;
     } else if (arg == "--tokenize") {
       options.tokenize = true;
+    } else if (arg == "--no_parse_special") {
+      options.parse_special = false;
     } else {
       usage("unknown argument " + arg);
     }
@@ -105,12 +108,15 @@ std::vector<int64_t> toVector(const mllm::Tensor& tensor) {
 }
 
 template<typename Tokenizer>
-std::vector<int64_t> tokenizeStdin(Tokenizer& tokenizer) {
+std::vector<int64_t> tokenizeStdin(Tokenizer& tokenizer, bool parse_special) {
   const std::string text((std::istreambuf_iterator<char>(std::cin)), std::istreambuf_iterator<char>());
+  const mllm::preprocessor::TokenizeOptions options{.parse_special = parse_special};
   if constexpr (requires { tokenizer.encode(text); }) {
-    return tokenizer.encode(text);  // UTF-8 tokenizers (MiniCPM4)
+    std::vector<int64_t> ids;  // UTF-8 tokenizers (MiniCPM4)
+    for (const auto& token : tokenizer.tokenize(text, options)) { ids.push_back(tokenizer.encode(token).front()); }
+    return ids;
   } else {
-    return toVector(tokenizer.convert2Ids(tokenizer.tokenize(text)));
+    return toVector(tokenizer.convert2Ids(tokenizer.tokenize(text, options)));
   }
 }
 
@@ -119,7 +125,7 @@ template<typename Tokenizer, typename Config, typename Message, typename MakeTok
 void runTextModel(const Options& options, nlohmann::json& output, MakeTokenizer make_tokenizer) {
   if (options.tokenize) {
     auto tokenizer = make_tokenizer(std::optional<Config>{});
-    output["token_ids"] = tokenizeStdin(*tokenizer);
+    output["token_ids"] = tokenizeStdin(*tokenizer, options.parse_special);
     return;
   }
   Config cfg(options.config);
@@ -145,7 +151,7 @@ int main(int argc, char** argv) {
     if (options.model == "qwen3_5") {
       if (options.tokenize) {
         mllm::models::qwen3_5::Qwen3_5Tokenizer tokenizer(options.tokenizer);
-        output["token_ids"] = tokenizeStdin(tokenizer);
+        output["token_ids"] = tokenizeStdin(tokenizer, options.parse_special);
       } else {
         auto cfg = mllm::models::qwen3_5::Qwen3_5Config(options.config);
         if (options.backend) { cfg.chat_template_backend = mllm::preprocessor::parseChatTemplateBackend(*options.backend); }
@@ -187,7 +193,7 @@ int main(int argc, char** argv) {
     } else {
       if (options.tokenize) {
         mllm::models::minicpm5::MiniCPM5Tokenizer tokenizer(options.tokenizer);
-        output["token_ids"] = tokenizeStdin(tokenizer);
+        output["token_ids"] = tokenizeStdin(tokenizer, options.parse_special);
       } else {
         auto cfg = mllm::models::minicpm5::MiniCPM5Config(options.config);
         if (options.backend) { cfg.chat_template_backend = mllm::preprocessor::parseChatTemplateBackend(*options.backend); }

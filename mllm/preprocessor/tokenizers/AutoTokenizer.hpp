@@ -129,6 +129,16 @@ class TrieUTF8 {
   std::unordered_map<cpts_string_t, AddedTokenAttr, VectorUint32Hash> attrs_;
 };
 
+// Options for a single tokenize() call.
+struct TokenizeOptions {
+  // When false, the checkpoint's control tokens (added tokens with
+  // `special: true`) are not recognized in the text: "<|im_start|>" in user
+  // content tokenizes as ordinary characters, matching Hugging Face
+  // split_special_tokens=True. Added tokens that are not control tokens are
+  // still matched, as in Hugging Face.
+  bool parse_special = true;
+};
+
 class AutoTokenizer {
  public:
   void addSpecialToken(const std::wstring& special_token);
@@ -140,6 +150,14 @@ class AutoTokenizer {
   virtual std::vector<std::wstring> _tokenize(const std::string& str) = 0;
 
   virtual std::vector<std::wstring> tokenize(const std::string& str) = 0;
+
+  // Tokenizers that route special tokens through the trie override this and
+  // implement tokenize(str) as tokenize(str, {}). The default ignores the
+  // options so older tokenizers keep their behavior.
+  virtual std::vector<std::wstring> tokenize(const std::string& str, const TokenizeOptions& options) {
+    (void)options;
+    return tokenize(str);
+  }
 
   virtual std::wstring _detokenize(int64_t pos_idx) = 0;
 
@@ -163,6 +181,12 @@ class AutoTokenizerUTF8 {
   virtual std::string decode(const std::vector<int64_t>& ids) = 0;
 
   virtual std::vector<std::string> tokenize(const std::string& str) = 0;
+
+  // See AutoTokenizer::tokenize(str, options).
+  virtual std::vector<std::string> tokenize(const std::string& str, const TokenizeOptions& options) {
+    (void)options;
+    return tokenize(str);
+  }
 
   virtual std::string detokenize(const std::vector<std::string>& tokenized_str) = 0;
 
