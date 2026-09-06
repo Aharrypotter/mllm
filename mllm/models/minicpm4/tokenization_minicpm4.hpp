@@ -25,6 +25,7 @@ class MiniCPM4Tokenizer final : public mllm::preprocessor::AutoTokenizerUTF8 {
       : chat_preprocessor_(std::move(chat_template), preprocessor::renderLegacyChatMlSingleTurn) {
     bpe_.initFromSentencePieceJson(file_path);
     chat_preprocessor_.setControlTokens(bpe_.controlTokens());
+    registerAddedTokens(bpe_.addedTokens());
 
     special_tokens_trie_.add("<|im_start|>");
     special_tokens_trie_.add("<|im_end|>");

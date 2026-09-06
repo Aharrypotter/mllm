@@ -167,28 +167,10 @@ class Qwen3Tokenizer final : public mllm::preprocessor::AutoTokenizer {
     for (auto& kv : bytes_2_unicode_dict_) { bytes_2_unicode_dict_inverse_.insert({kv.second, kv.first}); }
     bpe_.initFromSentencePieceJson(file_path);
     chat_preprocessor_.setControlTokens(bpe_.controlTokens());
-    special_tokens_trie_.add(L"<|endoftext|>");
-    special_tokens_trie_.add(L"<|im_start|>");
-    special_tokens_trie_.add(L"<|im_end|>");
-    special_tokens_trie_.add(L"<|object_ref_start|>");
-    special_tokens_trie_.add(L"<|object_ref_end|>");
-    special_tokens_trie_.add(L"<|box_start|>");
-    special_tokens_trie_.add(L"<|box_end|>");
-    special_tokens_trie_.add(L"<|quad_start|>");
-    special_tokens_trie_.add(L"<|quad_end|>");
-    special_tokens_trie_.add(L"<|vision_start|>");
-    special_tokens_trie_.add(L"<|vision_end|>");
-    special_tokens_trie_.add(L"<|vision_pad|>");
-    special_tokens_trie_.add(L"<|image_pad|>");
-    special_tokens_trie_.add(L"<|video_pad|>");
-    special_tokens_trie_.add(L"<think>");
-    special_tokens_trie_.add(L"</think>");
-    // Tool markers are added tokens in the official Qwen3 tokenizer; the chat
-    // template emits them as literal text around tool calls and responses.
-    special_tokens_trie_.add(L"<tool_call>");
-    special_tokens_trie_.add(L"</tool_call>");
-    special_tokens_trie_.add(L"<tool_response>");
-    special_tokens_trie_.add(L"</tool_response>");
+    // Added tokens (control tokens and markers such as <think> or <tool_call>)
+    // come from tokenizer.json, so every checkpoint of the family tokenizes
+    // them exactly as the official tokenizer does.
+    registerAddedTokens(bpe_.addedTokens());
   }
 
   std::vector<std::wstring> _tokenize(const std::string& str) override {

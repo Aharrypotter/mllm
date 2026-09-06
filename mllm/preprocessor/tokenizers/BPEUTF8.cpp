@@ -38,19 +38,23 @@ bool BPEUTF8::initFromSentencePieceJson(const std::string& file_path) {
     });
   }
 
+  added_tokens_.clear();
   control_tokens_.clear();
-  for (const auto& add_token : json_data["added_tokens"].items()) {
-    int64_t id = add_token.value()["id"];
-    std::string content = add_token.value()["content"];
-    if (add_token.value().value("special", false)) { control_tokens_.push_back(content); }
-    vocab_.insert({
-        utf8String2Cpts(content),
-        id,
-    });
-    vocab_inverse_.insert({
-        id,
-        utf8String2Cpts(content),
-    });
+  if (json_data.contains("added_tokens") && json_data["added_tokens"].is_array()) {
+    for (const auto& entry : json_data["added_tokens"]) {
+      AddedToken token;
+      token.id = entry.at("id").get<int64_t>();
+      token.content = entry.at("content").get<std::string>();
+      token.special = entry.value("special", false);
+      token.lstrip = entry.value("lstrip", false);
+      token.rstrip = entry.value("rstrip", false);
+      token.single_word = entry.value("single_word", false);
+      token.normalized = entry.value("normalized", false);
+      if (token.special) { control_tokens_.push_back(token.content); }
+      vocab_.insert({utf8String2Cpts(token.content), token.id});
+      vocab_inverse_.insert({token.id, utf8String2Cpts(token.content)});
+      added_tokens_.push_back(std::move(token));
+    }
   }
 
   int64_t cnt = 0;

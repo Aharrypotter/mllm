@@ -15,7 +15,7 @@ endif()
 # cross-builds do not try to execute it on the build host.
 add_test(NAME ChatTemplateFocused COMMAND Mllm-Test-ChatTemplate)
 
-add_executable(Mllm-Test-UnicodeClass UnicodeClassTest.cpp)
+add_executable(Mllm-Test-UnicodeClass UnicodeClassTest.cpp AddedTokenTest.cpp)
 target_link_libraries(Mllm-Test-UnicodeClass PRIVATE gtest_main MllmRT)
 target_include_directories(Mllm-Test-UnicodeClass PRIVATE ${MLLM_INCLUDE_DIR} ${MLLM_JSON_INCLUDE_DIR})
 add_test(NAME UnicodeClassFocused COMMAND Mllm-Test-UnicodeClass)

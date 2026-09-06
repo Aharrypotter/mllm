@@ -159,37 +159,19 @@ class MiniCPM5Tokenizer final : public preprocessor::AutoTokenizer {
     }
     chat_preprocessor_.setControlTokens(bpe_.controlTokens());
 
-    std::ifstream tokenizer_stream(file_path);
-    if (!tokenizer_stream) { throw std::invalid_argument("Unable to read MiniCPM5 tokenizer JSON: " + file_path); }
-    const auto tokenizer_json = nlohmann::json::parse(tokenizer_stream);
-    if (!tokenizer_json.contains("model") || tokenizer_json["model"].value("type", "") != "BPE") {
-      throw std::invalid_argument("MiniCPM5 tokenizer JSON must use the official BPE model");
-    }
-    if (!tokenizer_json.contains("added_tokens") || !tokenizer_json["added_tokens"].is_array()) {
-      throw std::invalid_argument("MiniCPM5 tokenizer JSON is missing added_tokens");
-    }
+    registerAddedTokens(bpe_.addedTokens());
     const std::unordered_map<std::string, int64_t> required_tokens = {
         {"<s>", 0}, {"</s>", 1}, {"<think>", 8}, {"</think>", 9}, {"<|im_start|>", 130072}, {"<|im_end|>", 130073},
     };
     std::unordered_map<std::string, int64_t> observed_required_tokens;
-    for (const auto& token : tokenizer_json["added_tokens"]) {
-      if (token.contains("content") && token["content"].is_string()) {
-        const auto content = token["content"].get<std::string>();
-        added_tokens_.push_back(preprocessor::utf8string2WideString(content));
-        if (required_tokens.contains(content) && token.contains("id") && token["id"].is_number_integer()) {
-          observed_required_tokens[content] = token["id"].get<int64_t>();
-        }
-      }
+    for (const auto& token : bpe_.addedTokens()) {
+      if (required_tokens.contains(token.content)) { observed_required_tokens[token.content] = token.id; }
     }
     for (const auto& [token, expected_id] : required_tokens) {
       if (!observed_required_tokens.contains(token) || observed_required_tokens.at(token) != expected_id) {
         throw std::invalid_argument("MiniCPM5 tokenizer JSON has an incompatible required token: " + token);
       }
     }
-    std::sort(added_tokens_.begin(), added_tokens_.end(), [](const auto& lhs, const auto& rhs) {
-      if (lhs.size() != rhs.size()) return lhs.size() > rhs.size();
-      return lhs < rhs;
-    });
   }
 
   // Product constructor: the chat-template backend comes from the model
@@ -237,33 +219,13 @@ class MiniCPM5Tokenizer final : public preprocessor::AutoTokenizer {
   }
 
   std::vector<std::wstring> tokenize(const std::string& input) override {
-    const auto wide_input = preprocessor::utf8string2WideString(input);
     std::vector<std::wstring> result;
-    size_t normal_start = 0;
-    size_t position = 0;
-    while (position < wide_input.size()) {
-      const std::wstring* matched_token = nullptr;
-      for (const auto& token : added_tokens_) {
-        if (token.size() <= wide_input.size() - position && wide_input.compare(position, token.size(), token) == 0) {
-          matched_token = &token;
-          break;
-        }
-      }
-      if (matched_token == nullptr) {
-        ++position;
+    for (const auto& segment : special_tokens_trie_.splitSegments(preprocessor::utf8string2WideString(input))) {
+      if (segment.is_special) {
+        result.push_back(segment.text);
         continue;
       }
-      if (normal_start < position) {
-        auto bpe_tokens =
-            _tokenize(preprocessor::wideString2Utf8String(wide_input.substr(normal_start, position - normal_start)));
-        result.insert(result.end(), bpe_tokens.begin(), bpe_tokens.end());
-      }
-      result.push_back(*matched_token);
-      position += matched_token->size();
-      normal_start = position;
-    }
-    if (normal_start < wide_input.size()) {
-      auto bpe_tokens = _tokenize(preprocessor::wideString2Utf8String(wide_input.substr(normal_start)));
+      auto bpe_tokens = _tokenize(preprocessor::wideString2Utf8String(segment.text));
       result.insert(result.end(), bpe_tokens.begin(), bpe_tokens.end());
     }
     return result;
@@ -314,7 +276,6 @@ class MiniCPM5Tokenizer final : public preprocessor::AutoTokenizer {
   std::unordered_map<std::wint_t, wchar_t> bytes_to_unicode_;
   std::unordered_map<wchar_t, std::wint_t> unicode_to_bytes_;
   preprocessor::ChatPreprocessor chat_preprocessor_;
-  std::vector<std::wstring> added_tokens_;
 };
 
 }  // namespace mllm::models::minicpm5

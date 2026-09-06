@@ -41,20 +41,24 @@ bool BPE::initFromSentencePieceJson(const std::string& file_path) {
     });
   }
 
+  added_tokens_.clear();
   control_tokens_.clear();
-  for (const auto& add_token : json_data["added_tokens"].items()) {
-    auto id = add_token.value()["id"];
-    auto content = add_token.value()["content"];
-    if (add_token.value().value("special", false)) { control_tokens_.push_back(content); }
-    auto str = utf8string2WideString(content);
-    vocab_.insert({
-        str,
-        id,
-    });
-    vocab_inverse_.insert({
-        id,
-        str,
-    });
+  if (json_data.contains("added_tokens") && json_data["added_tokens"].is_array()) {
+    for (const auto& entry : json_data["added_tokens"]) {
+      AddedToken token;
+      token.id = entry.at("id").get<int64_t>();
+      token.content = entry.at("content").get<std::string>();
+      token.special = entry.value("special", false);
+      token.lstrip = entry.value("lstrip", false);
+      token.rstrip = entry.value("rstrip", false);
+      token.single_word = entry.value("single_word", false);
+      token.normalized = entry.value("normalized", false);
+      if (token.special) { control_tokens_.push_back(token.content); }
+      auto str = utf8string2WideString(token.content);
+      vocab_.insert({str, token.id});
+      vocab_inverse_.insert({token.id, str});
+      added_tokens_.push_back(std::move(token));
+    }
   }
 
   int64_t cnt = 0;

@@ -165,6 +165,7 @@ class QwenTokenizer final : public mllm::preprocessor::AutoTokenizer {
 
     bpe_.initFromSentencePieceJson(vocab_file);
     chat_preprocessor_.setControlTokens(bpe_.controlTokens());
+    registerAddedTokens(bpe_.addedTokens());
     initBpeRanks(merge_file);
     initSpecialTokens();
   }
