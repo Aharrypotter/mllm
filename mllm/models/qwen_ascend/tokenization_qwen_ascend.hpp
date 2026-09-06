@@ -5,9 +5,11 @@
 #include <unordered_map>
 #include <filesystem>
 #include <utility>
+#include <stdexcept>
 #include <vector>
 
 #include "mllm/models/ARGeneration.hpp"
+#include "mllm/preprocessor/StreamingUtf8Decoder.hpp"
 #include "mllm/preprocessor/chat_template/PromptTokenization.hpp"
 #include "mllm/models/qwen_ascend/configuration_qwen_ascend.hpp"
 #include "mllm/preprocessor/chat_template/LegacyChatMl.hpp"
@@ -70,20 +72,33 @@ class QwenAscendTokenizer final : public mllm::preprocessor::AutoTokenizer {
 
   std::wstring _detokenize(int64_t pos_idx) override { return bpe_._lookup_inverse_vocab(pos_idx); }
 
-  std::wstring detokenize(int64_t pos_idx) override {
+  // Raw bytes of one token. Byte-level BPE splits a multi-byte character across
+  // tokens, so a single token is not necessarily valid UTF-8: stream these bytes
+  // through preprocessor::StreamingUtf8Decoder and print only what it returns.
+  std::string detokenizeBytes(int64_t pos_idx) {
     auto str = _detokenize(pos_idx);
-    std::string utf_8_str;
-    for (wchar_t c : str) { utf_8_str.push_back((unsigned char)(bytes_2_unicode_dict_inverse_[c])); }
-    return {mllm::preprocessor::utf8string2WideString(utf_8_str)};
+    std::string bytes;
+    bytes.reserve(str.size());
+    for (wchar_t c : str) {
+      const auto it = bytes_2_unicode_dict_inverse_.find(c);
+      if (it == bytes_2_unicode_dict_inverse_.end()) {
+        throw std::runtime_error("Qwen Ascend tokenizer encountered an unknown byte-unicode symbol");
+      }
+      bytes.push_back(static_cast<char>(it->second));
+    }
+    return bytes;
+  }
+
+  // Wide-string view of one token. Incomplete UTF-8 tails are dropped by the
+  // conversion; prefer detokenizeBytes() with a streaming decoder.
+  std::wstring detokenize(int64_t pos_idx) override {
+    return {mllm::preprocessor::utf8string2WideString(detokenizeBytes(pos_idx))};
   }
 
   // Decode full id sequence as one UTF-8 string to avoid per-token mojibake.
   std::string decode(const std::vector<int64_t>& ids) {
     std::string utf_8_str;
-    for (auto id : ids) {
-      auto piece = _detokenize(id);
-      for (wchar_t c : piece) { utf_8_str.push_back((unsigned char)(bytes_2_unicode_dict_inverse_[c])); }
-    }
+    for (auto id : ids) { utf_8_str += detokenizeBytes(id); }
     return utf_8_str;
   }
 

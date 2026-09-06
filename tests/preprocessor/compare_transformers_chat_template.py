@@ -368,6 +368,19 @@ def main() -> int:
             print(f"forged_turn: accepted=False ({str(error)[:120]})")
             failures.append("D/forged_turn")
 
+    if args.probe and args.model in ("qwen3", "qwen3_moe", "qwen_ascend", "qwen3_5", "minicpm5"):
+        print(f"== stage E: streaming decode of byte-split characters vs Transformers decode ({args.model})")
+        for name, text in [("cjk_emoji", "你好，世界！😀🚀 mllm 的流式解码"), ("mixed", "naïve café — 日本語テキスト 🇨🇳"), ("ascii", "plain ascii text")]:
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            byte_split = sum(1 for i in ids if not tokenizer.decode([i]).isprintable() or "\ufffd" in tokenizer.decode([i]))
+            decoded = run_json([str(args.probe), "--model", args.model, "--tokenizer", str(tokenizer_json), "--decode"],
+                               json.dumps(ids).encode("utf-8"))["text"]
+            reference = tokenizer.decode(ids, skip_special_tokens=False)
+            exact = decoded == reference
+            print(f"{name}: streaming_decode==transformers={exact} tokens={len(ids)} byte_split_tokens={byte_split}")
+            if not exact:
+                failures.append("E/" + name)
+
     if failures:
         print("FAILED: " + ", ".join(failures))
         return 1
