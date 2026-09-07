@@ -5,9 +5,12 @@
 #include <unordered_map>
 #include <filesystem>
 #include <utility>
+#include <stdexcept>
 #include <vector>
 
 #include "mllm/models/ARGeneration.hpp"
+#include "mllm/preprocessor/StreamingUtf8Decoder.hpp"
+#include "mllm/preprocessor/chat_template/PromptTokenization.hpp"
 #include "mllm/models/qwen_ascend/configuration_qwen_ascend.hpp"
 #include "mllm/preprocessor/chat_template/LegacyChatMl.hpp"
 #include "mllm/models/qwen3/tokenization_qwen3.hpp"
@@ -30,28 +33,10 @@ class QwenAscendTokenizer final : public mllm::preprocessor::AutoTokenizer {
     for (auto& kv : bytes_2_unicode_dict_) { bytes_2_unicode_dict_inverse_.insert({kv.second, kv.first}); }
     bpe_.initFromSentencePieceJson(file_path);
     chat_preprocessor_.setControlTokens(bpe_.controlTokens());
-    special_tokens_trie_.add(L"<|endoftext|>");
-    special_tokens_trie_.add(L"<|im_start|>");
-    special_tokens_trie_.add(L"<|im_end|>");
-    special_tokens_trie_.add(L"<|object_ref_start|>");
-    special_tokens_trie_.add(L"<|object_ref_end|>");
-    special_tokens_trie_.add(L"<|box_start|>");
-    special_tokens_trie_.add(L"<|box_end|>");
-    special_tokens_trie_.add(L"<|quad_start|>");
-    special_tokens_trie_.add(L"<|quad_end|>");
-    special_tokens_trie_.add(L"<|vision_start|>");
-    special_tokens_trie_.add(L"<|vision_end|>");
-    special_tokens_trie_.add(L"<|vision_pad|>");
-    special_tokens_trie_.add(L"<|image_pad|>");
-    special_tokens_trie_.add(L"<|video_pad|>");
-    special_tokens_trie_.add(L"<think>");
-    special_tokens_trie_.add(L"</think>");
-    // Tool markers are added tokens in the official Qwen3 tokenizer; the chat
-    // template emits them as literal text around tool calls and responses.
-    special_tokens_trie_.add(L"<tool_call>");
-    special_tokens_trie_.add(L"</tool_call>");
-    special_tokens_trie_.add(L"<tool_response>");
-    special_tokens_trie_.add(L"</tool_response>");
+    // Added tokens (control tokens and markers such as <think> or <tool_call>)
+    // come from tokenizer.json, so every checkpoint of the family tokenizes
+    // them exactly as the official tokenizer does.
+    registerAddedTokens(bpe_.addedTokens());
   }
 
   std::vector<std::wstring> _tokenize(const std::string& str) override {
@@ -69,15 +54,17 @@ class QwenAscendTokenizer final : public mllm::preprocessor::AutoTokenizer {
     return ret;
   }
 
-  std::vector<std::wstring> tokenize(const std::string& str) override {
-    auto tokens = special_tokens_trie_.split(preprocessor::utf8string2WideString(str));
+    std::vector<std::wstring> tokenize(const std::string& str) override { return tokenize(str, {}); }
+
+  std::vector<std::wstring> tokenize(const std::string& str, const preprocessor::TokenizeOptions& options) override {
     std::vector<std::wstring> all_tokens;
-    for (const auto& token : tokens) {
-      if (special_tokens_trie_.isSpecialToken(token)) {
-        all_tokens.emplace_back(token);
+    for (const auto& segment :
+         special_tokens_trie_.splitSegments(preprocessor::utf8string2WideString(str), {.parse_special = options.parse_special})) {
+      if (segment.is_special) {
+        all_tokens.emplace_back(segment.text);
         continue;
       }
-      auto tmp_tokens = _tokenize(preprocessor::wideString2Utf8String(token));
+      auto tmp_tokens = _tokenize(preprocessor::wideString2Utf8String(segment.text));
       all_tokens.insert(all_tokens.end(), tmp_tokens.begin(), tmp_tokens.end());
     }
     return all_tokens;
@@ -85,20 +72,33 @@ class QwenAscendTokenizer final : public mllm::preprocessor::AutoTokenizer {
 
   std::wstring _detokenize(int64_t pos_idx) override { return bpe_._lookup_inverse_vocab(pos_idx); }
 
-  std::wstring detokenize(int64_t pos_idx) override {
+  // Raw bytes of one token. Byte-level BPE splits a multi-byte character across
+  // tokens, so a single token is not necessarily valid UTF-8: stream these bytes
+  // through preprocessor::StreamingUtf8Decoder and print only what it returns.
+  std::string detokenizeBytes(int64_t pos_idx) {
     auto str = _detokenize(pos_idx);
-    std::string utf_8_str;
-    for (wchar_t c : str) { utf_8_str.push_back((unsigned char)(bytes_2_unicode_dict_inverse_[c])); }
-    return {mllm::preprocessor::utf8string2WideString(utf_8_str)};
+    std::string bytes;
+    bytes.reserve(str.size());
+    for (wchar_t c : str) {
+      const auto it = bytes_2_unicode_dict_inverse_.find(c);
+      if (it == bytes_2_unicode_dict_inverse_.end()) {
+        throw std::runtime_error("Qwen Ascend tokenizer encountered an unknown byte-unicode symbol");
+      }
+      bytes.push_back(static_cast<char>(it->second));
+    }
+    return bytes;
+  }
+
+  // Wide-string view of one token. Incomplete UTF-8 tails are dropped by the
+  // conversion; prefer detokenizeBytes() with a streaming decoder.
+  std::wstring detokenize(int64_t pos_idx) override {
+    return {mllm::preprocessor::utf8string2WideString(detokenizeBytes(pos_idx))};
   }
 
   // Decode full id sequence as one UTF-8 string to avoid per-token mojibake.
   std::string decode(const std::vector<int64_t>& ids) {
     std::string utf_8_str;
-    for (auto id : ids) {
-      auto piece = _detokenize(id);
-      for (wchar_t c : piece) { utf_8_str.push_back((unsigned char)(bytes_2_unicode_dict_inverse_[c])); }
-    }
+    for (auto id : ids) { utf_8_str += detokenizeBytes(id); }
     return utf_8_str;
   }
 
@@ -119,19 +119,34 @@ class QwenAscendTokenizer final : public mllm::preprocessor::AutoTokenizer {
                                 .backend = config.chat_template_backend,
                                 .template_options = {.model_directory = model_directory.empty()
                                                                             ? std::filesystem::path(file_path).parent_path()
-                                                                            : std::move(model_directory)}}) {}
+                                                                            : std::move(model_directory)},
+                           .control_token_policy = config.control_token_policy}) {}
 
   preprocessor::ChatTemplateBackend chatTemplateBackend() const noexcept { return chat_preprocessor_.backend(); }
 
   // Renders the single-turn runner prompt through the configured backend.
-  std::string renderChatTemplate(const QwenAscendMessage& message) const {
-    return chat_preprocessor_.render(preprocessor::makeSingleTurnChatTemplateRequest(message.prompt, "", false));
+  preprocessor::ChatTemplateRequest requestFor(const QwenAscendMessage& message) const {
+    return preprocessor::makeSingleTurnChatTemplateRequest(message.prompt, "", false);
+  }
+
+  std::string renderChatTemplate(const QwenAscendMessage& message) const { return chat_preprocessor_.render(requestFor(message)); }
+
+  // Origin-tagged prompt: under control_token_policy=neutralize the official
+  // template's provenance is kept so message content is tokenized without
+  // special-token parsing; otherwise the flat prompt is one template span.
+  std::vector<preprocessor::PromptSpan> renderPromptSpans(const QwenAscendMessage& message) const {
+    if (chat_preprocessor_.controlTokenPolicy() == preprocessor::ControlTokenPolicy::Neutralize) {
+      return chat_preprocessor_.renderSpans(requestFor(message));
+    }
+    return {{renderChatTemplate(message), false}};
+  }
+
+  std::vector<std::wstring> tokenizePrompt(const QwenAscendMessage& message) {
+    return preprocessor::tokenizePromptSpans(*this, renderPromptSpans(message));
   }
 
   ARGenerationOutputPast convertMessage(const QwenAscendMessage& message) {
-    auto applied_string = renderChatTemplate(message);
-
-    auto sequence_str = tokenize(applied_string);
+    auto sequence_str = tokenizePrompt(message);
     std::vector<int64_t> ids;
     ids.reserve(sequence_str.size());
     for (const auto& str : sequence_str) { ids.emplace_back(bpe_._lookup_vocab(str)); }

@@ -24,6 +24,7 @@
 #include "mllm/utils/Enumerate.hpp"
 #include "mllm/models/ARGeneration.hpp"
 #include "mllm/models/qwen3/chat_template_qwen3.hpp"
+#include "mllm/preprocessor/StreamingUtf8Decoder.hpp"
 #include "mllm/preprocessor/tokenizers/Unicode.hpp"
 #include "mllm/models/qwen3/tokenization_qwen3.hpp"
 #include "mllm/models/qwen3/configuration_qwen3.hpp"
@@ -673,13 +674,15 @@ class Qwen3ProbingSession final : public ::mllm::service::Session {
 
     int64_t package_cnt = 0;
     std::string accumulated_output = "";
+    preprocessor::StreamingUtf8Decoder utf8_decoder;
     auto wrapped_callback = [this, &max_length, &request, &full_seq_idx, &package_cnt, &callback, &probe_ctx, &stop_generating,
                              &candidate_key, &debounce_counter, &has_confirmed_key_in_decode,
-                             &accumulated_output](int64_t idx) {
+                             &accumulated_output, &utf8_decoder](int64_t idx) {
       if (stop_generating) return;
 
-      // Calculate token string early for punctuation check
-      std::string current_token_str = preprocessor::wideString2Utf8String(tokenizer_->detokenize(idx));
+      // Complete UTF-8 characters only: a byte-level token may be half a character.
+      std::string current_token_str = idx == model_->cfg.eos_token_id ? utf8_decoder.finish()
+                                                                       : utf8_decoder.append(tokenizer_->detokenizeBytes(idx));
 
       // 0. Accumulate output (Wait for safety check)
       // Do not append EOS token to the buffer

@@ -33,6 +33,8 @@ struct Qwen3Config : protected ConfigFile {
 
     chat_template_backend = preprocessor::parseChatTemplateBackend(data().value("chat_template_backend", "legacy"));
 
+    control_token_policy = preprocessor::parseControlTokenPolicy(data().value("control_token_policy", "reject"));
+
     linear_impl_type = aops::str2LinearImplTypes(data()["linear_impl_type"]);
   }
 
@@ -57,6 +59,7 @@ struct Qwen3Config : protected ConfigFile {
   int32_t thinking_start_token_id = 151667;
   int32_t thinking_end_token_id = 151668;
   preprocessor::ChatTemplateBackend chat_template_backend = preprocessor::ChatTemplateBackend::Legacy;
+  preprocessor::ControlTokenPolicy control_token_policy = preprocessor::ControlTokenPolicy::Reject;
 
   aops::LinearImplTypes linear_impl_type = aops::LinearImplTypes::kDefault;
 };
