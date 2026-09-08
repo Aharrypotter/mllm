@@ -7,6 +7,8 @@ mllm
 
 **适用于移动端和边缘设备的快速、轻量级多模态大语言模型推理引擎**
 
+[English](./README.md) | **简体中文**
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Documentation](https://img.shields.io/badge/docs-website-blue)](https://ubiquitouslearning.github.io/mllm/)
 [![GitHub Stars](https://img.shields.io/github/stars/UbiquitousLearning/mllm.svg)](https://github.com/UbiquitousLearning/mllm/stargazers)
@@ -101,23 +103,22 @@ mllm 框架可以与主流社区框架的模型检查点无缝集成。通过 ml
 
 ### mllm v2
 
-| Model(v2)                                                                   | CPU  | Jetson Orin CUDA | Hexagon NPU <br> INT8 |
-|-----------------------------------------------------------------------------|------|------------------|-----------------------|
-| [Qwen3-0.6B](https://github.com/QwenLM/Qwen3)                     | [✔️ w4a8](https://www.modelscope.cn/models/mllmTeam/Qwen3-0.6B-w4a32kai)  |  |  |
-| [Qwen3-1.7B](https://github.com/QwenLM/Qwen3)                     | [✔️ w4a8](https://www.modelscope.cn/models/mllmTeam/Qwen3-1.7B-w4a8-i8mm-kai)  |  | [W4A16-SM8650](https://modelscope.cn/models/mllmTeam/Qwen3-1.7B-Qnn-AOT-SM8650/summary) |
-| [Qwen3-4B](https://github.com/QwenLM/Qwen3)                      | [✔️ w4a8](https://www.modelscope.cn/models/mllmTeam/Qwen3-4B-w4a8-i8mm-kai)  |  |  |
+| Model(v2)                                                                   | CPU  | Hexagon NPU <br> INT8 | Ascend NPU |
+|-----------------------------------------------------------------------------|------|-----------------------|------------|
+| [Qwen3-0.6B](https://github.com/QwenLM/Qwen3)                     | [✔️ w4a8](https://www.modelscope.cn/models/mllmTeam/Qwen3-0.6B-w4a32kai)  |  | [✔️ W8A8](https://www.modelscope.cn/models/mllmTeam/Qwen3-0.6B-W8A8-Ascend) |
+| [Qwen3-1.7B](https://github.com/QwenLM/Qwen3)                     | [✔️ w4a8](https://www.modelscope.cn/models/mllmTeam/Qwen3-1.7B-w4a8-i8mm-kai)  | [W4A16-SM8650](https://modelscope.cn/models/mllmTeam/Qwen3-1.7B-Qnn-AOT-SM8650/) | |
+| [Qwen3-4B](https://github.com/QwenLM/Qwen3)                      | [✔️ w4a8](https://www.modelscope.cn/models/mllmTeam/Qwen3-4B-w4a8-i8mm-kai)  |  | |
+| [Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B)           | [✔️ w4a8](./examples/qwen3_5/README.md) | | |
+| [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B)               | [✔️ w4a8](./examples/qwen3_5/README.md) | | |
 | [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B)          | [✔️ w4a8](./examples/minicpm5/README.md) | | |
 | [MiniCPM5-2B](https://huggingface.co/openbmb/MiniCPM5-2B)          | [✔️ w4a8](./examples/minicpm5/README.md) | | |
-| Qwen3.5-2B                                                       |  | ✔️ W4A16 / W8A8 |  |
-| Qwen3.5-4B                                                       |  | ✔️ W4A16 / W8A8 |  |
-| Qwen3-VL-2B-Instruct                                            |  | ✔️ W4A16 / W8A8 |  |
-| Qwen3-VL-4B-Instruct                                            |  | ✔️ W4A16 / W8A8 |  |
-| [DeepSeek-OCR](https://github.com/deepseek-ai/DeepSeek-OCR)       | [✔️ w4a8](https://www.modelscope.cn/models/mllmTeam/DeepSeek-OCR-w4a8-i8mm-kai)  |  |  |
-| [SmolLM3](https://huggingface.co/blog/smollm3)| [✔️ w4a8](https://www.modelscope.cn/models/mllmTeam/SmolLM3-3B-w4a8-i8mm-kai)  |  |  |
-| [Qwen2-VL-2B-Instruct](https://qwenlm.github.io/zh/blog/qwen2-vl/) | [✔️ w4a8](https://www.modelscope.cn/models/mllmTeam/Qwen2-VL-2B-Instruct-w4a32kai) |  |  |
-| [Qwen2-VL-7B-Instruct](https://qwenlm.github.io/zh/blog/qwen2-vl/) | [✔️ w4a8](https://www.modelscope.cn/models/mllmTeam/Qwen2-VL-7B-Instruct-w4a32kai) |  |  |
-| [Qwen2.5-VL-3B-Instruct](https://qwenlm.github.io/blog/qwen2.5-vl/) | [✔️ w4a8](https://www.modelscope.cn/models/mllmTeam/Qwen2.5-VL-3B-Instruct-w4a32kai) |  |  |
-| [Qwen2.5-VL-7B-Instruct](https://qwenlm.github.io/blog/qwen2.5-vl/) | [✔️ w4a8](https://www.modelscope.cn/models/mllmTeam/Qwen2.5-VL-7B-Instruct-w4a32kai) |  |  |
+| [LFM2.5-2.6B](https://huggingface.co/LiquidAI/LFM2.5-2.6B)         | [✔️ w4a8](./examples/lfm2/README.md) | | |
+| [DeepSeek-OCR](https://github.com/deepseek-ai/DeepSeek-OCR)       | [✔️ w4a8](https://www.modelscope.cn/models/mllmTeam/DeepSeek-OCR-w4a8-i8mm-kai)  |  | |
+| [SmolLM3](https://huggingface.co/blog/smollm3)| [✔️ w4a8](https://www.modelscope.cn/models/mllmTeam/SmolLM3-3B-w4a8-i8mm-kai)  |  | |
+| [Qwen2-VL-2B-Instruct](https://qwenlm.github.io/zh/blog/qwen2-vl/)|[✔️ w4a8](https://www.modelscope.cn/models/mllmTeam/Qwen2-VL-2B-Instruct-w4a32kai) || |
+| [Qwen2-VL-7B-Instruct](https://qwenlm.github.io/zh/blog/qwen2-vl/)|[✔️ w4a8](https://www.modelscope.cn/models/mllmTeam/Qwen2-VL-7B-Instruct-w4a32kai)|| |
+| [Qwen2.5-VL-3B-Instruct](https://qwenlm.github.io/blog/qwen2.5-vl/)|[✔️ w4a8](https://www.modelscope.cn/models/mllmTeam/Qwen2.5-VL-3B-Instruct-w4a32kai)|| |
+| [Qwen2.5-VL-7B-Instruct](https://qwenlm.github.io/blog/qwen2.5-vl/)|[✔️ w4a8](https://www.modelscope.cn/models/mllmTeam/Qwen2.5-VL-7B-Instruct-w4a32kai)|| |
 
 ### mllm v1
 
