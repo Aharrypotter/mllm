@@ -45,7 +45,9 @@ void hmx_runtime_reset(void) {
     set_hmx_power(0);
 }
 
-int hmx_runtime_begin(hmx_runtime_session *session, uint32_t minimum_vtcm_size) {
+static int hmx_runtime_begin_impl(hmx_runtime_session *session,
+                                  uint32_t minimum_vtcm_size,
+                                  int single_thread) {
     if (!session || minimum_vtcm_size == 0) {
         return -1;
     }
@@ -72,14 +74,33 @@ int hmx_runtime_begin(hmx_runtime_session *session, uint32_t minimum_vtcm_size) 
     session->vtcm_base =
         (uint8_t *)HAP_compute_res_attr_get_vtcm_ptr(&request);
     session->vtcm_size = minimum_vtcm_size;
-    if (!session->vtcm_base ||
-        HAP_compute_res_hmx_lock2(
-            session->resource_context, HAP_COMPUTE_RES_HMX_SHARED) != 0) {
+    if (!session->vtcm_base) {
+        hmx_runtime_end(session);
+        return -1;
+    }
+    int lock_status = single_thread
+        ? HAP_compute_res_hmx_lock(session->resource_context)
+        : HAP_compute_res_hmx_lock2(
+              session->resource_context, HAP_COMPUTE_RES_HMX_SHARED);
+    if (lock_status != 0) {
         hmx_runtime_end(session);
         return -1;
     }
     session->hmx_locked = 1;
+    session->single_thread_lock = single_thread;
     return 0;
+}
+
+int hmx_runtime_begin(hmx_runtime_session *session, uint32_t minimum_vtcm_size) {
+    return hmx_runtime_begin_impl(session, minimum_vtcm_size, 0);
+}
+
+int hmx_runtime_begin_same_thread(hmx_runtime_session *session, uint32_t minimum_vtcm_size) {
+#if defined(__HEXAGON_ARCH__) && __HEXAGON_ARCH__ == 81
+    return hmx_runtime_begin_impl(session, minimum_vtcm_size, 1);
+#else
+    return hmx_runtime_begin_impl(session, minimum_vtcm_size, 0);
+#endif
 }
 
 void hmx_runtime_end(hmx_runtime_session *session) {
@@ -87,8 +108,12 @@ void hmx_runtime_end(hmx_runtime_session *session) {
         return;
     }
     if (session->hmx_locked && session->resource_context) {
-        (void)HAP_compute_res_hmx_unlock2(
-            session->resource_context, HAP_COMPUTE_RES_HMX_SHARED);
+        if (session->single_thread_lock) {
+            (void)HAP_compute_res_hmx_unlock(session->resource_context);
+        } else {
+            (void)HAP_compute_res_hmx_unlock2(
+                session->resource_context, HAP_COMPUTE_RES_HMX_SHARED);
+        }
     }
     if (session->resource_context) {
         (void)HAP_compute_res_release(session->resource_context);

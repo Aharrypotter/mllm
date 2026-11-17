@@ -1384,7 +1384,7 @@ AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_per_head(
         const uint32_t vtcm_bytes = hmx_i8_qk_packed_vtcm_bytes(
             HMX_FIXED_M_PADDED, HMX_FIXED_K_PADDED, n);
         const uint64_t resource_begin = HAP_perf_get_qtimer_count();
-        if (hmx_runtime_begin(&temporary_session, vtcm_bytes) != 0) {
+        if (hmx_runtime_begin_same_thread(&temporary_session, vtcm_bytes) != 0) {
             status = -1;
         } else {
             session = &temporary_session;
