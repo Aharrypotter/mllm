@@ -569,6 +569,29 @@ int main(int argc, char** argv) {
   args["debug_layer_outputs"] = true;
   args["return_hidden_states"] = true;
 
+  // Give the pure CPU path an explicitly sized cache. The implicit per-layer
+  // cache has a fixed 1024-token capacity and cannot serve long prompts.
+  if (!use_npu_prefill) {
+    const int64_t requested_cache_length =
+        static_cast<int64_t>(raw_input_tokens.shape()[1]) + max_new_tokens_value;
+    if (requested_cache_length <= 0 || requested_cache_length > cpu_cfg.max_cache_length) {
+      fmt::print(stderr, "Error: CPU prompt and generation require {} cache slots; configured capacity is {}.\n",
+                 requested_cache_length, cpu_cfg.max_cache_length);
+      ::mllm::shutdownContext();
+      return 2;
+    }
+    shared_kv_cache = std::make_unique<mllm::nn::StaticCache>(
+        static_cast<int32_t>(requested_cache_length), cpu_cfg.num_hidden_layers, cpu_cfg.num_attention_heads,
+        cpu_cfg.num_key_value_heads, cpu_cfg.head_dim, mllm::kFloat32, mllm::kFloat32, mllm::kCPU, false);
+    auto& cpu_decode_blocks = cpu_decode_model->text_model().decode_blocks();
+    for (int32_t layer_idx = 0; layer_idx < cpu_cfg.num_hidden_layers; ++layer_idx) {
+      auto& cache = cpu_decode_blocks.list()[layer_idx].getKVCache();
+      cache.setStaticCache(shared_kv_cache.get());
+      cache.setLayerIndex(layer_idx);
+    }
+    fmt::print("SHADOWNPU_CPU_CACHE capacity={} layers={}\n", requested_cache_length, cpu_cfg.num_hidden_layers);
+  }
+
   // Prefill phase
   if (!use_npu_prefill) {
     MLLM_INFO("Starting CPU prefill...");
