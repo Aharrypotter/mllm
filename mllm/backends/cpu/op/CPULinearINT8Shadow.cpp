@@ -5,11 +5,15 @@
 #include "backends/cpu/third_party/ggml/VecDotFP16.hpp"
 #include "backends/cpu/third_party/ggml/QuantizeQ8.hpp"
 #include "backends/qnn/op/QNNActivationScaleOverride.hpp"
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
+#include <stdexcept>
 
 namespace mllm {
-CPULinearINT8Shadow::CPULinearINT8Shadow(Backend *bn, string opName, int in_features, int out_features, int max_position, bool bias, int threadCount) :
-    thread_count(threadCount),
+CPULinearINT8Shadow::CPULinearINT8Shadow(Backend *bn, string opName, int in_features, int out_features, int max_position, bool bias, int threadCount, int activation_bits) :
+    activation_bits_(activation_bits), thread_count(threadCount),
     Op(bn, opName), in_features_(in_features), out_features_(out_features), max_position_(max_position), support_bias_(bias) {
     weight_.setBackend(bn);
     weightScale_.setBackend(bn);
@@ -34,6 +38,10 @@ ErrorCode CPULinearINT8Shadow::reshape(vector<shared_ptr<Tensor>> inputs, vector
     assert(outputs.size() == 1);
 
     outputs[0]->reshape(inputs[2]->batch(), inputs[2]->head(), inputs[2]->sequence(), inputs[2]->dimension());
+    if (activation_bits_ == 16) {
+        outputs[0]->setDtype(MLLM_TYPE_F32);
+        return Op::reshape(inputs, outputs);
+    }
 
     // inputs[0] linear dequant input __fp32
     // inputs[1] linear quant output  int8_t
@@ -113,6 +121,8 @@ ErrorCode CPULinearINT8Shadow::load(AbstructLoader &loader) {
     outputClip_.alloc();
     loader.load(&outputClip_);
 
+    if (activation_bits_ == 16) return Op::load(loader);
+
     shadowWeight_.setName(opName + ".shadow.weight");
     shadowWeight_.reshape(1, 1, in_features_, out_features_);
     shadowWeight_.setDtype(MLLM_TYPE_I8);
@@ -158,7 +168,82 @@ ErrorCode CPULinearINT8Shadow::free(vector<shared_ptr<Tensor>> inputs, vector<sh
     return Op::free(inputs, outputs);
 }
 
+ErrorCode CPULinearINT8Shadow::executeInt16(const vector<shared_ptr<Tensor>> &inputs,
+                                           const vector<shared_ptr<Tensor>> &outputs) {
+    auto &input = *inputs[0];
+    auto &quantized = *inputs[1];
+    auto &residual = *inputs[2];
+    auto &result = *outputs[0];
+    const auto count_tokens = [](Tensor &t) { return t.batch() * t.head() * t.sequence(); };
+    const int tokens = count_tokens(residual);
+    if ((input.dtype() != MLLM_TYPE_F32 && input.dtype() != MLLM_TYPE_F16) ||
+        quantized.dtype() != MLLM_TYPE_I16 || residual.dtype() != MLLM_TYPE_F32 ||
+        tokens != count_tokens(input) || tokens != count_tokens(quantized) ||
+        input.dimension() != in_features_ || quantized.dimension() != out_features_ ||
+        residual.dimension() != out_features_) {
+        throw std::runtime_error("invalid W8A16 shadow tensor bindings: " + name());
+    }
+
+    constexpr float min_code = -32768.0F;
+    constexpr float max_code = 32767.0F;
+    const float input_step = inputScale_.hostPtr<float>()[0] / max_code;
+    const float output_step = outputScale_.hostPtr<float>()[0] / max_code;
+    const float weight_step = weightScale_.hostPtr<float>()[0];
+    if (!(std::isfinite(input_step) && input_step > 0 && std::isfinite(output_step) && output_step > 0 &&
+          std::isfinite(weight_step) && weight_step > 0)) {
+        throw std::runtime_error("invalid W8A16 shadow scale: " + name());
+    }
+    const bool clip_input = inputClip_.hostPtr<int8_t>()[0] != 0;
+    const bool clip_output = outputClip_.hostPtr<int8_t>()[0] != 0;
+    const auto *weights = weight_.hostPtr<int8_t>();
+    const auto coords = [](Tensor &t, int token) {
+        return std::array<int, 3>{token / (t.head() * t.sequence()), token / t.sequence() % t.head(),
+                                  token % t.sequence()};
+    };
+
+#pragma omp parallel num_threads(thread_count)
+    {
+        std::vector<float> rounded(in_features_);
+        std::vector<float> row(out_features_);
+#pragma omp for
+        for (int token = 0; token < tokens; ++token) {
+            const auto [ib, ih, is] = coords(input, token);
+            const auto [qb, qh, qs] = coords(quantized, token);
+            const auto [rb, rh, rs] = coords(residual, token);
+            for (int o = 0; o < out_features_; ++o) row[o] = residual.dataAt<float>(rb, rh, rs, o);
+            for (int i = 0; i < in_features_ && (!clip_input || !clip_output); ++i) {
+                const float value = input.dtype() == MLLM_TYPE_F32
+                    ? input.dataAt<float>(ib, ih, is, i)
+                    : static_cast<float>(input.dataAt<mllm_fp16_t>(ib, ih, is, i));
+                const float code = std::round(value / input_step);
+                rounded[i] = code;
+                if (clip_input || (code >= min_code && code <= max_code)) continue;
+                const float delta = (code - std::clamp(code, min_code, max_code)) * input_step * weight_step;
+                const auto *weight_row = weights + static_cast<int64_t>(i) * out_features_;
+                for (int o = 0; o < out_features_; ++o) row[o] += delta * static_cast<float>(weight_row[o]);
+            }
+            for (int o = 0; o < out_features_; ++o) {
+                if (!clip_output) {
+                    const float code = quantized.dataAt<int16_t>(qb, qh, qs, o);
+                    if (code <= min_code || code >= max_code) {
+                        float full = 0.0F;
+                        for (int i = 0; i < in_features_; ++i) {
+                            const float w = weights[static_cast<int64_t>(i) * out_features_ + o];
+                            full += rounded[i] * input_step * w * weight_step;
+                        }
+                        row[o] = residual.dataAt<float>(rb, rh, rs, o) - code * output_step
+                            + std::round(full / output_step) * output_step;
+                    }
+                }
+                result.setDataAt<float>(rb, rh, rs, o, row[o]);
+            }
+        }
+    }
+    return Op::execute(inputs, outputs);
+}
+
 ErrorCode CPULinearINT8Shadow::execute(vector<shared_ptr<Tensor>> inputs, vector<shared_ptr<Tensor>> outputs) {
+    if (activation_bits_ == 16) return executeInt16(inputs, outputs);
     auto opName = name();
 
     // inputs[0] linear dequant input __fp32

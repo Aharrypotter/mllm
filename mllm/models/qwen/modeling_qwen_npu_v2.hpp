@@ -475,8 +475,10 @@ public:
             mlp_activation_dtype);
 
         down_proj = Linear(intermediate_size, hidden_size, false, mlp_base_name + names._down_proj_name);
-        pre_down_proj_quantize = Quantize(true, mlp_base_name + names._down_proj_name + ".quantize");
-        post_down_proj_dequantize = Dequantize(true, mlp_base_name + names._down_proj_name + ".dequantize");
+        const DataType down_activation_dtype = config.use_i16_shadow_down_proj ? MLLM_TYPE_I16 : MLLM_TYPE_I8;
+        pre_down_proj_quantize = Quantize(true, mlp_base_name + names._down_proj_name + ".quantize", down_activation_dtype);
+        post_down_proj_dequantize = Dequantize(true, mlp_base_name + names._down_proj_name + ".dequantize",
+                                             true, down_activation_dtype);
         post_mlp_view = View(1, 1, chunk_size, hidden_size, mlp_base_name + names._down_proj_name + ".dequantize-00_view_");
 
         mlp_mul = Mul(mlp_base_name + "mul");
@@ -671,7 +673,9 @@ public:
 
         part2 = make_unique<QwenDecoderNPUPart2WithShadow>(config, names, chunk_size, base_name);
 
-        shadow_linear = ShadowLinear(config.intermediate_size, hidden_size, 1024, false, base_name + names._ffn_base_name + names._down_proj_name + ".shadow");
+        shadow_linear = ShadowLinear(config.intermediate_size, hidden_size, 1024, false,
+                                     base_name + names._ffn_base_name + names._down_proj_name + ".shadow",
+                                     config.use_i16_shadow_down_proj ? 16 : 8);
 
         _SubgraphStart_1 = SubgraphStart(base_name + "subgraph_start1");
         _SubgraphEnd_1 = SubgraphFinalize(base_name + "subgraph_end1");

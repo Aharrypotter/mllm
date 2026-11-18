@@ -8,7 +8,7 @@
 namespace mllm {
 class CPULinearINT8Shadow : public Op {
 public:
-    CPULinearINT8Shadow(Backend *bn, string opName, int in_features, int out_features, int max_position, bool bias, int threadCount);
+    CPULinearINT8Shadow(Backend *bn, string opName, int in_features, int out_features, int max_position, bool bias, int threadCount, int activation_bits);
     virtual ~CPULinearINT8Shadow() = default;
     virtual ErrorCode reshape(vector<shared_ptr<Tensor>> inputs, vector<shared_ptr<Tensor>> outputs) override;
     virtual ErrorCode execute(vector<shared_ptr<Tensor>> inputs, vector<shared_ptr<Tensor>> outputs) override;
@@ -16,6 +16,9 @@ public:
     virtual ErrorCode free(vector<shared_ptr<Tensor>> inputs, vector<shared_ptr<Tensor>> outputs) override;
 
 private:
+    ErrorCode executeInt16(const vector<shared_ptr<Tensor>> &inputs, const vector<shared_ptr<Tensor>> &outputs);
+
+    int activation_bits_;
     int in_features_;
     int out_features_;
     int thread_count;
@@ -61,7 +64,8 @@ public:
         int out_features = op_param["out_features"];
         int max_position = op_param["max_position"];
         int bias = op_param["bias"];
-        return new CPULinearINT8Shadow(bn, name, in_features, out_features, max_position, (bool)bias, threadCount);
+        const int activation_bits = op_param.count("activation_bits") ? op_param.at("activation_bits") : 8;
+        return new CPULinearINT8Shadow(bn, name, in_features, out_features, max_position, (bool)bias, threadCount, activation_bits);
     }
 };
 

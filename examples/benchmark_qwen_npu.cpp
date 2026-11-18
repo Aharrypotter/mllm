@@ -317,6 +317,25 @@ void dumpResidualBoundary(const std::filesystem::path &dir, QNNModuleWrapper &gr
     if (!metadata) throw std::runtime_error("writing first residual boundary metadata failed");
 }
 
+int dumpShadowResidualBoundaries(const std::filesystem::path &dir, CPUModuleWrapper &graph) {
+    int count = 0;
+    for (const auto &callable : graph.traces_) {
+        if (callable->type_ != CallableType::OP || !callable->op) continue;
+        const auto name = callable->op->name();
+        const std::string suffix = ".mlp.down_proj.shadow";
+        if (name.size() < suffix.size() || name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+        if (callable->opOutputs.size() != 1) throw std::runtime_error("unexpected W8A16 shadow output");
+        const int layer = v2::qwenLayerIndexFromBaseName(name);
+        const auto label = "layer-" + std::to_string(layer) + "-shadow-residual";
+        std::ofstream metadata(dir / "metadata.tsv", std::ios::app);
+        writeProjectionBoundary(dir, metadata, *callable->opOutputs.front(), label.c_str(), 1, 1536, false);
+        metadata.close();
+        if (!metadata) throw std::runtime_error("writing W8A16 residual metadata failed");
+        ++count;
+    }
+    return count;
+}
+
 bool dumpFinalNormBoundary(const std::filesystem::path &dir, CPUModuleWrapper &graph) {
     const auto norm = std::find_if(graph.traces_.begin(), graph.traces_.end(), [](const auto &callable) {
         return callable->op != nullptr && callable->op->name() == "model.norm";
@@ -626,6 +645,7 @@ int main(int argc, char **argv) {
     bool projection_dumped = false;
     bool attention_dumped = false;
     int residuals_dumped = 0;
+    int shadow_residuals_dumped = 0;
     bool final_norm_dumped = false;
     if (!projection_dump.empty()) {
         after_graph = [&](int chunk_id, Module &graph) {
@@ -645,6 +665,9 @@ int main(int argc, char **argv) {
                 } else if (projection_dumped) {
                     if (auto *cpu = dynamic_cast<CPUModuleWrapper *>(&graph)) {
                         if (!attention_dumped) attention_dumped = dumpAttentionBoundary(projection_dump, *cpu);
+                        if (config.use_i16_shadow_down_proj) {
+                            shadow_residuals_dumped += dumpShadowResidualBoundaries(projection_dump, *cpu);
+                        }
                         if (!final_norm_dumped) final_norm_dumped = dumpFinalNormBoundary(projection_dump, *cpu);
                     }
                 }
@@ -656,10 +679,12 @@ int main(int argc, char **argv) {
     auto prefill_result = pipeline.run(
         input_tensor, prefill_opt, tokenizer, model, is_switched, {},
         parallel_chunks, !cpu_last_token_refine, after_graph);
-    if (after_graph && !(projection_dumped && attention_dumped && residuals_dumped == 27 && final_norm_dumped)) {
+    const size_t expected_shadow_residuals = config.use_i16_shadow_down_proj ? config.shadow_layers.size() : 0;
+    if (after_graph && !(projection_dumped && attention_dumped && residuals_dumped == 27 && final_norm_dumped
+                         && static_cast<size_t>(shadow_residuals_dumped) == expected_shadow_residuals)) {
         std::cerr << "missing layer 0 boundary: projection=" << projection_dumped
                   << " attention=" << attention_dumped << " residuals=" << residuals_dumped
-                  << " final_norm=" << final_norm_dumped << std::endl;
+                  << " shadow_residuals=" << shadow_residuals_dumped << " final_norm=" << final_norm_dumped << std::endl;
         return 5;
     }
     const int64_t npu_prefill_end_us = mllm_time_us();

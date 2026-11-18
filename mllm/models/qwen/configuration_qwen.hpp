@@ -334,6 +334,10 @@ struct QWenNPUConfig : virtual public QWenConfig {
             shadow_layers = {};
             use_i32_bias = false;
             use_high_precision_silu = true;
+            if (const char *shadow = std::getenv("MLLM_QWEN15_W8A16_SHADOW"); shadow && std::string(shadow) == "1") {
+                shadow_layers = {1, 2, 4, 26};
+                use_i16_shadow_down_proj = true;
+            }
         } else if (billionsType == "1.5b-vl-rotated") { // qwen-2-vl rotated model
             shadow_layers = {};
             use_high_precision_silu = true;
@@ -353,6 +357,7 @@ struct QWenNPUConfig : virtual public QWenConfig {
     // Compatibility controls for calibration-sensitive Qwen1.5 exports.
     bool use_i16_attention_output = false;
     bool use_i16_mlp_activations = false;
+    bool use_i16_shadow_down_proj = false;
     std::set<int> i16_mlp_layers_override;
 
     bool useI16MLPActivationsForLayer(int layer_idx) const {
