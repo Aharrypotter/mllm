@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -239,6 +240,143 @@ void dumpQNNBoundaryTensors(const std::filesystem::path& root,
   dump_tensor("-", "final_norm", "final_norm.f32", layer_outputs.back());
 }
 
+using QwenCPU = mllm::models::qwen_npu::QwenForCausalLMCPU;
+using QwenConfig = mllm::models::qwen_npu::QwenNPUConfig;
+using GenerationState = mllm::models::ARGenerationOutputPast;
+
+std::vector<float> lastTokenLogits(GenerationState& output, int32_t vocab) {
+  auto logits = output.at("sequence").to(mllm::kFloat32).contiguous();
+  MLLM_RT_ASSERT(logits.shape() == mllm::Tensor::shape_t({1, 1, vocab}));
+  const auto* first = logits.ptr<float>();
+  std::vector<float> values(first, first + vocab);
+  for (auto value : values) { MLLM_RT_ASSERT((std::bit_cast<uint32_t>(value) & 0x7f800000U) != 0x7f800000U); }
+  return values;
+}
+
+size_t argmax(const std::vector<float>& logits) {
+  return static_cast<size_t>(std::max_element(logits.begin(), logits.end()) - logits.begin());
+}
+
+void logCacheTrial(int mask, const std::vector<float>& logits, size_t qnn_target, size_t cpu_target) {
+  const auto rank = [&](size_t target) {
+    return 1 + std::count_if(logits.begin(), logits.end(), [&](float value) { return value > logits[target]; });
+  };
+  const auto top = argmax(logits);
+  uint64_t hash = 1469598103934665603ULL;
+  for (const float score : logits) {
+    uint32_t value = std::bit_cast<uint32_t>(score);
+    for (int byte = 0; byte < 4; ++byte) {
+      hash ^= value & 0xffU;
+      hash *= 1099511628211ULL;
+      value >>= 8;
+    }
+  }
+  fmt::print("SHADOWNPU_KV_TRIAL cpu_group_mask={} top_id={} top_score={:.9g} qnn_id={} qnn_score={:.9g} "
+             "qnn_rank={} cpu_id={} cpu_score={:.9g} cpu_rank={} cpu_minus_qnn={:.9g} logits_fnv64={:#018x}\n",
+             mask, top, logits[top], qnn_target, logits[qnn_target], rank(qnn_target), cpu_target, logits[cpu_target],
+             rank(cpu_target), logits[cpu_target] - logits[qnn_target], hash);
+}
+
+void logCacheDifferences(mllm::nn::StaticCache& qnn_cache, mllm::nn::StaticCache& cpu_cache, const QwenConfig& cfg,
+                         int32_t prefix) {
+  const int32_t repeats = cfg.num_attention_heads / cfg.num_key_value_heads;
+  const size_t head_elements = static_cast<size_t>(prefix) * cfg.head_dim;
+  const auto relativeError = [&](mllm::Tensor& sample, mllm::Tensor& reference) {
+    const mllm::Tensor::shape_t shape{1, cfg.num_attention_heads, prefix, cfg.head_dim};
+    MLLM_RT_ASSERT(sample.shape() == shape && reference.shape() == shape);
+    MLLM_RT_ASSERT(sample.dtype() == mllm::kFloat32 && reference.dtype() == mllm::kFloat32);
+    double diff_sq = 0.0;
+    double ref_sq = 0.0;
+    for (int32_t head = 0; head < cfg.num_key_value_heads; ++head) {
+      const auto* q = sample.offsettedPtr<float>({0, head * repeats, 0, 0});
+      const auto* c = reference.offsettedPtr<float>({0, head * repeats, 0, 0});
+      for (size_t element = 0; element < head_elements; ++element) {
+        const double diff = static_cast<double>(q[element]) - c[element];
+        diff_sq += diff * diff;
+        ref_sq += static_cast<double>(c[element]) * c[element];
+      }
+    }
+    return std::sqrt(diff_sq / ref_sq);
+  };
+  for (int32_t layer = 0; layer < cfg.num_hidden_layers; ++layer) {
+    auto qnn = qnn_cache.getKVCache(layer);
+    auto cpu = cpu_cache.getKVCache(layer);
+    fmt::print("SHADOWNPU_KV_PREFIX_DIFF layer={} key_relative_l2={:.9g} value_relative_l2={:.9g}\n",
+               layer, relativeError(qnn[0], cpu[0]), relativeError(qnn[1], cpu[1]));
+  }
+}
+
+bool crosscheckPrefillCaches(QwenCPU& decoder, mllm::nn::StaticCache& qnn_cache, const QwenConfig& cfg,
+                             const mllm::Tensor& tokens, const GenerationState& second_input) {
+  constexpr int all_cpu = 15;
+  const int32_t prefix = tokens.shape()[1];
+  const auto& position = second_input.at("position_ids");
+  MLLM_RT_ASSERT(position.constAt<int64_t>({0, position.shape()[1] - 1}) == prefix - 1);
+  for (int32_t layer = 0; layer < cfg.num_hidden_layers; ++layer) {
+    MLLM_RT_ASSERT(qnn_cache.getCurrentSeqCnt(layer) == prefix);
+  }
+
+  mllm::nn::StaticCache cpu_cache(cfg.max_cache_length, cfg.num_hidden_layers, cfg.num_attention_heads,
+                                  cfg.num_key_value_heads, cfg.head_dim, mllm::kFloat32, mllm::kFloat32, mllm::kCPU, false);
+  auto& blocks = decoder.text_model().decode_blocks().list();
+  const auto cacheAt = [&](int mask, int32_t layer) -> mllm::nn::StaticCache& {
+    const int32_t group = (4 * layer) / cfg.num_hidden_layers;
+    return (mask & (1 << group)) != 0 ? cpu_cache : qnn_cache;
+  };
+  const auto bind = [&](int mask) {
+    for (int32_t layer = 0; layer < cfg.num_hidden_layers; ++layer) {
+      blocks[layer].getKVCache().setStaticCache(&cacheAt(mask, layer));
+    }
+  };
+  const auto trial = [&](int mask) {
+    bind(mask);
+    auto output = decoder.forward(second_input, {});
+    MLLM_RT_ASSERT(output.at("position_ids").constAt<int64_t>({0, 0}) == prefix);
+    for (int32_t layer = 0; layer < cfg.num_hidden_layers; ++layer) {
+      MLLM_RT_ASSERT(cacheAt(mask, layer).getCurrentSeqCnt(layer) == prefix + 1);
+    }
+    qnn_cache.setCurrentSeqCnt(prefix);
+    if (mask != 0) { cpu_cache.setCurrentSeqCnt(prefix); }
+    return lastTokenLogits(output, cfg.vocab_size);
+  };
+
+  const auto qnn_control = trial(0);
+  fmt::print("SHADOWNPU_KV_STAGE cpu_prefill_start prefix={} capacity={} layers={}\n", prefix, cfg.max_cache_length,
+             cfg.num_hidden_layers);
+  std::cout.flush();
+  bind(all_cpu);
+  auto cpu_prefill = decoder.forward({{"sequence", tokens}}, {});
+  const auto cpu_first = argmax(lastTokenLogits(cpu_prefill, cfg.vocab_size));
+  const auto qnn_first = second_input.at("sequence").constAt<int64_t>({0, 0});
+  const auto& cpu_positions = cpu_prefill.at("position_ids");
+  MLLM_RT_ASSERT(cpu_positions.constAt<int64_t>({0, cpu_positions.shape()[1] - 1}) == prefix - 1);
+  for (int32_t layer = 0; layer < cfg.num_hidden_layers; ++layer) {
+    MLLM_RT_ASSERT(cpu_cache.getCurrentSeqCnt(layer) == prefix && qnn_cache.getCurrentSeqCnt(layer) == prefix);
+  }
+  fmt::print("SHADOWNPU_KV_FIRST cpu_id={} qnn_id={} prefix={} decode_position={}\n", cpu_first, qnn_first,
+             prefix, prefix);
+  if (qnn_first != static_cast<int64_t>(cpu_first)) {
+    bind(0);
+    return false;
+  }
+  logCacheDifferences(qnn_cache, cpu_cache, cfg, prefix);
+
+  const auto cpu_control = trial(all_cpu);
+  const size_t qnn_target = argmax(qnn_control);
+  const size_t cpu_target = argmax(cpu_control);
+  logCacheTrial(0, qnn_control, qnn_target, cpu_target);
+  logCacheTrial(all_cpu, cpu_control, qnn_target, cpu_target);
+  for (int mask = 1; mask < all_cpu; ++mask) { logCacheTrial(mask, trial(mask), qnn_target, cpu_target); }
+  const auto qnn_repeat = trial(0);
+  const auto cpu_repeat = trial(all_cpu);
+  bind(0);
+  const auto bytes = qnn_control.size() * sizeof(float);
+  const bool qnn_same = std::memcmp(qnn_control.data(), qnn_repeat.data(), bytes) == 0;
+  const bool cpu_same = std::memcmp(cpu_control.data(), cpu_repeat.data(), bytes) == 0;
+  fmt::print("SHADOWNPU_KV_REPEAT qnn_bitwise_equal={} cpu_bitwise_equal={}\n", qnn_same, cpu_same);
+  return qnn_same && cpu_same;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -289,6 +427,8 @@ int main(int argc, char** argv) {
       Argparse::add<bool>("--debug-qnn-layer-outputs").help("Copy and summarize every QNN decoder residual output");
   auto& debug_qnn_boundary_dir = Argparse::add<std::string>("--debug-qnn-boundary-dir")
                                       .help("Dump every QNN layer Q/K/V and CPU attention output as raw Float32");
+  auto& debug_prefill_kv = Argparse::add<bool>("--debug-prefill-kv-crosscheck")
+                               .help("Compare one CPU decode step using four groups of CPU- or QNN-prefilled KV");
 
   Argparse::parse(argc, argv);
 
@@ -414,6 +554,11 @@ int main(int argc, char** argv) {
   }
   if (attention_mode.get() == "dense" && head_profile.isSet()) {
     fmt::print(stderr, "Error: --head-retain-profile is only valid with --attention-mode f32-topk or hmx-topk.\n");
+    ::mllm::shutdownContext();
+    return 2;
+  }
+  if (debug_prefill_kv.isSet() && (!use_npu_prefill || run_prefill_only || prepare_context || sparse_topk)) {
+    fmt::print(stderr, "Error: KV crosscheck requires dense QNN prefill followed by CPU decode.\n");
     ::mllm::shutdownContext();
     return 2;
   }
@@ -771,6 +916,20 @@ int main(int argc, char** argv) {
       past["position_ids"] = mllm::Tensor::empty({1, 1}, mllm::kInt64, mllm::kCPU).alloc();
       past["position_ids"].at<mllm::mllm_int64_t>({0, 0}) = static_cast<mllm::mllm_int64_t>(prefill_seq_len);
     }
+  }
+
+  if (debug_prefill_kv.isSet()) {
+    const auto tile = qnn_backend->sequenceTileProfile();
+    fmt::print("\nSHADOWNPU_KV_PREFILL chunks={} tile={} graph_calls={} tile_calls={}\n", prefill_chunk_count,
+               qnn_backend->sequenceTile(), tile.graph_calls, tile.tile_calls);
+    const bool valid = !prefill_hit_eos && generated_token_ids.size() == 1 && cpu_cfg.num_hidden_layers >= 4
+                       && prefill_seq_len < cpu_cfg.max_cache_length;
+    const bool passed = valid && crosscheckPrefillCaches(*cpu_decode_model, *shared_kv_cache, cpu_cfg, raw_input_tokens, past);
+    cpu_decode_model.reset();
+    npu_model.reset();
+    qnn_backend.reset();
+    ::mllm::shutdownContext();
+    return passed ? 0 : 3;
   }
 
   double total_decode_time_ms = 0.0;
