@@ -1,6 +1,7 @@
 // Copyright (c) MLLM Team.
 // Licensed under the MIT License.
 
+#include <optional>
 #include <stdexcept>
 
 #include "mllm/backends/qnn/CustomLayers.hpp"
@@ -115,6 +116,9 @@ class QwenAttentionProjNPU : public nn::Module {
   nn::Linear q_proj_;
   nn::Linear k_proj_;
   nn::Linear v_proj_;
+  std::optional<nn::qnn::DequantizeAdd> q_dequantize_add_;
+  std::optional<nn::qnn::DequantizeAdd> k_dequantize_add_;
+  std::optional<nn::qnn::DequantizeAdd> v_dequantize_add_;
 
   // quantize scale should be attached to input tensor and use the prefix name q_proj
   // in QNN Backend, the quant scale key is always "qnn_quant_scale"
@@ -142,27 +146,38 @@ class QwenAttentionProjNPU : public nn::Module {
 
     input_layer_norm_ = reg<nn::RMSNorm>("input_layernorm", cfg.rms_norm_eps);
 
+    const bool fuse_bias = !cfg.qnn_qkv_bias_after_dequant;
     q_proj_ = reg<nn::Linear>("self_attn.q_proj",
                               aops::LinearOpOptions{.in_channels = hidden_size_,
                                                     .out_channels = head_dim_ * num_attention_heads_,
-                                                    .bias = true,
+                                                    .bias = fuse_bias,
                                                     .impl_type = cfg.linear_impl_type,
                                                     .qnn_impl_type = aops::LinearImplTypes::kQNN_tensor_symm_w8a16});
     k_proj_ = reg<nn::Linear>("self_attn.k_proj",
                               aops::LinearOpOptions{.in_channels = hidden_size_,
                                                     .out_channels = head_dim_ * num_key_value_heads_,
-                                                    .bias = true,
+                                                    .bias = fuse_bias,
                                                     .impl_type = cfg.linear_impl_type,
                                                     .qnn_impl_type = aops::LinearImplTypes::kQNN_tensor_symm_w8a16});
     v_proj_ = reg<nn::Linear>("self_attn.v_proj",
                               aops::LinearOpOptions{.in_channels = hidden_size_,
                                                     .out_channels = head_dim_ * num_key_value_heads_,
-                                                    .bias = true,
+                                                    .bias = fuse_bias,
                                                     .impl_type = cfg.linear_impl_type,
                                                     .qnn_impl_type = aops::LinearImplTypes::kQNN_tensor_symm_w8a16});
 
     // quantize scale should be attached to input tensor to let QNN know the scale for quantization output
     quantize_scale_ = reg<nn::Param>("quantize_scale", getModuleName() + ".self_attn.q_proj.input_scale", Tensor::shape_t{1});
+    if (!fuse_bias) {
+      q_dequantize_add_ = reg<nn::qnn::DequantizeAdd>("self_attn.q_proj.dequantize", kFloat32,
+                                                    head_dim_ * num_attention_heads_);
+      k_dequantize_add_ = reg<nn::qnn::DequantizeAdd>("self_attn.k_proj.dequantize", kFloat32,
+                                                    head_dim_ * num_key_value_heads_);
+      v_dequantize_add_ = reg<nn::qnn::DequantizeAdd>("self_attn.v_proj.dequantize", kFloat32,
+                                                    head_dim_ * num_key_value_heads_);
+      // Register parameter paths above before giving the alternative QNN graph its own symbol.
+      impl()->setAbsoluteName(getModuleName() + ".qkv_post_dequant_bias");
+    }
   }
 
   std::vector<Tensor> forward(const std::vector<Tensor>& inputs, const std::vector<AnyValue>& args) override {
@@ -183,14 +198,19 @@ class QwenAttentionProjNPU : public nn::Module {
     auto key_states = k_proj_(x);
     auto value_states = v_proj_(x);
 
+    if (q_dequantize_add_) {
+      query_states = (*q_dequantize_add_)(query_states);
+      key_states = (*k_dequantize_add_)(key_states);
+      value_states = (*v_dequantize_add_)(value_states);
+    }
+
     // [B, S, H, D]
     query_states = query_states.view({B, S, num_attention_heads_, head_dim_});
     key_states = key_states.view({B, S, num_key_value_heads_, head_dim_});
     value_states = value_states.view({B, S, num_key_value_heads_, head_dim_});
 
-    // QNN Conv2d fuses the Float32 model bias as an Int32 accumulator bias.
-    // Its Int16 output therefore implements the exported post-bias fake quant
-    // directly, without a lossy pre-bias quantization boundary.
+    // Convert the fused path from its calibrated post-bias INT16 range. The
+    // separate QNN operations above already returned Float32 activations.
     query_states = query_states.to(kFloat32);
     key_states = key_states.to(kFloat32);
     value_states = value_states.to(kFloat32);

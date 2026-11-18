@@ -86,6 +86,8 @@ struct QwenNPUConfig : protected ConfigFile {
 
   aops::LinearImplTypes linear_impl_type = aops::LinearImplTypes::kDefault;
   std::vector<int32_t> shadow_down_proj_layers;
+  // Rotated checkpoints may carry Q/K/V ranges calibrated before adding their Float32 biases.
+  bool qnn_qkv_bias_after_dequant = false;
 
   // ShadowNPU is opt-in and applies to prefill only. Decode remains dense.
   float prefill_attention_sparsity = 0.0F;

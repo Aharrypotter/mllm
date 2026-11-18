@@ -282,6 +282,8 @@ int main(int argc, char** argv) {
       Argparse::add<std::string>("--qnn-context").help("Load an existing QNN context binary before graph binding");
   auto& prepare_qnn_context = Argparse::add<std::string>("--prepare-qnn-context")
                                   .help("Build a prepare-only QNN context, save it to this new path, and exit");
+  auto& qnn_qkv_bias_after_dequant = Argparse::add<bool>("--qnn-qkv-bias-after-dequant")
+                                       .help("Use pre-bias INT16 ranges and add Q/K/V biases after dequantization");
   auto& cpu_prefill = Argparse::add<bool>("--cpu-prefill").help("Use CPU for prefill instead of QNN");
   auto& prefill_only = Argparse::add<bool>("--prefill-only")
                            .help("Run QNN prefill and report its first token without loading the CPU decode model");
@@ -301,6 +303,11 @@ int main(int argc, char** argv) {
   const bool use_npu_prefill = !cpu_prefill.isSet();
   const bool prepare_context = prepare_qnn_context.isSet();
   const bool run_prefill_only = prefill_only.isSet();
+  if (!use_npu_prefill && qnn_qkv_bias_after_dequant.isSet()) {
+    fmt::print(stderr, "Error: --qnn-qkv-bias-after-dequant requires QNN prefill.\n");
+    ::mllm::shutdownContext();
+    return 2;
+  }
   const auto missing_required = [&]() {
     return !config_path.isSet() || (!run_prefill_only && !cpu_model_path.isSet()) || !tokenizer_path.isSet()
            || !merges_path.isSet() || !model_version.isSet() || (use_npu_prefill && !npu_model_path.isSet());
@@ -439,6 +446,10 @@ int main(int argc, char** argv) {
   }
 
   auto cpu_cfg = mllm::models::qwen_npu::QwenNPUConfig(config_path.get());
+  cpu_cfg.qnn_qkv_bias_after_dequant = qnn_qkv_bias_after_dequant.isSet();
+  if (cpu_cfg.qnn_qkv_bias_after_dequant) {
+    fmt::print("SHADOWNPU_QKV_BIAS_ORDER mode=after_dequantization\n");
+  }
   float average_retention = 1.0F;
   int32_t dense_heads = cpu_cfg.num_hidden_layers * cpu_cfg.num_attention_heads;
   std::string dense_layers = "all";
