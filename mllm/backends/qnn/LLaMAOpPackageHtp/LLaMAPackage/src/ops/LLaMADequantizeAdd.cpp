@@ -449,7 +449,6 @@ int32_t qhmath_hvx_dequantize_add_ui16_af(
 
     HVX_Vector sline1p, sline1c, sline1;
     HVX_Vector scale_vec;
-    HVX_Vector one_vec;
 
     int32_t block, l2fetch_block;
     int32_t leftover = size & 63;
@@ -462,7 +461,6 @@ int32_t qhmath_hvx_dequantize_add_ui16_af(
     HVX_Vector convert_vector = Q6_V_vsplat_R(convert);
 
     scale_vec = Q6_V_vsplat_R(float_to_bits(scale));
-    one_vec = Q6_V_vsplat_R(float_to_fp16s(1.0));
     scale_vec = Q6_Vqf32_vadd_VsfVsf(scale_vec, Q6_V_vzero());
 
     for (int32_t i = vectors_in_rounddown - 1; i > 0; i -= BLOCK_SIZE) {
@@ -480,15 +478,17 @@ int32_t qhmath_hvx_dequantize_add_ui16_af(
             HVX_Vector bvec1 = *bptr++; // load 32 float elements
             HVX_Vector bvec2 = *bptr++;
 
-            HVX_Vector temp = Q6_Vh_vsub_VhVh(sline1, convert_vector);
-            HVX_VectorPair result = Q6_Wqf32_vmpy_VhfVhf(Q6_Vhf_equals_Vh(temp), one_vec);
-            result = Q6_W_vshuff_VVR(Q6_V_hi_W(result), Q6_V_lo_W(result), -4);
+            // Widen in lane order before entering the extended qf32 representation.
+            HVX_Vector centered = Q6_Vh_vsub_VhVh(sline1, convert_vector);
+            HVX_VectorPair centered_words = Q6_Ww_vunpack_Vh(centered);
+            HVX_Vector result_lo = Q6_Vqf32_equals_Vsf(Q6_Vsf_equals_Vw(Q6_V_lo_W(centered_words)));
+            HVX_Vector result_hi = Q6_Vqf32_equals_Vsf(Q6_Vsf_equals_Vw(Q6_V_hi_W(centered_words)));
             *optr++ = Q6_Vsf_equals_Vqf32(
                 Q6_Vqf32_vadd_Vqf32Vqf32(
-                    Q6_Vqf32_vmpy_Vqf32Vqf32(Q6_V_lo_W(result), scale_vec), Q6_Vqf32_equals_Vsf(bvec1)));
+                    Q6_Vqf32_vmpy_Vqf32Vqf32(result_lo, scale_vec), Q6_Vqf32_equals_Vsf(bvec1)));
             *optr++ = Q6_Vsf_equals_Vqf32(
                 Q6_Vqf32_vadd_Vqf32Vqf32(
-                    Q6_Vqf32_vmpy_Vqf32Vqf32(Q6_V_hi_W(result), scale_vec), Q6_Vqf32_equals_Vsf(bvec2)));
+                    Q6_Vqf32_vmpy_Vqf32Vqf32(result_hi, scale_vec), Q6_Vqf32_equals_Vsf(bvec2)));
 
             sline1p = sline1c;
         }
@@ -501,15 +501,17 @@ int32_t qhmath_hvx_dequantize_add_ui16_af(
         HVX_Vector bvec1 = *bptr++; // load 32 float elements
         HVX_Vector bvec2 = *bptr++;
 
-        HVX_Vector temp = Q6_Vh_vsub_VhVh(sline1, convert_vector);
-        HVX_VectorPair result = Q6_Wqf32_vmpy_VhfVhf(Q6_Vhf_equals_Vh(temp), one_vec);
-        result = Q6_W_vshuff_VVR(Q6_V_hi_W(result), Q6_V_lo_W(result), -4);
+        // Widen in lane order before entering the extended qf32 representation.
+        HVX_Vector centered = Q6_Vh_vsub_VhVh(sline1, convert_vector);
+        HVX_VectorPair centered_words = Q6_Ww_vunpack_Vh(centered);
+        HVX_Vector result_lo = Q6_Vqf32_equals_Vsf(Q6_Vsf_equals_Vw(Q6_V_lo_W(centered_words)));
+        HVX_Vector result_hi = Q6_Vqf32_equals_Vsf(Q6_Vsf_equals_Vw(Q6_V_hi_W(centered_words)));
         *optr++ = Q6_Vsf_equals_Vqf32(
             Q6_Vqf32_vadd_Vqf32Vqf32(
-                Q6_Vqf32_vmpy_Vqf32Vqf32(Q6_V_lo_W(result), scale_vec), Q6_Vqf32_equals_Vsf(bvec1)));
+                Q6_Vqf32_vmpy_Vqf32Vqf32(result_lo, scale_vec), Q6_Vqf32_equals_Vsf(bvec1)));
         *optr++ = Q6_Vsf_equals_Vqf32(
             Q6_Vqf32_vadd_Vqf32Vqf32(
-                Q6_Vqf32_vmpy_Vqf32Vqf32(Q6_V_hi_W(result), scale_vec), Q6_Vqf32_equals_Vsf(bvec2)));
+                Q6_Vqf32_vmpy_Vqf32Vqf32(result_hi, scale_vec), Q6_Vqf32_equals_Vsf(bvec2)));
     }
 
     return 0;
