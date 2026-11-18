@@ -307,8 +307,10 @@ void logCacheDifferences(mllm::nn::StaticCache& qnn_cache, mllm::nn::StaticCache
 }
 
 bool crosscheckPrefillCaches(QwenCPU& decoder, mllm::nn::StaticCache& qnn_cache, const QwenConfig& cfg,
-                             const mllm::Tensor& tokens, const GenerationState& second_input) {
-  constexpr int all_cpu = 15;
+                             const mllm::Tensor& tokens, const GenerationState& second_input, bool early_layers) {
+  constexpr int early_count = 7;
+  constexpr int all_early = (1 << early_count) - 1;
+  const int all_cpu = early_layers ? all_early + 1 : 15;
   const int32_t prefix = tokens.shape()[1];
   const auto& position = second_input.at("position_ids");
   MLLM_RT_ASSERT(position.constAt<int64_t>({0, position.shape()[1] - 1}) == prefix - 1);
@@ -320,7 +322,9 @@ bool crosscheckPrefillCaches(QwenCPU& decoder, mllm::nn::StaticCache& qnn_cache,
                                   cfg.num_key_value_heads, cfg.head_dim, mllm::kFloat32, mllm::kFloat32, mllm::kCPU, false);
   auto& blocks = decoder.text_model().decode_blocks().list();
   const auto cacheAt = [&](int mask, int32_t layer) -> mllm::nn::StaticCache& {
-    const int32_t group = (4 * layer) / cfg.num_hidden_layers;
+    if (mask == all_cpu) { return cpu_cache; }
+    if (early_layers && layer >= early_count) { return qnn_cache; }
+    const int32_t group = early_layers ? layer : (4 * layer) / cfg.num_hidden_layers;
     return (mask & (1 << group)) != 0 ? cpu_cache : qnn_cache;
   };
   const auto bind = [&](int mask) {
@@ -366,7 +370,30 @@ bool crosscheckPrefillCaches(QwenCPU& decoder, mllm::nn::StaticCache& qnn_cache,
   const size_t cpu_target = argmax(cpu_control);
   logCacheTrial(0, qnn_control, qnn_target, cpu_target);
   logCacheTrial(all_cpu, cpu_control, qnn_target, cpu_target);
-  for (int mask = 1; mask < all_cpu; ++mask) { logCacheTrial(mask, trial(mask), qnn_target, cpu_target); }
+  if (early_layers) {
+    std::vector<bool> seen(all_early + 1, false);
+    int minimum = early_count + 1;
+    const auto earlyTrial = [&](int mask) {
+      if (seen[mask]) { return; }
+      seen[mask] = true;
+      const auto logits = trial(mask);
+      logCacheTrial(mask, logits, qnn_target, cpu_target);
+      if (argmax(logits) == cpu_target) { minimum = std::min(minimum, std::popcount(static_cast<unsigned>(mask))); }
+    };
+    earlyTrial(all_early);
+    for (int layer = 0; layer < early_count; ++layer) {
+      earlyTrial(1 << layer);
+      earlyTrial(all_early ^ (1 << layer));
+    }
+    for (int count = 2; count < minimum && count < early_count; ++count) {
+      for (int mask = 1; mask < all_early; ++mask) {
+        if (std::popcount(static_cast<unsigned>(mask)) == count) { earlyTrial(mask); }
+      }
+    }
+    fmt::print("SHADOWNPU_KV_EARLY_MIN cpu_layers={}\n", minimum <= early_count ? minimum : -1);
+  } else {
+    for (int mask = 1; mask < all_cpu; ++mask) { logCacheTrial(mask, trial(mask), qnn_target, cpu_target); }
+  }
   const auto qnn_repeat = trial(0);
   const auto cpu_repeat = trial(all_cpu);
   bind(0);
@@ -429,6 +456,8 @@ int main(int argc, char** argv) {
                                       .help("Dump every QNN layer Q/K/V and CPU attention output as raw Float32");
   auto& debug_prefill_kv = Argparse::add<bool>("--debug-prefill-kv-crosscheck")
                                .help("Compare one CPU decode step using four groups of CPU- or QNN-prefilled KV");
+  auto& debug_prefill_kv_early = Argparse::add<bool>("--debug-prefill-kv-early-layers")
+                                     .help("Use single-layer selections within the first seven layers for the KV crosscheck");
 
   Argparse::parse(argc, argv);
 
@@ -559,6 +588,11 @@ int main(int argc, char** argv) {
   }
   if (debug_prefill_kv.isSet() && (!use_npu_prefill || run_prefill_only || prepare_context || sparse_topk)) {
     fmt::print(stderr, "Error: KV crosscheck requires dense QNN prefill followed by CPU decode.\n");
+    ::mllm::shutdownContext();
+    return 2;
+  }
+  if (debug_prefill_kv_early.isSet() && !debug_prefill_kv.isSet()) {
+    fmt::print(stderr, "Error: early-layer selection requires --debug-prefill-kv-crosscheck.\n");
     ::mllm::shutdownContext();
     return 2;
   }
@@ -922,9 +956,11 @@ int main(int argc, char** argv) {
     const auto tile = qnn_backend->sequenceTileProfile();
     fmt::print("\nSHADOWNPU_KV_PREFILL chunks={} tile={} graph_calls={} tile_calls={}\n", prefill_chunk_count,
                qnn_backend->sequenceTile(), tile.graph_calls, tile.tile_calls);
-    const bool valid = !prefill_hit_eos && generated_token_ids.size() == 1 && cpu_cfg.num_hidden_layers >= 4
+    const int32_t minimum_depth = debug_prefill_kv_early.isSet() ? 7 : 4;
+    const bool valid = !prefill_hit_eos && generated_token_ids.size() == 1 && cpu_cfg.num_hidden_layers >= minimum_depth
                        && prefill_seq_len < cpu_cfg.max_cache_length;
-    const bool passed = valid && crosscheckPrefillCaches(*cpu_decode_model, *shared_kv_cache, cpu_cfg, raw_input_tokens, past);
+    const bool passed = valid && crosscheckPrefillCaches(*cpu_decode_model, *shared_kv_cache, cpu_cfg, raw_input_tokens, past,
+                                                        debug_prefill_kv_early.isSet());
     cpu_decode_model.reset();
     npu_model.reset();
     qnn_backend.reset();
