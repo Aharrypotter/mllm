@@ -519,8 +519,10 @@ class QwenDecoder final : public nn::Module {
     auto out_mlp_states = self_attn_out_mlp_(x, res);
     if (shadow_down_proj_) {
       MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 3);
+      auto baseline = out_mlp_states[2].to(kCPU).contiguous();
+      if (capture_debug_boundaries_) { captured_debug_boundaries_.push_back(baseline); }
       x = down_proj_shadow_correction_(out_mlp_states[0].to(kCPU).contiguous(), out_mlp_states[1].to(kCPU).contiguous(),
-                                       out_mlp_states[2].to(kCPU).contiguous());
+                                       baseline);
     } else {
       MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 1);
       x = out_mlp_states[0];

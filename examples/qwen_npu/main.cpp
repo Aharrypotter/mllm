@@ -218,10 +218,11 @@ void dumpQNNBoundaryTensors(const std::filesystem::path& root,
                shapeString(tensor.shape()), tensor.numel(), bytes, path.string());
   };
 
-  const std::vector<std::string> boundary_names = {"q_proj", "k_proj", "v_proj", "attention_output"};
+  const std::vector<std::string> boundary_names = {"q_proj", "k_proj", "v_proj", "attention_output",
+                                                   "residual_before_shadow_correction"};
   for (size_t layer_index = 0; layer_index < model.capturedBoundaryLayerCount(); ++layer_index) {
     const auto& boundaries = model.capturedLayerBoundaries(layer_index);
-    MLLM_RT_ASSERT(boundaries.size() == boundary_names.size());
+    MLLM_RT_ASSERT(boundaries.size() == 4 || boundaries.size() == boundary_names.size());
     for (size_t boundary_index = 0; boundary_index < boundaries.size(); ++boundary_index) {
       const auto filename = fmt::format("layer-{:02d}-{}.f32", layer_index, boundary_names[boundary_index]);
       dump_tensor(std::to_string(layer_index), boundary_names[boundary_index], filename, boundaries[boundary_index]);
