@@ -242,9 +242,28 @@ bool dumpAttentionBoundary(const std::filesystem::path &dir, CPUModuleWrapper &g
     if (call.opInputs.size() != 1 || call.opOutputs.size() != 1) {
         throw std::runtime_error("unexpected first attention quantizer bindings");
     }
+    const auto find_op = [&](const std::string &suffix) -> const Callable & {
+        const auto name = "model.layers.0.self_attn." + suffix;
+        const auto match = std::find_if(graph.traces_.begin(), graph.traces_.end(), [&](const auto &entry) {
+            return entry->op != nullptr && entry->op->name() == name;
+        });
+        if (match == graph.traces_.end()) throw std::runtime_error("missing attention boundary op: " + name);
+        return **match;
+    };
+    const auto &q_rope = find_op("q_rope");
+    const auto &k_rope = find_op("k_rope");
+    const auto &softmax = find_op("softmax");
+    if (q_rope.opOutputs.size() != 1 || k_rope.opOutputs.size() != 1 ||
+        softmax.opInputs.size() != 1 || softmax.opOutputs.size() != 1) {
+        throw std::runtime_error("unexpected first attention score bindings");
+    }
     std::ofstream metadata(dir / "metadata.tsv", std::ios::app);
     writeProjectionBoundary(dir, metadata, *call.opInputs.front(), "attention", 12, 128, false);
     writeProjectionBoundary(dir, metadata, *call.opOutputs.front(), "attention-quantized", 12, 128, false);
+    writeProjectionBoundary(dir, metadata, *q_rope.opOutputs.front(), "q-rope", 12, 128, false);
+    writeProjectionBoundary(dir, metadata, *k_rope.opOutputs.front(), "k-rope", 2, 128, false);
+    writeProjectionBoundary(dir, metadata, *softmax.opInputs.front(), "attention-logits", 12, 2048, false);
+    writeProjectionBoundary(dir, metadata, *softmax.opOutputs.front(), "attention-probabilities", 12, 2048, false);
     metadata.close();
     if (!metadata) throw std::runtime_error("writing first attention boundary metadata failed");
     return true;
