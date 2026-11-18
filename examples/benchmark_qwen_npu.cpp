@@ -250,22 +250,37 @@ bool dumpAttentionBoundary(const std::filesystem::path &dir, CPUModuleWrapper &g
     return true;
 }
 
-void dumpFirstResidual(const std::filesystem::path &dir, QNNModuleWrapper &graph) {
+void dumpResidualBoundary(const std::filesystem::path &dir, QNNModuleWrapper &graph, int layer) {
     const auto &backend = static_cast<const QNNBackend &>(*Backend::global_backends[MLLM_QNN]);
     const auto bindings = backend.sequenceTileLogicalBindings(graph.name_);
     const auto &outputs = bindings.second;
-    const auto residual = std::find_if(outputs.begin(), outputs.end(), [](const auto &tensor) {
-        return tensor->name().find("model.layers.0.mlp.res_add") != std::string::npos;
+    const auto name = "model.layers." + std::to_string(layer) + ".mlp.res_add";
+    const auto residual = std::find_if(outputs.begin(), outputs.end(), [&](const auto &tensor) {
+        return tensor->name().find(name) != std::string::npos;
     });
     if (residual == outputs.end()) {
         std::string available;
         for (const auto &tensor : outputs) available += " " + tensor->name();
-        throw std::runtime_error("missing first MLP residual in QNN outputs:" + available);
+        throw std::runtime_error("missing " + name + " in QNN outputs:" + available);
     }
     std::ofstream metadata(dir / "metadata.tsv", std::ios::app);
-    writeProjectionBoundary(dir, metadata, **residual, "block-residual", 1, 1536, false);
+    const auto label = layer == 0 ? "block-residual" : "layer-" + std::to_string(layer) + "-residual";
+    writeProjectionBoundary(dir, metadata, **residual, label.c_str(), 1, 1536, false);
     metadata.close();
     if (!metadata) throw std::runtime_error("writing first residual boundary metadata failed");
+}
+
+bool dumpFinalNormBoundary(const std::filesystem::path &dir, CPUModuleWrapper &graph) {
+    const auto norm = std::find_if(graph.traces_.begin(), graph.traces_.end(), [](const auto &callable) {
+        return callable->op != nullptr && callable->op->name() == "model.norm";
+    });
+    if (norm == graph.traces_.end()) return false;
+    if ((*norm)->opOutputs.size() != 1) throw std::runtime_error("unexpected final norm bindings");
+    std::ofstream metadata(dir / "metadata.tsv", std::ios::app);
+    writeProjectionBoundary(dir, metadata, *(*norm)->opOutputs.front(), "final-norm", 1, 1536, false);
+    metadata.close();
+    if (!metadata) throw std::runtime_error("writing final norm metadata failed");
+    return true;
 }
 
 std::string answerBeforeEndMarker(const std::string &text) {
@@ -563,22 +578,27 @@ int main(int argc, char **argv) {
     std::function<void(int, Module &)> after_graph;
     bool projection_dumped = false;
     bool attention_dumped = false;
-    bool residual_dumped = false;
+    int residuals_dumped = 0;
+    bool final_norm_dumped = false;
     if (!projection_dump.empty()) {
         after_graph = [&](int chunk_id, Module &graph) {
-            if (chunk_id != 3 || residual_dumped) return;
+            if (chunk_id != 3) return;
             try {
                 if (auto *qnn = dynamic_cast<QNNModuleWrapper *>(&graph)) {
                     if (qnn->name_ == "model.layers.0.subgraph_start1") {
                         dumpProjectionBoundary(projection_dump, *qnn);
                         projection_dumped = true;
-                    } else if (qnn->name_ == "model.layers.0.subgraph_start2") {
-                        dumpFirstResidual(projection_dump, *qnn);
-                        residual_dumped = true;
+                    } else if (qnn->name_.find(".subgraph_start2") != std::string::npos) {
+                        const int layer = v2::qwenLayerIndexFromBaseName(qnn->name_);
+                        if (layer < 27) {
+                            dumpResidualBoundary(projection_dump, *qnn, layer);
+                            ++residuals_dumped;
+                        }
                     }
-                } else if (projection_dumped && !attention_dumped) {
+                } else if (projection_dumped) {
                     if (auto *cpu = dynamic_cast<CPUModuleWrapper *>(&graph)) {
-                        attention_dumped = dumpAttentionBoundary(projection_dump, *cpu);
+                        if (!attention_dumped) attention_dumped = dumpAttentionBoundary(projection_dump, *cpu);
+                        if (!final_norm_dumped) final_norm_dumped = dumpFinalNormBoundary(projection_dump, *cpu);
                     }
                 }
             } catch (const std::exception &error) {
@@ -589,9 +609,10 @@ int main(int argc, char **argv) {
     auto prefill_result = pipeline.run(
         input_tensor, prefill_opt, tokenizer, model, is_switched, {},
         parallel_chunks, !cpu_last_token_refine, after_graph);
-    if (after_graph && !(projection_dumped && attention_dumped && residual_dumped)) {
+    if (after_graph && !(projection_dumped && attention_dumped && residuals_dumped == 27 && final_norm_dumped)) {
         std::cerr << "missing layer 0 boundary: projection=" << projection_dumped
-                  << " attention=" << attention_dumped << " residual=" << residual_dumped << std::endl;
+                  << " attention=" << attention_dumped << " residuals=" << residuals_dumped
+                  << " final_norm=" << final_norm_dumped << std::endl;
         return 5;
     }
     const int64_t npu_prefill_end_us = mllm_time_us();
