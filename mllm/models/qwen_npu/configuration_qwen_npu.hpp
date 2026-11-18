@@ -11,6 +11,8 @@
 
 namespace mllm::models::qwen_npu {
 
+enum class QwenFirstBlockCapture { kNone, kOProj, kMLP };
+
 struct QwenNPUConfig : protected ConfigFile {
   QwenNPUConfig() = default;
 
@@ -86,7 +88,7 @@ struct QwenNPUConfig : protected ConfigFile {
 
   aops::LinearImplTypes linear_impl_type = aops::LinearImplTypes::kDefault;
   std::vector<int32_t> shadow_down_proj_layers;
-  bool debug_capture_first_o_proj = false;
+  QwenFirstBlockCapture debug_first_block_capture = QwenFirstBlockCapture::kNone;
 
   // ShadowNPU is opt-in and applies to prefill only. Decode remains dense.
   float prefill_attention_sparsity = 0.0F;

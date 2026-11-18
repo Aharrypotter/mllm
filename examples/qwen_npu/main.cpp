@@ -12,6 +12,7 @@
 #include <limits>
 #include <optional>
 #include <regex>
+#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -241,36 +242,74 @@ void dumpQNNBoundaryTensors(const std::filesystem::path& root,
   dump_tensor("-", "final_norm", "final_norm.f32", layer_outputs.back());
 }
 
-void dumpQNNOProj(const std::filesystem::path& root, const std::vector<mllm::Tensor>& captured) {
-  if (captured.size() != 4) { throw std::runtime_error("expected four QNN o_proj diagnostic tensors"); }
+struct QNNDiagnosticTensor {
+  const char* filename;
+  const char* dtype_name;
+  mllm::DataTypes dtype;
+  size_t row_limit = 0;
+};
+
+constexpr std::array<QNNDiagnosticTensor, 4> kQnnOProjTensors{{
+    {"o_proj_input.i8", "int8", mllm::kInt8},
+    {"o_proj_output.i8", "int8", mllm::kInt8},
+    {"attention_residual.f32", "float32-le", mllm::kFloat32},
+    {"block_residual.f32", "float32-le", mllm::kFloat32},
+}};
+
+constexpr std::array<QNNDiagnosticTensor, 7> kQnnMLPTensors{{
+    {"rms_norm.f32", "float32-le", mllm::kFloat32, 16},
+    {"mlp_input.i8", "int8", mllm::kInt8, 16},
+    {"gate_output.i8", "int8", mllm::kInt8, 16},
+    {"up_output.i8", "int8", mllm::kInt8, 16},
+    {"down_input.i16", "int16-le", mllm::kInt16, 16},
+    {"down_output.i16", "int16-le", mllm::kInt16, 16},
+    {"block_residual.f32", "float32-le", mllm::kFloat32},
+}};
+
+void dumpQNNFirstBlock(const std::filesystem::path& root, const std::vector<mllm::Tensor>& captured,
+                       std::span<const QNNDiagnosticTensor> entries) {
+  if (captured.size() != entries.size()) { throw std::runtime_error("unexpected first-block diagnostic tensor count"); }
   if (!std::filesystem::create_directory(root)) {
-    throw std::runtime_error("QNN o_proj diagnostic directory already exists: " + root.string());
+    throw std::runtime_error("QNN diagnostic directory already exists: " + root.string());
   }
   std::ofstream metadata(root / "metadata.tsv");
   metadata << "boundary\tdtype\tshape\tbytes\tstep\tzero_point\tfile\n"
            << std::setprecision(std::numeric_limits<float>::max_digits10);
-  const std::array filenames{"o_proj_input.i8", "o_proj_output.i8", "attention_residual.f32", "block_residual.f32"};
-  for (size_t i = 0; i < filenames.size(); ++i) {
+  for (size_t i = 0; i < entries.size(); ++i) {
+    const auto& entry = entries[i];
     auto tensor = captured[i];
-    const bool integer = i < 2;
-    if (tensor.dtype() != (integer ? mllm::kInt8 : mllm::kFloat32)) {
-      throw std::runtime_error("unexpected QNN o_proj diagnostic dtype");
+    if (tensor.dtype() != entry.dtype) {
+      throw std::runtime_error("unexpected first-block diagnostic dtype");
     }
+    const bool integer = entry.dtype != mllm::kFloat32;
     const float step = integer ? mllm::qnn::getQuantScale(tensor) : 0.0F;
     if (integer && (!std::isfinite(step) || step <= 0.0F)) {
-      throw std::runtime_error("missing QNN o_proj diagnostic quantization step");
+      throw std::runtime_error("missing first-block diagnostic quantization step");
     }
     tensor = tensor.to(mllm::kCPU).contiguous();
-    const auto path = root / filenames[i];
-    std::ofstream output(path, std::ios::binary);
-    const auto bytes = static_cast<std::streamsize>(tensor.bytes());
-    if (!output.write(tensor.ptr<char>(), bytes)) {
-      throw std::runtime_error("failed to write QNN o_proj diagnostic tensor: " + path.string());
+    auto shape = tensor.shape();
+    size_t bytes = tensor.bytes();
+    size_t offset = 0;
+    if (entry.row_limit != 0) {
+      if (shape.size() < 2 || shape[0] != 1 || shape[1] < 1) {
+        throw std::runtime_error("expected a non-empty single-batch first-block tensor");
+      }
+      const auto rows = static_cast<size_t>(shape[1]);
+      const auto kept = std::min(rows, entry.row_limit);
+      const auto row_bytes = bytes / rows;
+      offset = (rows - kept) * row_bytes;
+      bytes = kept * row_bytes;
+      shape[1] = static_cast<int32_t>(kept);
     }
-    metadata << i << '\t' << (integer ? "int8" : "float32-le") << '\t' << shapeString(tensor.shape()) << '\t'
-             << bytes << '\t' << step << '\t' << 0 << '\t' << filenames[i] << '\n';
+    const auto path = root / entry.filename;
+    std::ofstream output(path, std::ios::binary);
+    if (!output.write(tensor.ptr<char>() + offset, static_cast<std::streamsize>(bytes))) {
+      throw std::runtime_error("failed to write QNN diagnostic tensor: " + path.string());
+    }
+    metadata << i << '\t' << entry.dtype_name << '\t' << shapeString(shape) << '\t'
+             << bytes << '\t' << step << '\t' << 0 << '\t' << entry.filename << '\n';
   }
-  if (!metadata) { throw std::runtime_error("failed to write QNN o_proj diagnostic metadata"); }
+  if (!metadata) { throw std::runtime_error("failed to write QNN diagnostic metadata"); }
 }
 
 }  // namespace
@@ -325,6 +364,8 @@ int main(int argc, char** argv) {
                                       .help("Dump every QNN layer Q/K/V and CPU attention output as raw Float32");
   auto& debug_qnn_o_proj_dir = Argparse::add<std::string>("--debug-qnn-o-proj-dir")
                                    .help("Dump first-layer o_proj codes and residuals using a matching QNN context");
+  auto& debug_qnn_mlp_dir = Argparse::add<std::string>("--debug-qnn-mlp-dir")
+                                .help("Dump the last 16 first-layer RMSNorm and MLP rows using a matching QNN context");
 
   Argparse::parse(argc, argv);
 
@@ -337,8 +378,13 @@ int main(int argc, char** argv) {
   const bool use_npu_prefill = !cpu_prefill.isSet();
   const bool prepare_context = prepare_qnn_context.isSet();
   const bool run_prefill_only = prefill_only.isSet();
-  if (debug_qnn_o_proj_dir.isSet() && !use_npu_prefill) {
-    fmt::print(stderr, "Error: --debug-qnn-o-proj-dir requires QNN prefill.\n");
+  if ((debug_qnn_o_proj_dir.isSet() || debug_qnn_mlp_dir.isSet()) && !use_npu_prefill) {
+    fmt::print(stderr, "Error: first-block diagnostics require QNN prefill.\n");
+    ::mllm::shutdownContext();
+    return 2;
+  }
+  if (debug_qnn_o_proj_dir.isSet() && debug_qnn_mlp_dir.isSet()) {
+    fmt::print(stderr, "Error: select one first-block diagnostic per QNN context.\n");
     ::mllm::shutdownContext();
     return 2;
   }
@@ -480,7 +526,9 @@ int main(int argc, char** argv) {
   }
 
   auto cpu_cfg = mllm::models::qwen_npu::QwenNPUConfig(config_path.get());
-  cpu_cfg.debug_capture_first_o_proj = debug_qnn_o_proj_dir.isSet();
+  using mllm::models::qwen_npu::QwenFirstBlockCapture;
+  if (debug_qnn_o_proj_dir.isSet()) { cpu_cfg.debug_first_block_capture = QwenFirstBlockCapture::kOProj; }
+  if (debug_qnn_mlp_dir.isSet()) { cpu_cfg.debug_first_block_capture = QwenFirstBlockCapture::kMLP; }
   float average_retention = 1.0F;
   int32_t dense_heads = cpu_cfg.num_hidden_layers * cpu_cfg.num_attention_heads;
   std::string dense_layers = "all";
@@ -766,7 +814,12 @@ int main(int argc, char** argv) {
               prefill_chunk_count, logical_chunk, qnn_sequence_tile.get(), prefill_duration.count() / 1000.0);
 
     if (debug_qnn_o_proj_dir.isSet()) {
-      dumpQNNOProj(debug_qnn_o_proj_dir.get(), npu_model->model.decode_blocks().list().front().capturedOProj());
+      dumpQNNFirstBlock(debug_qnn_o_proj_dir.get(), npu_model->model.decode_blocks().list().front().capturedFirstBlock(),
+                        kQnnOProjTensors);
+    }
+    if (debug_qnn_mlp_dir.isSet()) {
+      dumpQNNFirstBlock(debug_qnn_mlp_dir.get(), npu_model->model.decode_blocks().list().front().capturedFirstBlock(),
+                        kQnnMLPTensors);
     }
 
     if (debug_qnn_layer_outputs.isSet() || debug_qnn_boundary_dir.isSet()) {

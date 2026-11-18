@@ -352,12 +352,15 @@ class QwenOutProjAndMLP final : public nn::Module {
 
   int hidden_size_, intermediate_size_;
   bool shadow_down_proj_ = false;
-  bool capture_o_proj_ = false;
+  QwenFirstBlockCapture capture_ = QwenFirstBlockCapture::kNone;
 
  public:
   QwenOutProjAndMLP() = default;
-  QwenOutProjAndMLP(const std::string& name, const QwenNPUConfig& cfg, bool shadow_down_proj, bool capture_o_proj)
-      : nn::Module(name), shadow_down_proj_(shadow_down_proj), capture_o_proj_(capture_o_proj) {
+  QwenOutProjAndMLP(const std::string& name, const QwenNPUConfig& cfg, bool shadow_down_proj, QwenFirstBlockCapture capture)
+      : nn::Module(name), shadow_down_proj_(shadow_down_proj), capture_(capture) {
+    if (capture_ == QwenFirstBlockCapture::kMLP && shadow_down_proj_) {
+      throw std::invalid_argument("first-layer MLP capture requires an uncorrected down projection");
+    }
     hidden_size_ = cfg.hidden_size;
     intermediate_size_ = cfg.intermediate_size;
 
@@ -412,35 +415,39 @@ class QwenOutProjAndMLP final : public nn::Module {
 
     auto tmp = x + res;
 
-    x = post_attention_layer_norm_(tmp);
+    auto normalized = post_attention_layer_norm_(tmp);
 
-    x = x.view({B, S, 1, hidden_size_});
+    x = normalized.view({B, S, 1, hidden_size_});
     x.attach("qnn_quant_scale", pre_mlp_proj_quantize_scale_.weight().impl());
     x = x.to(kInt8);
-    auto gate = gate_proj_(x);
-    gate = gate.view({B, S, 1, intermediate_size_});
+    auto gate_codes = gate_proj_(x);
+    auto gate = gate_codes.view({B, S, 1, intermediate_size_});
     gate = gate.to(kFloat32);
 
     gate = silu_(gate);
-    auto up = up_proj_(x);
-    up = up.view({B, S, 1, intermediate_size_});
+    auto up_codes = up_proj_(x);
+    auto up = up_codes.view({B, S, 1, intermediate_size_});
     up = up.to(kFloat32);
+    auto mlp_input = x;
 
     x = gate * up;
     auto shadow_input = x;
 
     x = x.view({B, S, 1, intermediate_size_});
     x.attach("qnn_quant_scale", down_proj_quantize_scale_.weight().impl());
-    x = x.to(kInt16);
-    x = down_proj_(x);
-    x = x.view({B, S, 1, hidden_size_});
+    auto down_input = x.to(kInt16);
+    auto down_output = down_proj_(down_input);
+    x = down_output.view({B, S, 1, hidden_size_});
     auto quantized_down_proj = x;
     x = x.to(kFloat32);
     x = x.view({B, S, hidden_size_});
 
     x = x + tmp;
     // QNN binds graph outputs in the order their producing nodes are added.
-    if (capture_o_proj_) {
+    if (capture_ == QwenFirstBlockCapture::kMLP) {
+      return {normalized, mlp_input, gate_codes, up_codes, down_input, down_output, x};
+    }
+    if (capture_ == QwenFirstBlockCapture::kOProj) {
       if (shadow_down_proj_) { return {input, projected, tmp, shadow_input, quantized_down_proj, x}; }
       return {input, projected, tmp, x};
     }
@@ -451,9 +458,9 @@ class QwenOutProjAndMLP final : public nn::Module {
 
 class QwenDecoder final : public nn::Module {
   bool capture_debug_boundaries_ = false;
-  bool capture_o_proj_ = false;
+  QwenFirstBlockCapture capture_ = QwenFirstBlockCapture::kNone;
   std::vector<Tensor> captured_debug_boundaries_;
-  std::vector<Tensor> captured_o_proj_;
+  std::vector<Tensor> captured_first_block_;
 
  public:
   QwenAttentionProjNPU self_attn_proj_;
@@ -466,11 +473,11 @@ class QwenDecoder final : public nn::Module {
 
   QwenDecoder(const std::string& name, const QwenNPUConfig& cfg, int32_t layer_idx) : nn::Module(name) {
     shadow_down_proj_ = cfg.useShadowDownProjection(layer_idx);
-    capture_o_proj_ = layer_idx == 0 && cfg.debug_capture_first_o_proj;
+    if (layer_idx == 0) { capture_ = cfg.debug_first_block_capture; }
     self_attn_proj_ = reg<QwenAttentionProjNPU>("", cfg);
     self_attn_proj_.to(kQNN);
     self_attn_matmul_ = reg<QwenAttentionMatmul>("self_attn", cfg, layer_idx);
-    self_attn_out_mlp_ = reg<QwenOutProjAndMLP>("", cfg, shadow_down_proj_, capture_o_proj_);
+    self_attn_out_mlp_ = reg<QwenOutProjAndMLP>("", cfg, shadow_down_proj_, capture_);
     self_attn_out_mlp_.to(kQNN);
     if (shadow_down_proj_) {
       down_proj_shadow_correction_ =
@@ -506,10 +513,12 @@ class QwenDecoder final : public nn::Module {
     res = res.to(kQNN);
 
     auto out_mlp_states = self_attn_out_mlp_(x, res);
-    const size_t first_model_output = capture_o_proj_ ? 3 : 0;
+    size_t first_model_output = 0;
+    if (capture_ == QwenFirstBlockCapture::kOProj) { first_model_output = 3; }
+    if (capture_ == QwenFirstBlockCapture::kMLP) { first_model_output = 6; }
     MLLM_RT_ASSERT_EQ(out_mlp_states.size(), first_model_output + (shadow_down_proj_ ? 3 : 1));
-    if (capture_o_proj_) {
-      captured_o_proj_.assign(out_mlp_states.begin(), out_mlp_states.begin() + first_model_output);
+    if (first_model_output != 0) {
+      captured_first_block_.assign(out_mlp_states.begin(), out_mlp_states.begin() + first_model_output);
     }
     if (shadow_down_proj_) {
       x = down_proj_shadow_correction_(out_mlp_states[first_model_output].to(kCPU).contiguous(),
@@ -518,7 +527,7 @@ class QwenDecoder final : public nn::Module {
     } else {
       x = out_mlp_states[first_model_output];
     }
-    if (capture_o_proj_) { captured_o_proj_.push_back(x); }
+    if (first_model_output != 0) { captured_first_block_.push_back(x); }
 
     return {x};
   }
@@ -526,7 +535,7 @@ class QwenDecoder final : public nn::Module {
   nn::KVCache& getKVCache() { return self_attn_matmul_.getKVCache(); }
   void setCaptureDebugBoundaries(bool capture) { capture_debug_boundaries_ = capture; }
   const std::vector<Tensor>& capturedDebugBoundaries() const { return captured_debug_boundaries_; }
-  const std::vector<Tensor>& capturedOProj() const { return captured_o_proj_; }
+  const std::vector<Tensor>& capturedFirstBlock() const { return captured_first_block_; }
 };
 
 class QwenText final : public nn::Module {
