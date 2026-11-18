@@ -378,6 +378,50 @@ std::string extractAccessCode(const std::string &text) {
                                                         : std::string();
 }
 
+int runCpuOnlyControl(QWenNPUConfig &config, const std::vector<token_id_t> &prompt_tokens,
+                      const std::string &vocab, const std::string &merge, const std::string &weights,
+                      int generation_tokens, const std::string &needle) {
+    Module::initBackend(MLLM_CPU);
+    BackendCleanup cleanup;
+    if (Backend::global_backends.count(MLLM_QNN) != 0) {
+        throw std::runtime_error("QNN backend was initialized in CPU control");
+    }
+    config.attn_implementation = "eager_notrans";
+    QWenTokenizer tokenizer(vocab, merge);
+    QWenForCausalLM model(config);
+    model.load(weights);
+    auto prompt = Tokenizer::tokens2Input(prompt_tokens);
+    LlmTextGeneratorOpts options{
+        .max_new_tokens = static_cast<size_t>(generation_tokens),
+        .do_sample = false,
+        .temperature = 0.3F,
+        .top_k = 50,
+        .top_p = 0.F,
+        .is_padding = false,
+    };
+    auto &state = Context::Instance().inference_state();
+    state.setExecutionType(PROMPT);
+    std::vector<token_id_t> ids;
+    model.generate(prompt, options, [&](unsigned int id) {
+        ids.push_back(static_cast<token_id_t>(id));
+        state.setExecutionType(AUTOREGRESSIVE);
+        return true;
+    });
+    std::cout << "\nCPU_CONTROL prompt_tokens=" << prompt_tokens.size()
+              << " prompt_hash=" << hashTokens(prompt_tokens)
+              << " generated_tokens=" << ids.size()
+              << " qnn_backends=" << Backend::global_backends.count(MLLM_QNN) << "\n";
+    std::cout << "CPU_CONTROL_IDS";
+    for (const auto id : ids) std::cout << ' ' << id;
+    std::cout << "\n";
+    const auto answer = answerBeforeEndMarker(tokenizer.detokenize(ids));
+    const auto code = extractAccessCode(answer);
+    std::cout << "CPU_CONTROL_ANSWER " << answer << "\n"
+              << "CPU_CONTROL_QUALITY extracted_code=" << (code.empty() ? "none" : code)
+              << " retrieval_exact=" << (code == needle) << "\n";
+    return static_cast<int>(ids.size() != static_cast<size_t>(generation_tokens));
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -416,6 +460,7 @@ int main(int argc, char **argv) {
         "legacy");
     cmd_parser.add<std::string>("projection-dump-dir", '\0',
         "capture layer-0 QNN input, Q/K/V, attention and residual on the last 16 input tokens", false, "");
+    cmd_parser.add("cpu-only-control", '\0', "run the CPU model with exact prompt tokens and no QNN backend");
     cmd_parser.parse_check(argc, argv);
 
     const int chunk_size = cmd_parser.get<int>("chunk-size");
@@ -516,6 +561,15 @@ int main(int argc, char **argv) {
         unsetenv("MLLM_HMX_PIPELINE_MAIN_CPU");
     }
     CPUBackend::cpu_threads = cmd_parser.get<int>("thread");
+    if (cmd_parser.exist("cpu-only-control")) {
+        if (prompt_tokens.empty() || !projection_dump.empty() || attention_mode != "dense") {
+            std::cerr << "CPU control requires exact prompt tokens and dense attention" << std::endl;
+            return 2;
+        }
+        return runCpuOnlyControl(config, prompt_tokens, cmd_parser.get<std::string>("vocab"),
+                                 cmd_parser.get<std::string>("merge"), cmd_parser.get<std::string>("decoding-model"),
+                                 decode_token_count + 1, needle);
+    }
     Module::initBackend(MLLM_QNN);
     BackendCleanup backend_cleanup;
 
