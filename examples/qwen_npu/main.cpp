@@ -167,8 +167,9 @@ void printLayerBoundarySummaries(size_t layer_index, const std::vector<mllm::Ten
       fmt::format("qnn_layer{}_k_proj", layer_index),
       fmt::format("qnn_layer{}_v_proj", layer_index),
       fmt::format("qnn_layer{}_attention_output", layer_index),
+      fmt::format("qnn_layer{}_residual_before_shadow_correction", layer_index),
   };
-  MLLM_RT_ASSERT(tensors.size() == phases.size());
+  MLLM_RT_ASSERT(tensors.size() == 4 || tensors.size() == phases.size());
   for (size_t index = 0; index < tensors.size(); ++index) {
     auto tensor = tensors[index];
     tensor = tensor.to(mllm::kFloat32).contiguous();
