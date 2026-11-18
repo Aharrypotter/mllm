@@ -5675,12 +5675,6 @@ private:
                         std::memory_order_release);
                 }
                 pipelineStreamingNotify();
-                if (!topk_error.empty() && stream_error.empty()) {
-                    stream_error = topk_error;
-                }
-                if (!sparse_error.empty() && stream_error.empty()) {
-                    stream_error = sparse_error;
-                }
                 return !cancelled.load(std::memory_order_acquire)
                     && consumed == stream.count;
             };
@@ -5727,16 +5721,21 @@ private:
             topk_worker_busy_ns.begin(), topk_worker_busy_ns.end());
         sparse_busy_ns = std::max(
             sparse_busy_ns, sparse_assist_busy_ns);
-        if (!sparse_assist_error.empty()) {
-            return fail(sparse_assist_error, error);
-        }
-        if (!produced) return fail(detail, error);
-        if (!stream_seen.load(std::memory_order_acquire)) {
-            return fail("HMX long RPC did not expose a direct score stream",
+        const auto fail_pipeline = [&](const std::string &message) {
+            return fail("HMX direct pipeline layer=" + std::to_string(request.layer_id)
+                            + " key_len=" + std::to_string(request.key_len)
+                            + ": " + message,
                         error);
+        };
+        // Read worker-owned messages after their futures complete. Prefer
+        // the specific worker failure to the producer's cancellation summary.
+        if (!sparse_assist_error.empty()) return fail_pipeline(sparse_assist_error);
+        if (!topk_error.empty()) return fail_pipeline(topk_error);
+        if (!sparse_error.empty()) return fail_pipeline(sparse_error);
+        if (!produced) return fail_pipeline(detail);
+        if (!stream_seen.load(std::memory_order_acquire)) {
+            return fail_pipeline("HMX long RPC did not expose a direct score stream");
         }
-        if (!topk_error.empty()) return fail(topk_error, error);
-        if (!sparse_error.empty()) return fail(sparse_error, error);
 
         const std::uint64_t finish_ns = timing_enabled
             ? CPUAttentionProfiler::nowNs() : 0;
