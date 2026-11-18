@@ -89,6 +89,8 @@ struct Qwen3_5Config : protected ConfigFile {
 
     chat_template_backend = preprocessor::parseChatTemplateBackend(data().value("chat_template_backend", "legacy"));
 
+    control_token_policy = preprocessor::parseControlTokenPolicy(data().value("control_token_policy", "reject"));
+
     vision_enabled = data().contains("vision_config");
     if (vision_enabled) {
       const auto& vc = data()["vision_config"];
@@ -243,6 +245,7 @@ struct Qwen3_5Config : protected ConfigFile {
 
   aops::LinearImplTypes linear_impl_type = aops::LinearImplTypes::kDefault;
   preprocessor::ChatTemplateBackend chat_template_backend = preprocessor::ChatTemplateBackend::Legacy;
+  preprocessor::ControlTokenPolicy control_token_policy = preprocessor::ControlTokenPolicy::Reject;
 
   // Helpers
   [[nodiscard]] bool isFullAttentionLayer(int layer_idx) const {

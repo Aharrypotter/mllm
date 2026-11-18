@@ -11,6 +11,7 @@
 
 #include "mllm/preprocessor/tokenizers/BPE.hpp"
 #include "mllm/models/ARGeneration.hpp"
+#include "mllm/preprocessor/chat_template/PromptTokenization.hpp"
 #include "mllm/models/qwen_npu/configuration_qwen_npu.hpp"
 #include "mllm/preprocessor/chat_template/LegacyChatMl.hpp"
 #include "mllm/preprocessor/tokenizers/Unicode.hpp"
@@ -75,11 +76,11 @@ inline bool qwenTokenizerMatchPattern(const std::wstring& str, size_t& pos, std:
     matched.clear();
 
     // Require at least one non-letter/digit/whitespace
-    if (pos < str.size() && !std::iswspace(str[pos]) && !preprocessor::isLetter(str[pos]) && !preprocessor::isDigit(str[pos])) {
+    if (pos < str.size() && !preprocessor::isWhitespace(str[pos]) && !preprocessor::isLetter(str[pos]) && !preprocessor::isDigit(str[pos])) {
       do {
         matched += str[pos];
         ++pos;
-      } while (pos < str.size() && !std::iswspace(str[pos]) && !preprocessor::isLetter(str[pos])
+      } while (pos < str.size() && !preprocessor::isWhitespace(str[pos]) && !preprocessor::isLetter(str[pos])
                && !preprocessor::isDigit(str[pos]));
 
       // Capture trailing newlines
@@ -97,7 +98,7 @@ inline bool qwenTokenizerMatchPattern(const std::wstring& str, size_t& pos, std:
   // 5. Match \s*[\r\n]+ (newlines with leading whitespace)
   {
     size_t start = pos;
-    while (pos < str.size() && std::iswspace(str[pos])) ++pos;
+    while (pos < str.size() && preprocessor::isWhitespace(str[pos])) ++pos;
     if (pos < str.size() && (str[pos] == L'\r' || str[pos] == L'\n')) {
       while (pos < str.size() && (str[pos] == L'\r' || str[pos] == L'\n')) ++pos;
       matched = str.substr(start, pos - start);
@@ -108,11 +109,11 @@ inline bool qwenTokenizerMatchPattern(const std::wstring& str, size_t& pos, std:
   }
 
   // 6. Match \s+(?!\S) (whitespace not followed by non-space)
-  if (std::iswspace(str[pos])) {
+  if (preprocessor::isWhitespace(str[pos])) {
     size_t start = pos;
-    while (pos < str.size() && std::iswspace(str[pos])) ++pos;
+    while (pos < str.size() && preprocessor::isWhitespace(str[pos])) ++pos;
     // Check if at end or followed by whitespace
-    if (pos >= str.size() || std::iswspace(str[pos])) {
+    if (pos >= str.size() || preprocessor::isWhitespace(str[pos])) {
       matched = str.substr(start, pos - start);
       return true;
     } else {
@@ -121,9 +122,9 @@ inline bool qwenTokenizerMatchPattern(const std::wstring& str, size_t& pos, std:
   }
 
   // 7. Match remaining whitespace
-  if (std::iswspace(str[pos])) {
+  if (preprocessor::isWhitespace(str[pos])) {
     size_t start = pos;
-    while (pos < str.size() && std::iswspace(str[pos])) ++pos;
+    while (pos < str.size() && preprocessor::isWhitespace(str[pos])) ++pos;
     matched = str.substr(start, pos - start);
     return true;
   }
@@ -165,6 +166,7 @@ class QwenTokenizer final : public mllm::preprocessor::AutoTokenizer {
 
     bpe_.initFromSentencePieceJson(vocab_file);
     chat_preprocessor_.setControlTokens(bpe_.controlTokens());
+    registerAddedTokens(bpe_.addedTokens());
     initBpeRanks(merge_file);
     initSpecialTokens();
   }
@@ -208,15 +210,17 @@ class QwenTokenizer final : public mllm::preprocessor::AutoTokenizer {
     return ret;
   }
 
-  std::vector<std::wstring> tokenize(const std::string& str) override {
-    auto tokens = special_tokens_trie_.split(preprocessor::utf8string2WideString(str));
+    std::vector<std::wstring> tokenize(const std::string& str) override { return tokenize(str, {}); }
+
+  std::vector<std::wstring> tokenize(const std::string& str, const preprocessor::TokenizeOptions& options) override {
     std::vector<std::wstring> all_tokens;
-    for (const auto& token : tokens) {
-      if (special_tokens_trie_.isSpecialToken(token)) {
-        all_tokens.emplace_back(token);
+    for (const auto& segment :
+         special_tokens_trie_.splitSegments(preprocessor::utf8string2WideString(str), {.parse_special = options.parse_special})) {
+      if (segment.is_special) {
+        all_tokens.emplace_back(segment.text);
         continue;
       }
-      auto tmp_tokens = _tokenize(preprocessor::wideString2Utf8String(token));
+      auto tmp_tokens = _tokenize(preprocessor::wideString2Utf8String(segment.text));
       all_tokens.insert(all_tokens.end(), tmp_tokens.begin(), tmp_tokens.end());
     }
     return all_tokens;
@@ -297,20 +301,34 @@ class QwenTokenizer final : public mllm::preprocessor::AutoTokenizer {
                           .backend = config.chat_template_backend,
                           .template_options = {.model_directory = model_directory.empty()
                                                                       ? std::filesystem::path(vocab_file).parent_path()
-                                                                      : std::move(model_directory)}}) {}
+                                                                      : std::move(model_directory)},
+                           .control_token_policy = config.control_token_policy}) {}
 
   preprocessor::ChatTemplateBackend chatTemplateBackend() const noexcept { return chat_preprocessor_.backend(); }
 
   // Renders the single-turn runner prompt through the configured backend.
-  std::string renderChatTemplate(const QwenMessage& message) const {
-    return chat_preprocessor_.render(preprocessor::makeSingleTurnChatTemplateRequest(message.prompt, kQwenNpuDefaultSystemPrompt, std::nullopt));
+  preprocessor::ChatTemplateRequest requestFor(const QwenMessage& message) const {
+    return preprocessor::makeSingleTurnChatTemplateRequest(message.prompt, kQwenNpuDefaultSystemPrompt, std::nullopt);
+  }
+
+  std::string renderChatTemplate(const QwenMessage& message) const { return chat_preprocessor_.render(requestFor(message)); }
+
+  // Origin-tagged prompt: under control_token_policy=neutralize the official
+  // template's provenance is kept so message content is tokenized without
+  // special-token parsing; otherwise the flat prompt is one template span.
+  std::vector<preprocessor::PromptSpan> renderPromptSpans(const QwenMessage& message) const {
+    if (chat_preprocessor_.controlTokenPolicy() == preprocessor::ControlTokenPolicy::Neutralize) {
+      return chat_preprocessor_.renderSpans(requestFor(message));
+    }
+    return {{renderChatTemplate(message), false}};
+  }
+
+  std::vector<std::wstring> tokenizePrompt(const QwenMessage& message) {
+    return preprocessor::tokenizePromptSpans(*this, renderPromptSpans(message));
   }
 
   ARGenerationOutputPast convertMessage(const QwenMessage& message) {
-    auto applied_string = renderChatTemplate(message);
-
-    // process sequence
-    auto sequence_str = tokenize(applied_string);
+    auto sequence_str = tokenizePrompt(message);
     std::vector<int64_t> ids;
     ids.reserve(sequence_str.size());
     for (const auto& str : sequence_str) { ids.emplace_back(bpe_._lookup_vocab(str)); }

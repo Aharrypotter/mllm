@@ -7,6 +7,8 @@
 // This Byte-Level BPE(BBPE) works as an fully correct byte-level BPE tokenizer.
 
 #include <string>
+
+#include "mllm/preprocessor/tokenizers/AddedToken.hpp"
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -73,8 +75,16 @@ class BPEUTF8 {
 
   std::string _lookup_inverse_vocab(int64_t idx);
 
-  // See BPE::controlTokens().
+  // See BPE::addedTokens() and BPE::controlTokens().
+  const std::vector<AddedToken>& addedTokens() const { return added_tokens_; }
   const std::vector<std::string>& controlTokens() const { return control_tokens_; }
+
+  // Attribute of a token id: kControl for added tokens with `special: true`,
+  // kUserDefined for the other added tokens, kNormal for vocabulary entries.
+  TokenAttr attrOf(int64_t id) const {
+    const auto it = attr_by_id_.find(id);
+    return it == attr_by_id_.end() ? TokenAttr::kNormal : it->second;
+  }
 
  private:
   inline std::vector<uint32_t> utf8String2Cpts(const std::string& str) {
@@ -92,6 +102,8 @@ class BPEUTF8 {
   std::unordered_set<std::pair<cpt_string_t, cpt_string_t>, BPEUTF8PairHash> _get_pairs(const std::vector<cpt_string_t>& word);
   std::unordered_map<cpt_string_t, int64_t, details::VectorUint32Hash> vocab_;
   std::unordered_map<int64_t, cpt_string_t> vocab_inverse_;
+  std::vector<AddedToken> added_tokens_;
+  std::unordered_map<int64_t, TokenAttr> attr_by_id_;
   std::vector<std::string> control_tokens_;
   std::unordered_map<std::pair<cpt_string_t, cpt_string_t>, int64_t, BPEUTF8PairHash> bpe_ranks_;
 };

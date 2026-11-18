@@ -15,6 +15,7 @@
 #include "mllm/utils/Enumerate.hpp"
 #include "mllm/models/ARGeneration.hpp"
 #include "mllm/models/qwen3/chat_template_qwen3.hpp"
+#include "mllm/preprocessor/StreamingUtf8Decoder.hpp"
 #include "mllm/preprocessor/tokenizers/Unicode.hpp"
 #include "mllm/models/qwen3/tokenization_qwen3.hpp"
 #include "mllm/models/qwen3/configuration_qwen3.hpp"
@@ -443,15 +444,17 @@ class Qwen3Session final : public ::mllm::service::Session {
 
     // Iteration start
     int64_t package_cnt = 0;
-    model_->streamGenerate(input, args, [this, &max_length, &request, &full_seq_idx, &package_cnt, &callback](int64_t idx) {
+    // Tokens are byte pieces; only complete UTF-8 characters are sent to the client.
+    preprocessor::StreamingUtf8Decoder utf8_decoder;
+    model_->streamGenerate(input, args, [this, &max_length, &request, &full_seq_idx, &package_cnt, &callback, &utf8_decoder](int64_t idx) {
       bool finished = false;
       std::string ret_token;
       if (idx == model_->cfg.eos_token_id || package_cnt + 1 >= max_length) {
         finished = true;
-        ret_token = "";
+        ret_token = utf8_decoder.finish();
       } else {
         finished = false;
-        ret_token = preprocessor::wideString2Utf8String(tokenizer_->detokenize(idx));
+        ret_token = utf8_decoder.append(tokenizer_->detokenizeBytes(idx));
 
         // Update full_seq_idx to include the new token for Radix Tree to use.
         full_seq_idx.push_back(idx);

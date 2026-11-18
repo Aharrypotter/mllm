@@ -28,6 +28,8 @@ using json = nlohmann::json;
 #include <unordered_set>
 #include <unordered_map>
 
+#include "mllm/preprocessor/tokenizers/AddedToken.hpp"
+
 namespace mllm::preprocessor {
 
 // split text to tokens.
@@ -35,6 +37,20 @@ namespace mllm::preprocessor {
 // > Trie.split("<|im_start|>Hello world!")
 //
 // will give: ["<|im_start|>","Hello world!"]
+// Match-time control for the special-token tries.
+struct SplitOptions {
+  // When false, tokens registered as control tokens are left in the text and
+  // reach the model's byte-level pre-tokenizer like any other characters. Added
+  // tokens that are not control tokens are still matched, as in Hugging Face.
+  bool parse_special = true;
+};
+
+template<typename StringT>
+struct SplitSegment {
+  StringT text;
+  bool is_special = false;
+};
+
 class Trie {
   struct TrieNode {
     std::unordered_map<wchar_t, std::unique_ptr<TrieNode>> children;
@@ -42,18 +58,28 @@ class Trie {
   };
 
  public:
-  void add(const std::wstring& word);
+  void add(const std::wstring& word, AddedTokenAttr attr = {});
 
   void update(const std::vector<std::wstring>& words);
 
-  // I use FSA to implement the split function.
+  // Leftmost-longest matching with the same automaton Hugging Face uses, then
+  // the added-token attributes: lstrip/rstrip absorb adjacent white space into
+  // the match, single_word drops matches embedded in a word, and control tokens
+  // are dropped when parse_special is false. Absorbed white space is not emitted.
+  std::vector<SplitSegment<std::wstring>> splitSegments(const std::wstring& text, const SplitOptions& options = {});
+
+  // Flattened form of splitSegments with default options; kept for tokenizers
+  // that decide by isSpecialToken().
   std::vector<std::wstring> split(const std::wstring& text);
 
   bool isSpecialToken(const std::wstring& token);
 
  private:
+  std::vector<std::pair<size_t, size_t>> matchSpans(const std::wstring& text);
+
   std::unique_ptr<TrieNode> root_ = std::make_unique<TrieNode>();
   std::unordered_set<std::wstring> special_tokens_;
+  std::unordered_map<std::wstring, AddedTokenAttr> attrs_;
 };
 
 class TrieUTF8 {
@@ -72,11 +98,13 @@ class TrieUTF8 {
   };
 
  public:
-  void add(const std::string& word);
+  void add(const std::string& word, AddedTokenAttr attr = {});
 
   void update(const std::vector<std::string>& words);
 
-  // I use FSA to implement the split function.
+  // See Trie::splitSegments.
+  std::vector<SplitSegment<std::string>> splitSegments(const std::string& text, const SplitOptions& options = {});
+
   std::vector<std::string> split(const std::string& text);
 
   bool isSpecialToken(const std::string& token);
@@ -94,17 +122,42 @@ class TrieUTF8 {
   }
 
  private:
+  std::vector<std::pair<size_t, size_t>> matchSpans(const cpts_string_t& text);
+
   std::unique_ptr<TrieNode> root_ = std::make_unique<TrieNode>();
   std::unordered_set<cpts_string_t, VectorUint32Hash> special_tokens_;
+  std::unordered_map<cpts_string_t, AddedTokenAttr, VectorUint32Hash> attrs_;
+};
+
+// Options for a single tokenize() call.
+struct TokenizeOptions {
+  // When false, the checkpoint's control tokens (added tokens with
+  // `special: true`) are not recognized in the text: "<|im_start|>" in user
+  // content tokenizes as ordinary characters, matching Hugging Face
+  // split_special_tokens=True. Added tokens that are not control tokens are
+  // still matched, as in Hugging Face.
+  bool parse_special = true;
 };
 
 class AutoTokenizer {
  public:
   void addSpecialToken(const std::wstring& special_token);
 
+  // Registers a checkpoint's added tokens (from BPE::addedTokens()) with their
+  // attributes. Replaces per-model hand-written special-token lists.
+  void registerAddedTokens(const std::vector<AddedToken>& tokens);
+
   virtual std::vector<std::wstring> _tokenize(const std::string& str) = 0;
 
   virtual std::vector<std::wstring> tokenize(const std::string& str) = 0;
+
+  // Tokenizers that route special tokens through the trie override this and
+  // implement tokenize(str) as tokenize(str, {}). The default ignores the
+  // options so older tokenizers keep their behavior.
+  virtual std::vector<std::wstring> tokenize(const std::string& str, const TokenizeOptions& options) {
+    (void)options;
+    return tokenize(str);
+  }
 
   virtual std::wstring _detokenize(int64_t pos_idx) = 0;
 
@@ -120,11 +173,20 @@ class AutoTokenizerUTF8 {
  public:
   void addSpecialToken(const std::string& special_token);
 
+  // See AutoTokenizer::registerAddedTokens.
+  void registerAddedTokens(const std::vector<AddedToken>& tokens);
+
   virtual std::vector<int64_t> encode(const std::string& str) = 0;
 
   virtual std::string decode(const std::vector<int64_t>& ids) = 0;
 
   virtual std::vector<std::string> tokenize(const std::string& str) = 0;
+
+  // See AutoTokenizer::tokenize(str, options).
+  virtual std::vector<std::string> tokenize(const std::string& str, const TokenizeOptions& options) {
+    (void)options;
+    return tokenize(str);
+  }
 
   virtual std::string detokenize(const std::vector<std::string>& tokenized_str) = 0;
 

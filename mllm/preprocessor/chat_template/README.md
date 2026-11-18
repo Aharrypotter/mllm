@@ -66,10 +66,27 @@ inactive while the list is empty.
 mark special, notably `<think>` and `</think>` in the Qwen3 family, stay allowed
 in content, so multi-turn reasoning history still round-trips.
 
-This is a request-boundary check, not full provenance tracking. It refuses the
-input rather than rendering it as inert text. Tracking which output spans came
-from user content, the way llama.cpp's engine marks strings, would allow the
-gentler behavior and is the follow-up.
+Two policies exist, selected per model with `"control_token_policy"` in
+`config.json`:
+
+- `reject` (default): the request-boundary check above. Works with both
+  backends; `ChatPreprocessor::render` always applies it, because a flat string
+  cannot say where its bytes came from.
+- `neutralize`: the official template is rendered with provenance (the fork's
+  `Template::render_parts` marks every string under `messages` and `tools`),
+  `ChatPreprocessor::renderSpans` returns origin-tagged spans, and the tokenizer
+  tokenizes input-origin spans with `parse_special=false`
+  (`tokenizePromptSpans`). A `<|im_start|>` inside message content then becomes
+  ordinary text instead of an error. Requires `jinja_required`; construction
+  fails on the legacy backend. Token merges do not cross span boundaries, which
+  matches the official tokenizer whenever a template ends its literals at a
+  control token or a newline, as the Qwen and MiniCPM families do; the parity
+  gate's stage D proves benign prompts tokenize identically under both policies.
+
+`TokenizeOptions{.parse_special=false}` is the underlying tokenizer gate and is
+also available directly. It equals Hugging Face `split_special_tokens=True`:
+control tokens are left in the text, other added tokens such as `<think>` are
+still matched (parity gate stage C).
 
 ## Compatibility contract
 

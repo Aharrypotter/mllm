@@ -5,6 +5,8 @@
 
 #include <nlohmann/json_fwd.hpp>
 
+#include "mllm/preprocessor/tokenizers/AddedToken.hpp"
+
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -34,11 +36,23 @@ class BPE {
 
   std::wstring _lookup_inverse_vocab(int64_t idx);
 
-  // Contents of `added_tokens` entries whose `special` flag is set. These are
-  // the checkpoint's control tokens: turn boundaries, vision markers, and the
+  // Every `added_tokens` entry of the tokenizer.json, in file order. A
+  // tokenizer registers them in its special-token trie with
+  // AutoTokenizer::registerAddedTokens instead of keeping a hand-written list.
+  const std::vector<AddedToken>& addedTokens() const { return added_tokens_; }
+
+  // Contents of the entries whose `special` flag is set. These are the
+  // checkpoint's control tokens: turn boundaries, vision markers, and the
   // like. They may only enter a prompt from a chat template, never from
   // message content, so ChatPreprocessor rejects them in a request.
   const std::vector<std::string>& controlTokens() const { return control_tokens_; }
+
+  // Attribute of a token id: kControl for added tokens with `special: true`,
+  // kUserDefined for the other added tokens, kNormal for vocabulary entries.
+  TokenAttr attrOf(int64_t id) const {
+    const auto it = attr_by_id_.find(id);
+    return it == attr_by_id_.end() ? TokenAttr::kNormal : it->second;
+  }
 
  private:
   std::unordered_set<std::pair<std::wstring, std::wstring>, BPEPairHash> _get_pairs(const std::vector<std::wstring>& word);
@@ -51,6 +65,8 @@ class BPE {
   // rebuilt from the merge table. Roughly 2% of such entries are unreachable
   // by merges alone, so ignoring the flag silently changes the token ids.
   bool ignore_merges_ = false;
+  std::vector<AddedToken> added_tokens_;
+  std::unordered_map<int64_t, TokenAttr> attr_by_id_;
   std::vector<std::string> control_tokens_;
 };
 

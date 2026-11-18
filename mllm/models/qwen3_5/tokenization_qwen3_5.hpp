@@ -15,6 +15,7 @@
 #include "mllm/preprocessor/tokenizers/BPE.hpp"
 #include "mllm/preprocessor/StreamingUtf8Decoder.hpp"
 #include "mllm/models/ARGeneration.hpp"
+#include "mllm/preprocessor/chat_template/PromptTokenization.hpp"
 #include "mllm/models/qwen3_5/chat_template_qwen3_5.hpp"
 #include "mllm/models/qwen3_5/configuration_qwen3_5.hpp"
 #include "mllm/models/qwen3_5/image_preprocessor_qwen3_5.hpp"
@@ -38,7 +39,7 @@ inline bool qwen3_5TokenizerMatchPattern(const std::wstring& str, size_t& pos, s
   for (const auto& contraction : contractions) {
     bool matches = pos + contraction.size() <= str.size();
     for (size_t index = 0; matches && index < contraction.size(); ++index) {
-      matches = std::towlower(str[pos + index]) == contraction[index];
+      matches = preprocessor::toLower(str[pos + index]) == contraction[index];
     }
     if (matches) {
       matched = str.substr(pos, contraction.size());
@@ -88,10 +89,10 @@ inline bool qwen3_5TokenizerMatchPattern(const std::wstring& str, size_t& pos, s
 
     if (str[pos] == L' ') { ++pos; }
 
-    if (pos < str.size() && !std::iswspace(str[pos]) && !preprocessor::isLetter(str[pos]) && !preprocessor::isDigit(str[pos])) {
+    if (pos < str.size() && !preprocessor::isWhitespace(str[pos]) && !preprocessor::isLetter(str[pos]) && !preprocessor::isDigit(str[pos])) {
       do {
         ++pos;
-      } while (pos < str.size() && !std::iswspace(str[pos]) && !preprocessor::isLetter(str[pos])
+      } while (pos < str.size() && !preprocessor::isWhitespace(str[pos]) && !preprocessor::isLetter(str[pos])
                && !preprocessor::isDigit(str[pos]));
 
       matched = str.substr(start, pos - start);
@@ -111,7 +112,7 @@ inline bool qwen3_5TokenizerMatchPattern(const std::wstring& str, size_t& pos, s
     size_t start = pos;
     size_t scan = pos;
     size_t last_line_break = std::wstring::npos;
-    while (scan < str.size() && std::iswspace(str[scan])) {
+    while (scan < str.size() && preprocessor::isWhitespace(str[scan])) {
       if (str[scan] == L'\r' || str[scan] == L'\n') { last_line_break = scan + 1; }
       ++scan;
     }
@@ -123,9 +124,9 @@ inline bool qwen3_5TokenizerMatchPattern(const std::wstring& str, size_t& pos, s
   }
 
   // 6. Match \s+(?!\S)
-  if (std::iswspace(str[pos])) {
+  if (preprocessor::isWhitespace(str[pos])) {
     size_t start = pos;
-    while (pos < str.size() && std::iswspace(str[pos])) ++pos;
+    while (pos < str.size() && preprocessor::isWhitespace(str[pos])) ++pos;
     if (pos >= str.size()) {
       matched = str.substr(start, pos - start);
       return true;
@@ -141,9 +142,9 @@ inline bool qwen3_5TokenizerMatchPattern(const std::wstring& str, size_t& pos, s
   }
 
   // 7. Match remaining whitespace
-  if (std::iswspace(str[pos])) {
+  if (preprocessor::isWhitespace(str[pos])) {
     size_t start = pos;
-    while (pos < str.size() && std::iswspace(str[pos])) ++pos;
+    while (pos < str.size() && preprocessor::isWhitespace(str[pos])) ++pos;
     matched = str.substr(start, pos - start);
     return true;
   }
@@ -196,33 +197,10 @@ class Qwen3_5Tokenizer final : public mllm::preprocessor::AutoTokenizer {
     for (auto& kv : bytes_2_unicode_dict_) { bytes_2_unicode_dict_inverse_.insert({kv.second, kv.first}); }
     bpe_.initFromSentencePieceJson(file_path);
     chat_preprocessor_.setControlTokens(bpe_.controlTokens());
-    // Qwen3.5 special tokens
-    special_tokens_trie_.add(L"<|endoftext|>");
-    special_tokens_trie_.add(L"<|im_start|>");
-    special_tokens_trie_.add(L"<|im_end|>");
-    special_tokens_trie_.add(L"<|object_ref_start|>");
-    special_tokens_trie_.add(L"<|object_ref_end|>");
-    special_tokens_trie_.add(L"<|box_start|>");
-    special_tokens_trie_.add(L"<|box_end|>");
-    special_tokens_trie_.add(L"<|quad_start|>");
-    special_tokens_trie_.add(L"<|quad_end|>");
-    special_tokens_trie_.add(L"<|vision_start|>");
-    special_tokens_trie_.add(L"<|vision_end|>");
-    special_tokens_trie_.add(L"<|vision_pad|>");
-    special_tokens_trie_.add(L"<|image_pad|>");
-    special_tokens_trie_.add(L"<|video_pad|>");
-    special_tokens_trie_.add(L"<|fim_prefix|>");
-    special_tokens_trie_.add(L"<|fim_middle|>");
-    special_tokens_trie_.add(L"<|fim_suffix|>");
-    special_tokens_trie_.add(L"<|fim_pad|>");
-    special_tokens_trie_.add(L"<|repo_name|>");
-    special_tokens_trie_.add(L"<|file_sep|>");
-    special_tokens_trie_.add(L"<think>");
-    special_tokens_trie_.add(L"</think>");
-    special_tokens_trie_.add(L"<tool_call>");
-    special_tokens_trie_.add(L"</tool_call>");
-    special_tokens_trie_.add(L"<tool_response>");
-    special_tokens_trie_.add(L"</tool_response>");
+    // Added tokens (control tokens and markers such as <think> or <tool_call>)
+    // come from tokenizer.json, so every checkpoint of the family tokenizes
+    // them exactly as the official tokenizer does.
+    registerAddedTokens(bpe_.addedTokens());
   }
 
   // Product constructor: geometry and chat-template backend come from the
@@ -236,7 +214,8 @@ class Qwen3_5Tokenizer final : public mllm::preprocessor::AutoTokenizer {
                              .backend = config.chat_template_backend,
                              .template_options = {.model_directory = model_directory.empty()
                                                                          ? std::filesystem::path(file_path).parent_path()
-                                                                         : std::move(model_directory)}}) {}
+                                                                         : std::move(model_directory)},
+                           .control_token_policy = config.control_token_policy}) {}
 
   preprocessor::ChatTemplateBackend chatTemplateBackend() const noexcept { return chat_preprocessor_.backend(); }
 
@@ -244,9 +223,24 @@ class Qwen3_5Tokenizer final : public mllm::preprocessor::AutoTokenizer {
   const std::vector<std::string>& controlTokens() const { return bpe_.controlTokens(); }
 
   // Renders the prompt text for one runner turn without media expansion.
-  std::string renderChatTemplate(const Qwen3_5Message& message) const {
-    return chat_preprocessor_.render(
-        makeQwen3_5ChatTemplateRequest(message.prompt, message.image_paths.size(), !message.video_frames_thwc.isNil()));
+  preprocessor::ChatTemplateRequest requestFor(const Qwen3_5Message& message) const {
+    return makeQwen3_5ChatTemplateRequest(message.prompt, message.image_paths.size(), !message.video_frames_thwc.isNil());
+  }
+
+  std::string renderChatTemplate(const Qwen3_5Message& message) const { return chat_preprocessor_.render(requestFor(message)); }
+
+  // Origin-tagged prompt: under control_token_policy=neutralize the official
+  // template's provenance is kept so message content is tokenized without
+  // special-token parsing; otherwise the flat prompt is one template span.
+  std::vector<preprocessor::PromptSpan> renderPromptSpans(const Qwen3_5Message& message) const {
+    if (chat_preprocessor_.controlTokenPolicy() == preprocessor::ControlTokenPolicy::Neutralize) {
+      return chat_preprocessor_.renderSpans(requestFor(message));
+    }
+    return {{renderChatTemplate(message), false}};
+  }
+
+  std::vector<std::wstring> tokenizePrompt(const Qwen3_5Message& message) {
+    return preprocessor::tokenizePromptSpans(*this, renderPromptSpans(message));
   }
 
   std::vector<std::wstring> _tokenize(const std::string& str) override {
@@ -263,15 +257,17 @@ class Qwen3_5Tokenizer final : public mllm::preprocessor::AutoTokenizer {
     return ret;
   }
 
-  std::vector<std::wstring> tokenize(const std::string& str) override {
-    auto tokens = special_tokens_trie_.split(preprocessor::utf8string2WideString(str));
+    std::vector<std::wstring> tokenize(const std::string& str) override { return tokenize(str, {}); }
+
+  std::vector<std::wstring> tokenize(const std::string& str, const preprocessor::TokenizeOptions& options) override {
     std::vector<std::wstring> all_tokens;
-    for (const auto& token : tokens) {
-      if (special_tokens_trie_.isSpecialToken(token)) {
-        all_tokens.emplace_back(token);
+    for (const auto& segment :
+         special_tokens_trie_.splitSegments(preprocessor::utf8string2WideString(str), {.parse_special = options.parse_special})) {
+      if (segment.is_special) {
+        all_tokens.emplace_back(segment.text);
         continue;
       }
-      auto tmp_tokens = _tokenize(preprocessor::wideString2Utf8String(token));
+      auto tmp_tokens = _tokenize(preprocessor::wideString2Utf8String(segment.text));
       all_tokens.insert(all_tokens.end(), tmp_tokens.begin(), tmp_tokens.end());
     }
     return all_tokens;
@@ -336,24 +332,34 @@ class Qwen3_5Tokenizer final : public mllm::preprocessor::AutoTokenizer {
     // one placeholder per media block. Stage 2 expands those placeholders the
     // way the official processor does, then the tokenizer stage expands per
     // patch tokens from the image/video geometry.
-    auto applied_string = renderChatTemplate(message);
+    auto spans = renderPromptSpans(message);
+    // Placeholders come from the template, never from content (reserved markers
+    // are rejected above), so only template-origin spans are inspected.
+    std::string template_text;
+    for (const auto& span : spans) { if (!span.is_input) template_text += span.text; }
     if (has_image) {
-      const auto placeholder_count = countOccurrences(applied_string, kQwen3_5ImagePlaceholder);
+      const auto placeholder_count = countOccurrences(template_text, kQwen3_5ImagePlaceholder);
       if (placeholder_count != message.image_paths.size()) {
         throw std::runtime_error("Qwen3.5 chat template rendered " + std::to_string(placeholder_count)
                                  + " image placeholders for " + std::to_string(message.image_paths.size()) + " images");
       }
     } else if (has_video) {
-      const auto placeholder = applied_string.find(kQwen3_5VideoPlaceholder);
-      if (placeholder == std::string::npos || countOccurrences(applied_string, kQwen3_5VideoPlaceholder) != 1) {
+      if (countOccurrences(template_text, kQwen3_5VideoPlaceholder) != 1) {
         throw std::runtime_error("Qwen3.5 chat template must render exactly one video placeholder");
       }
       const auto timestamps = calculateQwen3_5VideoTimestamps(message.video_frame_indices, message.video_frames_per_second,
                                                               vision_temporal_patch_size_);
-      applied_string.replace(placeholder, sizeof(kQwen3_5VideoPlaceholder) - 1, makeQwen3_5VideoMarkers(timestamps));
+      const auto markers = makeQwen3_5VideoMarkers(timestamps);
+      for (auto& span : spans) {
+        if (span.is_input) continue;
+        const auto placeholder = span.text.find(kQwen3_5VideoPlaceholder);
+        if (placeholder != std::string::npos) {
+          span.text.replace(placeholder, sizeof(kQwen3_5VideoPlaceholder) - 1, markers);
+          break;
+        }
+      }
     }
-
-    auto sequence_str = tokenize(applied_string);
+    auto sequence_str = preprocessor::tokenizePromptSpans(*this, spans);
     std::vector<int64_t> ids;
     ids.reserve(sequence_str.size());
     for (const auto& str : sequence_str) { ids.emplace_back(bpe_._lookup_vocab(str)); }

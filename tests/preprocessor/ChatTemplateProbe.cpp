@@ -33,6 +33,8 @@
 #include "mllm/models/qwen_npu/configuration_qwen_npu.hpp"
 #include "mllm/models/qwen_npu/tokenization_qwen.hpp"
 #include "mllm/preprocessor/chat_template/ChatTemplate.hpp"
+#include "mllm/preprocessor/StreamingUtf8Decoder.hpp"
+#include "mllm/preprocessor/chat_template/PromptTokenization.hpp"
 
 namespace {
 
@@ -43,17 +45,20 @@ struct Options {
   std::string config;
   std::string model_dir;
   std::optional<std::string> backend;
+  std::optional<std::string> policy;
   std::string prompt;
   std::string system;
   bool enable_thinking = false;
   bool tokenize = false;
+  bool decode = false;
+  bool parse_special = true;
 };
 
 [[noreturn]] void usage(const std::string& error = "") {
   if (!error.empty()) { std::cerr << error << "\n"; }
   std::cerr << "usage: Mllm-ChatTemplate-Probe --model MODEL --tokenizer tokenizer.json [--merges merges.txt] [--config config.json]\n"
-               "       [--model_dir DIR] [--backend legacy|jinja_required] [--prompt TEXT] [--system TEXT]\n"
-               "       [--enable_thinking] [--tokenize]\n";
+               "       [--model_dir DIR] [--backend legacy|jinja_required] [--policy reject|neutralize] [--prompt TEXT] [--system TEXT]\n"
+               "       [--enable_thinking] [--tokenize [--no_parse_special]] [--decode]\n";
   std::exit(2);
 }
 
@@ -77,6 +82,8 @@ Options parse(int argc, char** argv) {
       options.model_dir = value();
     } else if (arg == "--backend") {
       options.backend = value();
+    } else if (arg == "--policy") {
+      options.policy = value();
     } else if (arg == "--prompt") {
       options.prompt = value();
     } else if (arg == "--system") {
@@ -85,6 +92,10 @@ Options parse(int argc, char** argv) {
       options.enable_thinking = true;
     } else if (arg == "--tokenize") {
       options.tokenize = true;
+    } else if (arg == "--decode") {
+      options.decode = true;
+    } else if (arg == "--no_parse_special") {
+      options.parse_special = false;
     } else {
       usage("unknown argument " + arg);
     }
@@ -95,8 +106,8 @@ Options parse(int argc, char** argv) {
   if (!known) { usage("unknown --model " + options.model); }
   if (options.model == "qwen_npu" && options.merges.empty()) { usage("--merges is required for qwen_npu"); }
   if (options.tokenizer.empty()) { usage("--tokenizer is required"); }
-  if (!options.tokenize && options.config.empty()) { usage("--config is required for the product path"); }
-  if (!options.tokenize && options.prompt.empty()) { usage("--prompt is required for the product path"); }
+  if (!options.tokenize && !options.decode && options.config.empty()) { usage("--config is required for the product path"); }
+  if (!options.tokenize && !options.decode && options.prompt.empty()) { usage("--prompt is required for the product path"); }
   return options;
 }
 
@@ -105,13 +116,27 @@ std::vector<int64_t> toVector(const mllm::Tensor& tensor) {
 }
 
 template<typename Tokenizer>
-std::vector<int64_t> tokenizeStdin(Tokenizer& tokenizer) {
+std::vector<int64_t> tokenizeStdin(Tokenizer& tokenizer, bool parse_special) {
   const std::string text((std::istreambuf_iterator<char>(std::cin)), std::istreambuf_iterator<char>());
+  const mllm::preprocessor::TokenizeOptions options{.parse_special = parse_special};
   if constexpr (requires { tokenizer.encode(text); }) {
-    return tokenizer.encode(text);  // UTF-8 tokenizers (MiniCPM4)
+    std::vector<int64_t> ids;  // UTF-8 tokenizers (MiniCPM4)
+    for (const auto& token : tokenizer.tokenize(text, options)) { ids.push_back(tokenizer.encode(token).front()); }
+    return ids;
   } else {
-    return toVector(tokenizer.convert2Ids(tokenizer.tokenize(text)));
+    return toVector(tokenizer.convert2Ids(tokenizer.tokenize(text, options)));
   }
+}
+
+// Decode mode: token ids on stdin (JSON array) -> UTF-8 text through the
+// streaming decoder, one token at a time, exactly as a runner prints it.
+template<typename Tokenizer>
+std::string decodeStdin(Tokenizer& tokenizer) {
+  const std::string text((std::istreambuf_iterator<char>(std::cin)), std::istreambuf_iterator<char>());
+  mllm::preprocessor::StreamingUtf8Decoder decoder;
+  std::string out;
+  for (const auto& id : nlohmann::json::parse(text)) { out += decoder.append(tokenizer.detokenizeBytes(id.get<int64_t>())); }
+  return out + decoder.finish();
 }
 
 // Text-only runners: tokenize mode or the product path with an explicit backend.
@@ -119,15 +144,26 @@ template<typename Tokenizer, typename Config, typename Message, typename MakeTok
 void runTextModel(const Options& options, nlohmann::json& output, MakeTokenizer make_tokenizer) {
   if (options.tokenize) {
     auto tokenizer = make_tokenizer(std::optional<Config>{});
-    output["token_ids"] = tokenizeStdin(*tokenizer);
+    output["token_ids"] = tokenizeStdin(*tokenizer, options.parse_special);
+    return;
+  }
+  if (options.decode) {
+    auto tokenizer = make_tokenizer(std::optional<Config>{});
+    if constexpr (requires { tokenizer->detokenizeBytes(int64_t{}); }) {
+      output["text"] = decodeStdin(*tokenizer);
+    } else {
+      throw std::runtime_error("this tokenizer has no detokenizeBytes()");
+    }
     return;
   }
   Config cfg(options.config);
   if (options.backend) { cfg.chat_template_backend = mllm::preprocessor::parseChatTemplateBackend(*options.backend); }
+  if (options.policy) { cfg.control_token_policy = mllm::preprocessor::parseControlTokenPolicy(*options.policy); }
   auto tokenizer = make_tokenizer(std::optional<Config>{cfg});
   Message message{.prompt = options.prompt};
   output["backend"] = mllm::preprocessor::chatTemplateBackendName(tokenizer->chatTemplateBackend());
-  output["prompt_text"] = tokenizer->renderChatTemplate(message);
+  output["policy"] = mllm::preprocessor::controlTokenPolicyName(cfg.control_token_policy);
+  output["prompt_text"] = mllm::preprocessor::flattenPromptSpans(tokenizer->renderPromptSpans(message));
   output["token_ids"] = toVector(tokenizer->convertMessage(message).at("sequence"));
 }
 
@@ -143,16 +179,19 @@ int main(int argc, char** argv) {
     const std::filesystem::path model_dir = options.model_dir;
 
     if (options.model == "qwen3_5") {
-      if (options.tokenize) {
+      if (options.tokenize || options.decode) {
         mllm::models::qwen3_5::Qwen3_5Tokenizer tokenizer(options.tokenizer);
-        output["token_ids"] = tokenizeStdin(tokenizer);
+        if (options.decode) output["text"] = decodeStdin(tokenizer);
+        else output["token_ids"] = tokenizeStdin(tokenizer, options.parse_special);
       } else {
         auto cfg = mllm::models::qwen3_5::Qwen3_5Config(options.config);
         if (options.backend) { cfg.chat_template_backend = mllm::preprocessor::parseChatTemplateBackend(*options.backend); }
+  if (options.policy) { cfg.control_token_policy = mllm::preprocessor::parseControlTokenPolicy(*options.policy); }
         mllm::models::qwen3_5::Qwen3_5Tokenizer tokenizer(options.tokenizer, cfg, model_dir);
         mllm::models::qwen3_5::Qwen3_5Message message{.prompt = options.prompt};
         output["backend"] = mllm::preprocessor::chatTemplateBackendName(tokenizer.chatTemplateBackend());
-        output["prompt_text"] = tokenizer.renderChatTemplate(message);
+        output["policy"] = mllm::preprocessor::controlTokenPolicyName(cfg.control_token_policy);
+        output["prompt_text"] = mllm::preprocessor::flattenPromptSpans(tokenizer.renderPromptSpans(message));
         output["token_ids"] = toVector(tokenizer.convertMessage(message).at("sequence"));
       }
     } else if (options.model == "qwen3") {
@@ -185,17 +224,20 @@ int main(int argc, char** argv) {
                    : std::make_unique<QwenTokenizer>(options.tokenizer, options.merges);
       });
     } else {
-      if (options.tokenize) {
+      if (options.tokenize || options.decode) {
         mllm::models::minicpm5::MiniCPM5Tokenizer tokenizer(options.tokenizer);
-        output["token_ids"] = tokenizeStdin(tokenizer);
+        if (options.decode) output["text"] = decodeStdin(tokenizer);
+        else output["token_ids"] = tokenizeStdin(tokenizer, options.parse_special);
       } else {
         auto cfg = mllm::models::minicpm5::MiniCPM5Config(options.config);
         if (options.backend) { cfg.chat_template_backend = mllm::preprocessor::parseChatTemplateBackend(*options.backend); }
+  if (options.policy) { cfg.control_token_policy = mllm::preprocessor::parseControlTokenPolicy(*options.policy); }
         mllm::models::minicpm5::MiniCPM5Tokenizer tokenizer(options.tokenizer, cfg, model_dir);
         mllm::models::minicpm5::MiniCPM5Message message{
             .prompt = options.prompt, .system = options.system, .enable_thinking = options.enable_thinking};
         output["backend"] = mllm::preprocessor::chatTemplateBackendName(tokenizer.chatTemplateBackend());
-        output["prompt_text"] = tokenizer.renderChatTemplate(message);
+        output["policy"] = mllm::preprocessor::controlTokenPolicyName(cfg.control_token_policy);
+        output["prompt_text"] = mllm::preprocessor::flattenPromptSpans(tokenizer.renderPromptSpans(message));
         output["token_ids"] = toVector(tokenizer.convertMessage(message).at("sequence"));
       }
     }

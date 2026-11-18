@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <iostream>
 #include <fmt/core.h>
 #include <mllm/mllm.hpp>
@@ -62,7 +63,12 @@ MLLM_MAIN({
       fmt::print("\n🤖 Response: ");
 
       // Use for loop
-      for (auto& step : qwen3_moe.chat(inputs)) { std::wcout << qwen3_moe_tokenizer.detokenize(step.cur_token_id) << std::flush; }
+      mllm::preprocessor::StreamingUtf8Decoder decoder;
+      for (auto& step : qwen3_moe.chat(inputs)) {
+        fmt::print("{}", decoder.append(qwen3_moe_tokenizer.detokenizeBytes(step.cur_token_id)));
+        std::fflush(stdout);
+      }
+      fmt::print("{}", decoder.finish());
 
       fmt::print("\n{}\n", std::string(60, '-'));
     } catch (const std::exception& e) { fmt::print("\n❌ Error: {}\n{}\n", e.what(), std::string(60, '-')); }
