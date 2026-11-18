@@ -1,5 +1,6 @@
 #include <fmt/core.h>
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -28,6 +29,7 @@
 #include "mllm/backends/qnn/passes/QNNGraphIOTensorPass.hpp"
 #include "mllm/backends/qnn/passes/QNNOpNamingPass.hpp"
 #include "mllm/backends/qnn/QNNBackend.hpp"
+#include "mllm/backends/qnn/QNNUtils.hpp"
 #include "mllm/backends/cpu/kernels/common/shadownpu/AttentionProfiler.hpp"
 #include "mllm/compile/PassManager.hpp"
 #include "mllm/core/SlicePrimitives.hpp"  // for kAll
@@ -239,6 +241,38 @@ void dumpQNNBoundaryTensors(const std::filesystem::path& root,
   dump_tensor("-", "final_norm", "final_norm.f32", layer_outputs.back());
 }
 
+void dumpQNNOProj(const std::filesystem::path& root, const std::vector<mllm::Tensor>& captured) {
+  if (captured.size() != 4) { throw std::runtime_error("expected four QNN o_proj diagnostic tensors"); }
+  if (!std::filesystem::create_directory(root)) {
+    throw std::runtime_error("QNN o_proj diagnostic directory already exists: " + root.string());
+  }
+  std::ofstream metadata(root / "metadata.tsv");
+  metadata << "boundary\tdtype\tshape\tbytes\tstep\tzero_point\tfile\n"
+           << std::setprecision(std::numeric_limits<float>::max_digits10);
+  const std::array filenames{"o_proj_input.i8", "o_proj_output.i8", "attention_residual.f32", "block_residual.f32"};
+  for (size_t i = 0; i < filenames.size(); ++i) {
+    auto tensor = captured[i];
+    const bool integer = i < 2;
+    if (tensor.dtype() != (integer ? mllm::kInt8 : mllm::kFloat32)) {
+      throw std::runtime_error("unexpected QNN o_proj diagnostic dtype");
+    }
+    const float step = integer ? mllm::qnn::getQuantScale(tensor) : 0.0F;
+    if (integer && (!std::isfinite(step) || step <= 0.0F)) {
+      throw std::runtime_error("missing QNN o_proj diagnostic quantization step");
+    }
+    tensor = tensor.to(mllm::kCPU).contiguous();
+    const auto path = root / filenames[i];
+    std::ofstream output(path, std::ios::binary);
+    const auto bytes = static_cast<std::streamsize>(tensor.bytes());
+    if (!output.write(tensor.ptr<char>(), bytes)) {
+      throw std::runtime_error("failed to write QNN o_proj diagnostic tensor: " + path.string());
+    }
+    metadata << i << '\t' << (integer ? "int8" : "float32-le") << '\t' << shapeString(tensor.shape()) << '\t'
+             << bytes << '\t' << step << '\t' << 0 << '\t' << filenames[i] << '\n';
+  }
+  if (!metadata) { throw std::runtime_error("failed to write QNN o_proj diagnostic metadata"); }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -289,6 +323,8 @@ int main(int argc, char** argv) {
       Argparse::add<bool>("--debug-qnn-layer-outputs").help("Copy and summarize every QNN decoder residual output");
   auto& debug_qnn_boundary_dir = Argparse::add<std::string>("--debug-qnn-boundary-dir")
                                       .help("Dump every QNN layer Q/K/V and CPU attention output as raw Float32");
+  auto& debug_qnn_o_proj_dir = Argparse::add<std::string>("--debug-qnn-o-proj-dir")
+                                   .help("Dump first-layer o_proj codes and residuals using a matching QNN context");
 
   Argparse::parse(argc, argv);
 
@@ -301,6 +337,11 @@ int main(int argc, char** argv) {
   const bool use_npu_prefill = !cpu_prefill.isSet();
   const bool prepare_context = prepare_qnn_context.isSet();
   const bool run_prefill_only = prefill_only.isSet();
+  if (debug_qnn_o_proj_dir.isSet() && !use_npu_prefill) {
+    fmt::print(stderr, "Error: --debug-qnn-o-proj-dir requires QNN prefill.\n");
+    ::mllm::shutdownContext();
+    return 2;
+  }
   const auto missing_required = [&]() {
     return !config_path.isSet() || (!run_prefill_only && !cpu_model_path.isSet()) || !tokenizer_path.isSet()
            || !merges_path.isSet() || !model_version.isSet() || (use_npu_prefill && !npu_model_path.isSet());
@@ -439,6 +480,7 @@ int main(int argc, char** argv) {
   }
 
   auto cpu_cfg = mllm::models::qwen_npu::QwenNPUConfig(config_path.get());
+  cpu_cfg.debug_capture_first_o_proj = debug_qnn_o_proj_dir.isSet();
   float average_retention = 1.0F;
   int32_t dense_heads = cpu_cfg.num_hidden_layers * cpu_cfg.num_attention_heads;
   std::string dense_layers = "all";
@@ -722,6 +764,10 @@ int main(int argc, char** argv) {
     prefill_time_ms = prefill_duration.count();
     MLLM_INFO("QNN prefill completed: seq_len={}, chunks={}, logical_chunk={}, qnn_tile={}, time={:.2f}s", prefill_seq_len,
               prefill_chunk_count, logical_chunk, qnn_sequence_tile.get(), prefill_duration.count() / 1000.0);
+
+    if (debug_qnn_o_proj_dir.isSet()) {
+      dumpQNNOProj(debug_qnn_o_proj_dir.get(), npu_model->model.decode_blocks().list().front().capturedOProj());
+    }
 
     if (debug_qnn_layer_outputs.isSet() || debug_qnn_boundary_dir.isSet()) {
       printLayerSummaries("qnn_prefill", npu_model->capturedLayerOutputs(), true);

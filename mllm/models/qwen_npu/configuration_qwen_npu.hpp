@@ -86,6 +86,7 @@ struct QwenNPUConfig : protected ConfigFile {
 
   aops::LinearImplTypes linear_impl_type = aops::LinearImplTypes::kDefault;
   std::vector<int32_t> shadow_down_proj_layers;
+  bool debug_capture_first_o_proj = false;
 
   // ShadowNPU is opt-in and applies to prefill only. Decode remains dense.
   float prefill_attention_sparsity = 0.0F;
