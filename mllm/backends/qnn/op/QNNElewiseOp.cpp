@@ -1,6 +1,9 @@
 // Copyright (c) MLLM Team.
 // Licensed under the MIT License.
 
+#include <cstdlib>
+#include <cstring>
+
 #include "mllm/backends/qnn/op/QNNElewiseOp.hpp"
 #include "mllm/backends/qnn/QNNBackend.hpp"
 #include "mllm/backends/qnn/QNNUtils.hpp"
@@ -151,9 +154,25 @@ bool QNNMulPattern::addNode(const std::string& graphName, const ir::op_ptr_t& op
     return false;
   }
 
-  // Add ElementWiseMultiply node to the graph using standard QNN operator
-  qnnBackend->graphAddNode(graphName, qnnMulOp->getName(), "ElementWiseMultiply", inputTensorNames, {outputs[0]->name()}, {},
-                           {});
+  const char* request = std::getenv("MLLM_QNN_MLP_HVX_MUL");
+  const bool requested = request != nullptr && std::strcmp(request, "1") == 0;
+  const auto& node_name = qnnMulOp->getName();
+  if (requested && graphName.starts_with("model.layers.") && graphName.ends_with("_2")
+      && node_name == graphName + ".Mul.0") {
+    const Tensor::shape_t expected_shape{1, 256, 1, 8960};
+    if (inputs.size() != 2 || outputs.size() != 1 || inputs[0]->tensor_.dtype() != kFloat32
+        || inputs[1]->tensor_.dtype() != kFloat32 || outputs[0]->tensor_.dtype() != kFloat32
+        || inputs[0]->tensor_.shape() != expected_shape || inputs[1]->tensor_.shape() != expected_shape
+        || outputs[0]->tensor_.shape() != expected_shape) {
+      MLLM_ERROR("QNN_MLP_HVX_MUL_SHAPE_MISMATCH graph={} node={}", graphName, node_name);
+      return false;
+    }
+    qnnBackend->graphAddNode(graphName, node_name + ".llama_hvx_f32", "LLaMAMul", inputTensorNames, {outputs[0]->name()}, {},
+                             {}, "LLaMAPackage");
+    MLLM_INFO("QNN_MLP_HVX_MUL_LOWERING graph={} node={}", graphName, node_name);
+  } else {
+    qnnBackend->graphAddNode(graphName, node_name, "ElementWiseMultiply", inputTensorNames, {outputs[0]->name()}, {}, {});
+  }
 
   return true;
 }
