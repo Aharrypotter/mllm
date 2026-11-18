@@ -324,8 +324,19 @@ int dumpShadowResidualBoundaries(const std::filesystem::path &dir, CPUModuleWrap
         const auto name = callable->op->name();
         const std::string suffix = ".mlp.down_proj.shadow";
         if (name.size() < suffix.size() || name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
-        if (callable->opOutputs.size() != 1) throw std::runtime_error("unexpected W8A16 shadow output");
+        if (callable->opInputs.size() != 3 || callable->opOutputs.size() != 1) {
+            throw std::runtime_error("unexpected W8A16 shadow bindings");
+        }
         const int layer = v2::qwenLayerIndexFromBaseName(name);
+        std::ofstream layout(dir / "shadow-input-layout.tsv", std::ios::app);
+        for (size_t slot = 0; slot < callable->opInputs.size(); ++slot) {
+            auto &input = *callable->opInputs[slot];
+            layout << layer << '\t' << slot << '\t' << input.name() << '\t' << static_cast<int>(input.ctype())
+                   << '\t' << input.batch() << '\t' << input.head() << '\t' << input.sequence()
+                   << '\t' << input.dimension() << '\n';
+        }
+        layout.close();
+        if (!layout) throw std::runtime_error("writing W8A16 input layout failed");
         const auto label = "layer-" + std::to_string(layer) + "-shadow-residual";
         std::ofstream metadata(dir / "metadata.tsv", std::ios::app);
         writeProjectionBoundary(dir, metadata, *callable->opOutputs.front(), label.c_str(), 1, 1536, false);

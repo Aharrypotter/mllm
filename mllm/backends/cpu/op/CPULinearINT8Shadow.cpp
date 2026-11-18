@@ -176,8 +176,10 @@ ErrorCode CPULinearINT8Shadow::executeInt16(const vector<shared_ptr<Tensor>> &in
     auto &result = *outputs[0];
     const auto count_tokens = [](Tensor &t) { return t.batch() * t.head() * t.sequence(); };
     const int tokens = count_tokens(residual);
+    const auto supported_layout = [](Tensor &t) { return t.ctype() == BSHD || t.ctype() == BHSD; };
     if ((input.dtype() != MLLM_TYPE_F32 && input.dtype() != MLLM_TYPE_F16) ||
         quantized.dtype() != MLLM_TYPE_I16 || residual.dtype() != MLLM_TYPE_F32 ||
+        !supported_layout(input) || !supported_layout(quantized) || !supported_layout(residual) ||
         tokens != count_tokens(input) || tokens != count_tokens(quantized) ||
         input.dimension() != in_features_ || quantized.dimension() != out_features_ ||
         residual.dimension() != out_features_) {
@@ -197,8 +199,14 @@ ErrorCode CPULinearINT8Shadow::executeInt16(const vector<shared_ptr<Tensor>> &in
     const bool clip_output = outputClip_.hostPtr<int8_t>()[0] != 0;
     const auto *weights = weight_.hostPtr<int8_t>();
     const auto coords = [](Tensor &t, int token) {
-        return std::array<int, 3>{token / (t.head() * t.sequence()), token / t.sequence() % t.head(),
-                                  token % t.sequence()};
+        const int tokens_per_batch = t.head() * t.sequence();
+        const int batch = token / tokens_per_batch;
+        const int index = token % tokens_per_batch;
+        // QNN flattens the packed MLP rows in physical sequence/head order.
+        if (t.ctype() == BSHD) {
+            return std::array<int, 3>{batch, index % t.head(), index / t.head()};
+        }
+        return std::array<int, 3>{batch, index / t.sequence(), index % t.sequence()};
     };
 
 #pragma omp parallel num_threads(thread_count)
