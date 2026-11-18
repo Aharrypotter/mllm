@@ -762,6 +762,7 @@ int main(int argc, char **argv) {
     state.setExecutionType(AUTOREGRESSIVE);
     state.toggleSwitching();
 
+    // The CPU embedding reads token IDs as numeric float values.
     Tensor decoding_input;
     decoding_input.setBackend(Backend::global_backends[MLLM_CPU].get());
     decoding_input.setTtype(INPUT_TENSOR);
@@ -795,7 +796,7 @@ int main(int argc, char **argv) {
         refine_opt.max_new_tokens = 1;
         bool refined_token_produced = false;
         token_id_t refined_first_token = 0;
-        decoding_input.setDataAt(
+        decoding_input.setDataAt<float>(
             0, 0, 0, 0,
             prompt_tokens[static_cast<std::size_t>(prompt_token_count - 1)]);
         decoding_model.generate(
@@ -813,10 +814,10 @@ int main(int argc, char **argv) {
         }
         first_token_us = mllm_time_us();
         generated_ids.push_back(refined_first_token);
-        decoding_input.setDataAt(0, 0, 0, 0, refined_first_token);
+        decoding_input.setDataAt<float>(0, 0, 0, 0, refined_first_token);
     } else {
         generated_ids.push_back(npu_first_token);
-        decoding_input.setDataAt(0, 0, 0, 0, npu_first_token);
+        decoding_input.setDataAt<float>(0, 0, 0, 0, npu_first_token);
     }
 
     decoding_model.generate(decoding_input, decoding_opt,
