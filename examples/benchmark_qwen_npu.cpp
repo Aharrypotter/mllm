@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -114,6 +115,35 @@ uint64_t hashTokens(const std::vector<token_id_t> &tokens) {
     return hash;
 }
 
+std::vector<token_id_t> readPromptTokenFile(const std::string &path,
+                                            int token_count, int vocab_size) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("cannot open prompt token file: " + path);
+    }
+    std::vector<token_id_t> tokens;
+    tokens.reserve(token_count);
+    for (int i = 0; i < token_count; ++i) {
+        unsigned char bytes[4];
+        if (!input.read(reinterpret_cast<char *>(bytes), sizeof(bytes))) {
+            throw std::runtime_error("prompt token file is shorter than --prompt-tokens");
+        }
+        const uint32_t token = static_cast<uint32_t>(bytes[0])
+            | (static_cast<uint32_t>(bytes[1]) << 8)
+            | (static_cast<uint32_t>(bytes[2]) << 16)
+            | (static_cast<uint32_t>(bytes[3]) << 24);
+        if (token >= static_cast<uint32_t>(vocab_size)) {
+            throw std::runtime_error("prompt token at index " + std::to_string(i)
+                                     + " is outside the model vocabulary");
+        }
+        tokens.push_back(token);
+    }
+    if (input.peek() != std::char_traits<char>::eof() || input.bad()) {
+        throw std::runtime_error("prompt token file size does not match --prompt-tokens");
+    }
+    return tokens;
+}
+
 std::string answerBeforeEndMarker(const std::string &text) {
     size_t end = text.size();
     for (const std::string marker : {std::string("\0", 1),
@@ -144,7 +174,9 @@ int main(int argc, char **argv) {
     cmd_parser.add<std::string>("qnn-profile", '\0', "QNN profiling: off, basic, or detailed", false, "off");
     cmd_parser.add<int>("limits", 'l', "KV cache size", false, 2048);
     cmd_parser.add<int>("thread", 't', "CPU decoding threads", false, 4);
-    cmd_parser.add<int>("prompt-tokens", 'p', "effective synthetic prompt tokens", false, 1024);
+    cmd_parser.add<int>("prompt-tokens", 'p', "effective input token count", false, 1024);
+    cmd_parser.add<std::string>("prompt-token-file", '\0',
+        "optional sequence of little-endian uint32 input token IDs", false, "");
     cmd_parser.add<int>("decode-tokens", 'd', "CPU tokens generated after the first token", false, 32);
     cmd_parser.add<int>("chunk-size", 'c', "NPU prefill graph chunk size", false, 256);
     cmd_parser.add<int>(
@@ -182,6 +214,8 @@ int main(int argc, char **argv) {
     const std::string needle = cmd_parser.get<std::string>("needle");
     const std::string quality_prompt =
         cmd_parser.get<std::string>("quality-prompt");
+    const std::string prompt_token_file =
+        cmd_parser.get<std::string>("prompt-token-file");
     if (prompt_token_count <= 0 || chunk_size <= 0 || decode_token_count <= 0) {
         std::cerr << "prompt-tokens, decode-tokens, and chunk-size must be positive" << std::endl;
         return 2;
@@ -222,6 +256,18 @@ int main(int argc, char **argv) {
                   << " to cover padded prefill and CPU decode tokens" << std::endl;
         return 2;
     }
+    QWenNPUConfig config(token_limit, cmd_parser.get<std::string>("model-size"),
+                         RoPEType::HFHUBROPE);
+    std::vector<token_id_t> prompt_tokens;
+    if (!prompt_token_file.empty()) {
+        try {
+            prompt_tokens = readPromptTokenFile(prompt_token_file, prompt_token_count,
+                                                config.vocab_size);
+        } catch (const std::runtime_error &error) {
+            std::cerr << error.what() << std::endl;
+            return 2;
+        }
+    }
 
     try {
         QNNBackend::setDefaultProfilingLevel(
@@ -249,8 +295,6 @@ int main(int argc, char **argv) {
 
     QWenTokenizer tokenizer(cmd_parser.get<std::string>("vocab"),
                             cmd_parser.get<std::string>("merge"));
-    QWenNPUConfig config(token_limit, cmd_parser.get<std::string>("model-size"),
-                         RoPEType::HFHUBROPE);
     config.prefill_attention_pattern_sparse = attention_mode == "hmx-topk";
     config.prefill_attention_hmx_selector = attention_mode == "hmx-topk";
     mllm::examples::ShadowNPUHeadSchedule head_schedule;
@@ -269,59 +313,60 @@ int main(int argc, char **argv) {
     const float requested_sparsity = attention_mode == "dense"
         ? 0.0F : 1.0F - head_schedule.average_retention;
 
-    std::string synthetic_user_prompt;
-    if (quality_prompt == "legacy") {
-        synthetic_user_prompt =
-            "Memorize this exact access code: " + needle
-            + ". You will be asked for it after a long archive.\n";
-        const std::string sentence =
-            "Archive note: mobile inference processes context in deterministic chunks. ";
-        const int sentence_repetitions = std::max(512, prompt_token_count / 4);
-        synthetic_user_prompt.reserve(
-            synthetic_user_prompt.size()
-            + sentence.size() * sentence_repetitions + 160);
-        for (int i = 0; i < sentence_repetitions; ++i) {
-            synthetic_user_prompt += sentence;
+    if (prompt_token_file.empty()) {
+        std::string synthetic_user_prompt;
+        if (quality_prompt == "legacy") {
+            synthetic_user_prompt =
+                "Memorize this exact access code: " + needle
+                + ". You will be asked for it after a long archive.\n";
+            const std::string sentence =
+                "Archive note: mobile inference processes context in deterministic chunks. ";
+            const int sentence_repetitions = std::max(512, prompt_token_count / 4);
+            synthetic_user_prompt.reserve(
+                synthetic_user_prompt.size()
+                + sentence.size() * sentence_repetitions + 160);
+            for (int i = 0; i < sentence_repetitions; ++i) {
+                synthetic_user_prompt += sentence;
+            }
+            synthetic_user_prompt +=
+                "\nQuestion: What is the exact access code stated at the beginning? "
+                "Answer with the code only.";
+        } else {
+            synthetic_user_prompt =
+                "Archive target record 0000 contains access code " + needle
+                + ". Preserve this target exactly.\n";
+            const int records = std::max(1024, prompt_token_count / 2);
+            for (int i = 1; i <= records; ++i) {
+                synthetic_user_prompt += "Archive record " + std::to_string(i)
+                    + ": routine mobile inference note, checksum "
+                    + std::to_string((i * 7919) % 10000) + ".\n";
+            }
+            synthetic_user_prompt +=
+                "Decoy warning: CPU-1842 is obsolete and is not the target.\n"
+                "Question: What access code is stored in archive target record 0000? "
+                "Answer with the target code only.";
         }
-        synthetic_user_prompt +=
-            "\nQuestion: What is the exact access code stated at the beginning? "
-            "Answer with the code only.";
-    } else {
-        synthetic_user_prompt =
-            "Archive target record 0000 contains access code " + needle
-            + ". Preserve this target exactly.\n";
-        const int records = std::max(1024, prompt_token_count / 2);
-        for (int i = 1; i <= records; ++i) {
-            synthetic_user_prompt += "Archive record " + std::to_string(i)
-                + ": routine mobile inference note, checksum "
-                + std::to_string((i * 7919) % 10000) + ".\n";
+
+        auto formatted_prompt = tokenizer.apply_chat_template(synthetic_user_prompt);
+        auto [available_tokens, source_tensor] =
+            tokenizer.tokenizePaddingByChunk(
+                formatted_prompt, chunk_size, config.vocab_size);
+        if (available_tokens < prompt_token_count) {
+            std::cerr << "synthetic prompt unexpectedly produced only "
+                      << available_tokens << " tokens" << std::endl;
+            return 3;
         }
-        synthetic_user_prompt +=
-            "Decoy warning: CPU-1842 is obsolete and is not the target.\n"
-            "Question: What access code is stored in archive target record 0000? "
-            "Answer with the target code only.";
-    }
 
-    auto formatted_prompt = tokenizer.apply_chat_template(synthetic_user_prompt);
-    auto [available_tokens, source_tensor] =
-        tokenizer.tokenizePaddingByChunk(
-            formatted_prompt, chunk_size, config.vocab_size);
-    if (available_tokens < prompt_token_count) {
-        std::cerr << "synthetic prompt unexpectedly produced only "
-                  << available_tokens << " tokens" << std::endl;
-        return 3;
-    }
-
-    std::vector<token_id_t> prompt_tokens;
-    prompt_tokens.reserve(padded_prompt_tokens);
-    const int tail_count = std::min(256, prompt_token_count / 3);
-    for (int i = 0; i < prompt_token_count - tail_count; ++i) {
-        prompt_tokens.push_back(
-            static_cast<token_id_t>(source_tensor.dataAt<float>(0, 0, i, 0)));
-    }
-    for (int i = available_tokens - tail_count; i < available_tokens; ++i) {
-        prompt_tokens.push_back(
-            static_cast<token_id_t>(source_tensor.dataAt<float>(0, 0, i, 0)));
+        prompt_tokens.reserve(padded_prompt_tokens);
+        const int tail_count = std::min(256, prompt_token_count / 3);
+        for (int i = 0; i < prompt_token_count - tail_count; ++i) {
+            prompt_tokens.push_back(
+                static_cast<token_id_t>(source_tensor.dataAt<float>(0, 0, i, 0)));
+        }
+        for (int i = available_tokens - tail_count; i < available_tokens; ++i) {
+            prompt_tokens.push_back(
+                static_cast<token_id_t>(source_tensor.dataAt<float>(0, 0, i, 0)));
+        }
     }
     const uint64_t prompt_hash = hashTokens(prompt_tokens);
     prompt_tokens.resize(padded_prompt_tokens, config.vocab_size);
@@ -547,7 +592,7 @@ int main(int argc, char **argv) {
               << " p95_tpot_ms=" << p95_tpot_ms
               << " decode_tok_s=" << 1000.0 / tpot_ms
               << " attention_mode=" << attention_mode
-              << " quality_prompt=" << quality_prompt
+              << " quality_prompt=" << (prompt_token_file.empty() ? quality_prompt : "token-file")
               << " requested_sparsity=" << std::setprecision(6)
               << (attention_mode == "dense" ? 0.0F : requested_sparsity)
               << " retained_fraction="
