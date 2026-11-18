@@ -146,10 +146,10 @@ std::vector<token_id_t> readPromptTokenFile(const std::string &path,
 
 template <typename T>
 void writeProjectionRows(Tensor &tensor, std::ofstream &file, bool transposed,
-                         int heads, int dimensions) {
+                         int heads, int dimensions, int sequence) {
     std::vector<T> values;
     values.reserve(16 * heads * dimensions);
-    for (int row = 496; row < 512; ++row) {
+    for (int row = sequence - 16; row < sequence; ++row) {
         for (int head = 0; head < heads; ++head) {
             for (int dim = 0; dim < dimensions; ++dim) {
                 values.push_back(transposed ? tensor.dataAt<T>(0, head, dim, row)
@@ -162,11 +162,11 @@ void writeProjectionRows(Tensor &tensor, std::ofstream &file, bool transposed,
 
 void writeProjectionBoundary(const std::filesystem::path &dir, std::ofstream &metadata,
                              Tensor &tensor, const char *label, int heads,
-                             int dimensions, bool allow_transpose) {
+                             int dimensions, bool allow_transpose, int sequence = 512) {
     const bool transposed = allow_transpose && tensor.sequence() == dimensions
-        && tensor.dimension() == 512;
+        && tensor.dimension() == sequence;
     if (tensor.batch() != 1 || tensor.head() != heads ||
-        (!transposed && (tensor.sequence() != 512 || tensor.dimension() != dimensions))) {
+        (!transposed && (tensor.sequence() != sequence || tensor.dimension() != dimensions))) {
         throw std::runtime_error(std::string("unexpected QNN boundary shape: ") + label + " "
                                  + std::to_string(tensor.batch()) + "x" + std::to_string(tensor.head())
                                  + "x" + std::to_string(tensor.sequence()) + "x" + std::to_string(tensor.dimension()));
@@ -180,19 +180,19 @@ void writeProjectionBoundary(const std::filesystem::path &dir, std::ofstream &me
     switch (tensor.dtype()) {
     case MLLM_TYPE_I8:
         dtype = "i8";
-        writeProjectionRows<int8_t>(tensor, file, transposed, heads, dimensions);
+        writeProjectionRows<int8_t>(tensor, file, transposed, heads, dimensions, sequence);
         break;
     case MLLM_TYPE_I16:
         dtype = "i16";
-        writeProjectionRows<int16_t>(tensor, file, transposed, heads, dimensions);
+        writeProjectionRows<int16_t>(tensor, file, transposed, heads, dimensions, sequence);
         break;
     case MLLM_TYPE_F16:
         dtype = "f16";
-        writeProjectionRows<mllm_fp16_t>(tensor, file, transposed, heads, dimensions);
+        writeProjectionRows<mllm_fp16_t>(tensor, file, transposed, heads, dimensions, sequence);
         break;
     case MLLM_TYPE_F32:
         dtype = "f32";
-        writeProjectionRows<float>(tensor, file, transposed, heads, dimensions);
+        writeProjectionRows<float>(tensor, file, transposed, heads, dimensions, sequence);
         break;
     default:
         throw std::runtime_error(std::string("unexpected QNN boundary dtype: ") + label);
@@ -257,6 +257,17 @@ bool dumpAttentionBoundary(const std::filesystem::path &dir, CPUModuleWrapper &g
         softmax.opInputs.size() != 1 || softmax.opOutputs.size() != 1) {
         throw std::runtime_error("unexpected first attention score bindings");
     }
+    const auto qk = std::find_if(graph.traces_.begin(), graph.traces_.end(), [&](const auto &entry) {
+        return entry->type_ == CallableType::OP && entry->opOutputs.size() == 1
+            && entry->opOutputs.front() == softmax.opInputs.front();
+    });
+    if (qk == graph.traces_.end() || (*qk)->opInputs.size() != 2 ||
+        (*qk)->opInputs.front() != q_rope.opOutputs.front()) {
+        throw std::runtime_error("unexpected QK matmul bindings");
+    }
+    auto &qk_query = *(*qk)->opInputs[0];
+    auto &qk_key = *(*qk)->opInputs[1];
+
     std::ofstream metadata(dir / "metadata.tsv", std::ios::app);
     writeProjectionBoundary(dir, metadata, *call.opInputs.front(), "attention", 12, 128, false);
     writeProjectionBoundary(dir, metadata, *call.opOutputs.front(), "attention-quantized", 12, 128, false);
@@ -264,6 +275,23 @@ bool dumpAttentionBoundary(const std::filesystem::path &dir, CPUModuleWrapper &g
     writeProjectionBoundary(dir, metadata, *k_rope.opOutputs.front(), "k-rope", 2, 128, false);
     writeProjectionBoundary(dir, metadata, *softmax.opInputs.front(), "attention-logits", 12, 2048, false);
     writeProjectionBoundary(dir, metadata, *softmax.opOutputs.front(), "attention-probabilities", 12, 2048, false);
+    writeProjectionBoundary(dir, metadata, qk_query, "qk-query", 12, 128, false);
+    writeProjectionBoundary(dir, metadata, qk_key, "qk-key", 12, 128, true, 2048);
+
+    std::ofstream layout(dir / "qk-input-layout.tsv");
+    layout << "input\ttensor\tctype\tsequence\tdimension\thead_stride\tsequence_stride\tdimension_stride\n";
+    const auto write_layout = [&](const char *label, Tensor &tensor) {
+        const auto base = tensor.offset(0, 0, 0, 0);
+        layout << label << '\t' << tensor.name() << '\t' << static_cast<int>(tensor.ctype()) << '\t'
+               << tensor.sequence() << '\t' << tensor.dimension() << '\t'
+               << tensor.offset(0, 1, 0, 0) - base << '\t'
+               << tensor.offset(0, 0, 1, 0) - base << '\t'
+               << tensor.offset(0, 0, 0, 1) - base << '\n';
+    };
+    write_layout("qk-query", qk_query);
+    write_layout("qk-key", qk_key);
+    layout.close();
+    if (!layout) throw std::runtime_error("writing QK input layout failed");
     metadata.close();
     if (!metadata) throw std::runtime_error("writing first attention boundary metadata failed");
     return true;
