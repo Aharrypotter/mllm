@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #include "mllm/core/DataTypes.hpp"
 #include "mllm/utils/Common.hpp"
@@ -62,40 +63,50 @@ void CPULinearShadowCorrectionOp::forward(const std::vector<Tensor>& inputs, std
   const int32_t out_channels = options_.out_channels;
   const int64_t tokens = baseline.numel() / out_channels;
 
+  std::vector<int32_t> saturated_channels;
+  if (!clip_output) { saturated_channels.reserve(out_channels); }
+  std::vector<float> full_sums(clip_output ? 0 : out_channels);
+
   for (int64_t token = 0; token < tokens; ++token) {
     const auto* token_input = x + token * in_channels;
+    const auto* token_q_output = q_output + token * out_channels;
+    const auto* token_baseline = base + token * out_channels;
     auto* token_output = output + token * out_channels;
 
-    if (!clip_input) {
-      for (int32_t input_channel = 0; input_channel < in_channels; ++input_channel) {
-        const float unbounded_q = std::round(token_input[input_channel] / input_step);
-        if (unbounded_q >= static_cast<float>(kQuantMin) && unbounded_q <= static_cast<float>(kQuantMax)) { continue; }
+    saturated_channels.clear();
+    if (!clip_output) {
+      for (int32_t channel = 0; channel < out_channels; ++channel) {
+        const int32_t code = token_q_output[channel];
+        if (code <= kQuantMin || code >= kQuantMax) { saturated_channels.push_back(channel); }
+      }
+    }
+    if (clip_input && saturated_channels.empty()) { continue; }
+    std::fill_n(full_sums.begin(), saturated_channels.size(), 0.0F);
+
+    // Keep each output's accumulation in input-channel order while visiting
+    // weights from the same input row together.
+    for (int32_t input_channel = 0; input_channel < in_channels; ++input_channel) {
+      const float unbounded_q = std::round(token_input[input_channel] / input_step);
+      const auto* weight_row = weight + static_cast<int64_t>(input_channel) * out_channels;
+      if (!clip_input && !(unbounded_q >= static_cast<float>(kQuantMin) && unbounded_q <= static_cast<float>(kQuantMax))) {
         const float clipped_q = std::clamp(unbounded_q, static_cast<float>(kQuantMin), static_cast<float>(kQuantMax));
         const float correction_scale = (unbounded_q - clipped_q) * input_step * weight_step;
-        const auto* weight_row = weight + static_cast<int64_t>(input_channel) * out_channels;
-        for (int32_t output_channel = 0; output_channel < out_channels; ++output_channel) {
-          token_output[output_channel] += correction_scale * static_cast<float>(weight_row[output_channel]);
+        for (int32_t channel = 0; channel < out_channels; ++channel) {
+          token_output[channel] += correction_scale * static_cast<float>(weight_row[channel]);
         }
+      }
+      const float scaled_input = unbounded_q * input_step;
+      for (size_t i = 0; i < saturated_channels.size(); ++i) {
+        const float q_weight = weight_row[saturated_channels[i]];
+        full_sums[i] += scaled_input * q_weight * weight_step;
       }
     }
 
-    if (!clip_output) {
-      const auto* token_q_output = q_output + token * out_channels;
-      const auto* token_baseline = base + token * out_channels;
-      for (int32_t output_channel = 0; output_channel < out_channels; ++output_channel) {
-        const int32_t q_value = token_q_output[output_channel];
-        if (q_value > kQuantMin && q_value < kQuantMax) { continue; }
-
-        float full_sum = 0.0F;
-        for (int32_t input_channel = 0; input_channel < in_channels; ++input_channel) {
-          const float unbounded_q = std::round(token_input[input_channel] / input_step);
-          const int8_t q_weight = weight[static_cast<int64_t>(input_channel) * out_channels + output_channel];
-          full_sum += unbounded_q * input_step * static_cast<float>(q_weight) * weight_step;
-        }
-        const float restored_q = std::round(full_sum / output_step);
-        token_output[output_channel] =
-            token_baseline[output_channel] - static_cast<float>(q_value) * output_step + restored_q * output_step;
-      }
+    for (size_t i = 0; i < saturated_channels.size(); ++i) {
+      const auto channel = saturated_channels[i];
+      const float restored_q = std::round(full_sums[i] / output_step);
+      token_output[channel] =
+          token_baseline[channel] - static_cast<float>(token_q_output[channel]) * output_step + restored_q * output_step;
     }
   }
 }
