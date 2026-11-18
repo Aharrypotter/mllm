@@ -144,6 +144,79 @@ std::vector<token_id_t> readPromptTokenFile(const std::string &path,
     return tokens;
 }
 
+template <typename T>
+void writeProjectionRows(Tensor &tensor, std::ofstream &file, bool transposed,
+                         int heads, int dimensions) {
+    std::vector<T> values;
+    values.reserve(16 * heads * dimensions);
+    for (int row = 496; row < 512; ++row) {
+        for (int head = 0; head < heads; ++head) {
+            for (int dim = 0; dim < dimensions; ++dim) {
+                values.push_back(transposed ? tensor.dataAt<T>(0, head, dim, row)
+                                           : tensor.dataAt<T>(0, head, row, dim));
+            }
+        }
+    }
+    file.write(reinterpret_cast<const char *>(values.data()), values.size() * sizeof(T));
+}
+
+void writeProjectionBoundary(const std::filesystem::path &dir, std::ofstream &metadata,
+                             Tensor &tensor, const char *label, int heads,
+                             int dimensions, bool allow_transpose) {
+    const bool transposed = allow_transpose && tensor.sequence() == dimensions
+        && tensor.dimension() == 512;
+    if (tensor.batch() != 1 || tensor.head() != heads ||
+        (!transposed && (tensor.sequence() != 512 || tensor.dimension() != dimensions))) {
+        throw std::runtime_error(std::string("unexpected QNN boundary shape: ") + label + " "
+                                 + std::to_string(tensor.batch()) + "x" + std::to_string(tensor.head())
+                                 + "x" + std::to_string(tensor.sequence()) + "x" + std::to_string(tensor.dimension()));
+    }
+    const std::string filename = std::string(label) + ".bin";
+    if (std::filesystem::exists(dir / filename)) {
+        throw std::runtime_error("QNN boundary output already exists: " + filename);
+    }
+    std::ofstream file(dir / filename, std::ios::binary);
+    const char *dtype;
+    switch (tensor.dtype()) {
+    case MLLM_TYPE_I16:
+        dtype = "i16";
+        writeProjectionRows<int16_t>(tensor, file, transposed, heads, dimensions);
+        break;
+    case MLLM_TYPE_F16:
+        dtype = "f16";
+        writeProjectionRows<mllm_fp16_t>(tensor, file, transposed, heads, dimensions);
+        break;
+    case MLLM_TYPE_F32:
+        dtype = "f32";
+        writeProjectionRows<float>(tensor, file, transposed, heads, dimensions);
+        break;
+    default:
+        throw std::runtime_error(std::string("unexpected QNN boundary dtype: ") + label);
+    }
+    file.close();
+    if (!file) throw std::runtime_error("writing QNN boundary failed: " + filename);
+    metadata << label << '\t' << tensor.name() << '\t' << dtype << '\t'
+             << (transposed ? "BHDS" : "BHSD") << '\t' << heads << '\t'
+             << dimensions << "\t2032\t16\t" << filename << '\n';
+}
+
+void dumpProjectionBoundary(const std::filesystem::path &dir, QNNModuleWrapper &graph) {
+    if (graph.inputs_.size() != 1 || graph.outputs_.size() != 3) {
+        throw std::runtime_error("unexpected layer 0 QNN boundary tensor count");
+    }
+    if (std::filesystem::exists(dir / "metadata.tsv")) {
+        throw std::runtime_error("QNN boundary metadata already exists");
+    }
+    std::ofstream metadata(dir / "metadata.tsv");
+    metadata << "boundary\ttensor\tdtype\tnative_order\theads\tdim\tfirst_token\trows\tfile\n";
+    writeProjectionBoundary(dir, metadata, *graph.inputs_[0], "qkv-input", 1, 1536, false);
+    writeProjectionBoundary(dir, metadata, *graph.outputs_[0], "q-proj", 12, 128, false);
+    writeProjectionBoundary(dir, metadata, *graph.outputs_[1], "k-proj", 2, 128, false);
+    writeProjectionBoundary(dir, metadata, *graph.outputs_[2], "v-proj", 2, 128, true);
+    metadata.close();
+    if (!metadata) throw std::runtime_error("writing QNN boundary metadata failed");
+}
+
 std::string answerBeforeEndMarker(const std::string &text) {
     size_t end = text.size();
     for (const std::string marker : {std::string("\0", 1),
@@ -198,6 +271,8 @@ int main(int argc, char **argv) {
     cmd_parser.add<std::string>(
         "quality-prompt", '\0', "quality prompt: legacy or records", false,
         "legacy");
+    cmd_parser.add<std::string>("projection-dump-dir", '\0',
+        "capture native layer-0 QNN input and Q/K/V on the last 16 input tokens", false, "");
     cmd_parser.parse_check(argc, argv);
 
     const int chunk_size = cmd_parser.get<int>("chunk-size");
@@ -245,6 +320,14 @@ int main(int argc, char **argv) {
     if (chunk_overlap_policy != "auto" && chunk_overlap_policy != "on"
         && chunk_overlap_policy != "off") {
         std::cerr << "chunk-overlap must be auto, on, or off" << std::endl;
+        return 2;
+    }
+    const auto projection_dump = cmd_parser.get<std::string>("projection-dump-dir");
+    if (!projection_dump.empty() &&
+        (prompt_token_file.empty() || prompt_token_count != 2048 || chunk_size != 512
+         || attention_mode != "dense" || chunk_overlap_policy != "off"
+         || !std::filesystem::is_directory(projection_dump))) {
+        std::cerr << "projection dump requires an existing directory, exact 2K input, and dense logical M512" << std::endl;
         return 2;
     }
     const int padded_prompt_tokens =
@@ -426,9 +509,25 @@ int main(int argc, char **argv) {
         || (chunk_overlap_policy == "auto" && attention_mode != "hmx-topk");
     const std::string chunk_schedule = parallel_chunks
         ? "overlap" : "chunk-major";
+    std::function<void(int, Module &)> after_graph;
+    bool projection_dumped = false;
+    if (!projection_dump.empty()) {
+        after_graph = [&](int chunk_id, Module &graph) {
+            if (chunk_id != 3) return;
+            auto *qnn_graph = dynamic_cast<QNNModuleWrapper *>(&graph);
+            if (qnn_graph != nullptr && qnn_graph->name_ == "model.layers.0.subgraph_start1") {
+                dumpProjectionBoundary(projection_dump, *qnn_graph);
+                projection_dumped = true;
+            }
+        };
+    }
     auto prefill_result = pipeline.run(
         input_tensor, prefill_opt, tokenizer, model, is_switched, {},
-        parallel_chunks, !cpu_last_token_refine);
+        parallel_chunks, !cpu_last_token_refine, after_graph);
+    if (after_graph && !projection_dumped) {
+        std::cerr << "missing layer 0 QNN boundary" << std::endl;
+        return 5;
+    }
     const int64_t npu_prefill_end_us = mllm_time_us();
     const auto attention_profile = CPUAttentionProfiler::snapshot();
     const auto sparse_selection = CPUSparseSelectionStats::snapshot();

@@ -7,6 +7,7 @@
 #include "Trace.hpp"
 #include "Types.hpp"
 #include "tokenizers/Tokenizer.hpp"
+#include <functional>
 #include <memory>
 #include <stdexcept>
 
@@ -54,7 +55,8 @@ public:
                            bool &isSwitched,
                            const vector<Tensor *> &clean_tensors = {},
                            bool parallel_chunks = true,
-                           bool print_first_token = true) {
+                           bool print_first_token = true,
+                           const std::function<void(int, Module &)> &after_graph = {}) {
         if (input_tensor.backend() == nullptr) {
             throw std::invalid_argument("chunk pipeline input tensor must have a backend");
         }
@@ -103,6 +105,7 @@ public:
 #endif
             auto &graph = Tracer::model_[i];
             graph->Forward({}, {chunk_id});
+            if (after_graph) after_graph(chunk_id, *graph);
 #ifdef DEBUGPRINT
             auto graph_end = mllm_time_us();
             std::cout << "chunk_id: " << chunk_id << ", graphIdx: " << i << ", graph time: " << (graph_end - graph_start) / 1000.0F << "ms" << std::endl;
