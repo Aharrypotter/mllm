@@ -161,6 +161,11 @@ public:
     virtual void onExecuteStart(vector<shared_ptr<Tensor>> &inputs, vector<shared_ptr<Tensor>> &outputs, string graphName = "") override;
     virtual void onExecuteEnd(std::vector<shared_ptr<Tensor>> &outputs, const string &graph_name) override{};
 
+    auto sequenceTileLogicalBindings(const std::string &graph_name) const {
+        const auto &state = sequenceTileGraphs_.at(graph_name);
+        return std::make_pair(state.logical_inputs, state.logical_outputs);
+    }
+
     // std::vector<Tensor> runFunc(
     //     std::vector<std::string> out_names,
     //     TensorFuncType type,

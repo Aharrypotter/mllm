@@ -201,18 +201,29 @@ void writeProjectionBoundary(const std::filesystem::path &dir, std::ofstream &me
 }
 
 void dumpProjectionBoundary(const std::filesystem::path &dir, QNNModuleWrapper &graph) {
-    if (graph.inputs_.size() != 1 || graph.outputs_.size() != 3) {
-        throw std::runtime_error("unexpected layer 0 QNN boundary tensor count");
+    const auto &backend = static_cast<const QNNBackend &>(*Backend::global_backends[MLLM_QNN]);
+    auto [inputs, outputs] = backend.sequenceTileLogicalBindings(graph.name_);
+    if (inputs.size() != 1 || outputs.size() != 3) {
+        throw std::runtime_error("unexpected layer 0 logical QNN boundary count");
     }
+    const auto output = [&](const char *projection) -> Tensor & {
+        auto match = std::find_if(outputs.begin(), outputs.end(), [&](const auto &tensor) {
+            return tensor->name().find(projection) != std::string::npos;
+        });
+        if (match == outputs.end()) {
+            throw std::runtime_error(std::string("missing logical QNN projection: ") + projection);
+        }
+        return **match;
+    };
     if (std::filesystem::exists(dir / "metadata.tsv")) {
         throw std::runtime_error("QNN boundary metadata already exists");
     }
     std::ofstream metadata(dir / "metadata.tsv");
     metadata << "boundary\ttensor\tdtype\tnative_order\theads\tdim\tfirst_token\trows\tfile\n";
-    writeProjectionBoundary(dir, metadata, *graph.inputs_[0], "qkv-input", 1, 1536, false);
-    writeProjectionBoundary(dir, metadata, *graph.outputs_[0], "q-proj", 12, 128, false);
-    writeProjectionBoundary(dir, metadata, *graph.outputs_[1], "k-proj", 2, 128, false);
-    writeProjectionBoundary(dir, metadata, *graph.outputs_[2], "v-proj", 2, 128, true);
+    writeProjectionBoundary(dir, metadata, *inputs[0], "qkv-input", 1, 1536, false);
+    writeProjectionBoundary(dir, metadata, output(".q_proj"), "q-proj", 12, 128, false);
+    writeProjectionBoundary(dir, metadata, output(".k_proj"), "k-proj", 2, 128, false);
+    writeProjectionBoundary(dir, metadata, output(".v_proj"), "v-proj", 2, 128, true);
     metadata.close();
     if (!metadata) throw std::runtime_error("writing QNN boundary metadata failed");
 }
@@ -516,8 +527,12 @@ int main(int argc, char **argv) {
             if (chunk_id != 3) return;
             auto *qnn_graph = dynamic_cast<QNNModuleWrapper *>(&graph);
             if (qnn_graph != nullptr && qnn_graph->name_ == "model.layers.0.subgraph_start1") {
-                dumpProjectionBoundary(projection_dump, *qnn_graph);
-                projection_dumped = true;
+                try {
+                    dumpProjectionBoundary(projection_dump, *qnn_graph);
+                    projection_dumped = true;
+                } catch (const std::exception &error) {
+                    std::cerr << "QNN boundary observer: " << error.what() << std::endl;
+                }
             }
         };
     }
