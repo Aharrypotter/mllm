@@ -10,7 +10,8 @@
 #include "backends/cpu/third_party/ggml/Quantize.hpp"
 using namespace mllm;
 
-ErrorCode mat_mul(Tensor *src0_, Tensor *src1, Tensor *dst, bool support_bias, Tensor *bias = nullptr, bool transpose0 = false, bool transpose1 = true, int thread_count = 4);
+ErrorCode mat_mul(Tensor *src0_, Tensor *src1, Tensor *dst, bool support_bias, Tensor *bias = nullptr, bool transpose0 = false, bool transpose1 = true, int thread_count = 4,
+                  bool widen_fp16_accumulation = false);
 
 ErrorCode mat_mul_i8(Tensor *src0, Tensor *src1, Tensor *dst, bool support_bias, Tensor *bias = nullptr, bool transpose0 = false, bool transpose1 = false, int thread_count = 4, float scale1 = 1.0f, float scale2 = 1.0f);
 

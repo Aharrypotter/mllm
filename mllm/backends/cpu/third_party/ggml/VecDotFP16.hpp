@@ -31,3 +31,4 @@
 // using namespace mllm;
 
 void vec_dot_fp16(const int n, float *__restrict s, const mllm_fp16_t *__restrict vx, const mllm_fp16_t *__restrict vy);
+void vec_dot_fp16_accumulate_f32(int n, float *s, const void *x, const void *y);

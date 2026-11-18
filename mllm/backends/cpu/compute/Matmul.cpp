@@ -4,6 +4,7 @@
 
 #include "Matmul.hpp"
 #include "Types.hpp"
+#include "backends/cpu/third_party/ggml/VecDotFP16.hpp"
 #include "backends/cpu/third_party/ggml/VecDotType.hpp"
 #include "backends/cpu/third_party/ggml/GemmLlamafile.hpp"
 #include <cassert>
@@ -17,7 +18,7 @@
 #endif
 
 ErrorCode mat_mul(Tensor *src0, Tensor *src1, Tensor *dst, bool support_bias, Tensor *bias,
-                  bool transpose0, bool transpose1, int thread_count) {
+                  bool transpose0, bool transpose1, int thread_count, bool widen_fp16_accumulation) {
     // src1 = W  src0 = x
     // transpose0=false  transpose1=true
     const int M = transpose0 ? src0->dimension() : src0->sequence();
@@ -29,7 +30,8 @@ ErrorCode mat_mul(Tensor *src0, Tensor *src1, Tensor *dst, bool support_bias, Te
     auto dst_dtype = dst->dtype();
 
     auto vec_dot_type = type_traits[src1_dtype].vec_dot_type;
-    auto vec_dot = type_traits[src1_dtype].vec_dot;
+    const bool widen_fp16_dot = widen_fp16_accumulation && src1_dtype == MLLM_TYPE_F16;
+    const auto vec_dot = widen_fp16_dot ? vec_dot_fp16_accumulate_f32 : type_traits[src1_dtype].vec_dot;
     auto x_to_vec_dot_type = type_traits[vec_dot_type].from_float;
     auto from_float_to_mat = type_traits[vec_dot_type].from_float_to_mat;
     gemv_func const gemv = type_traits[src1_dtype].gemv;
@@ -45,7 +47,7 @@ ErrorCode mat_mul(Tensor *src0, Tensor *src1, Tensor *dst, bool support_bias, Te
     int ld_src1 = src1->sequenceSkipDim();
     int ld_src0 = src0->sequenceSkipDim();
     int ld_dst = dst->sequenceSkipDim();
-    if (check_llamafile_sgemm(N, M, K / blck_size(src0->dtype()), src1->dtype(), src0->dtype(), dst->dtype(), ld_src1 / src1_blck_size, ld_src0 / src0_blck_size, ld_dst / blck_size(dst->dtype()))
+    if (!widen_fp16_dot && check_llamafile_sgemm(N, M, K / blck_size(src0->dtype()), src1->dtype(), src0->dtype(), dst->dtype(), ld_src1 / src1_blck_size, ld_src0 / src0_blck_size, ld_dst / blck_size(dst->dtype()))
         && dst->ctype() == BSHD && dst->aggregatedTensors().empty()) {
         int is_0 = (src1->batch() == 1 && src1->head() == 1 && src1->batch() != src0->batch()) ? 0 : 1;
 #pragma omp parallel for collapse(3) num_threads(thread_count)
@@ -123,7 +125,7 @@ ErrorCode mat_mul(Tensor *src0, Tensor *src1, Tensor *dst, bool support_bias, Te
     ld_src1 = src1->sequenceSkipDim();
     ld_src0 = src0->sequenceSkipDim();
     ld_dst = dst->sequenceSkipDim();
-    if (check_llamafile_sgemm(N, M, K / blck_size(src1->dtype()), src1->dtype(), src0->dtype(),
+    if (!widen_fp16_dot && check_llamafile_sgemm(N, M, K / blck_size(src1->dtype()), src1->dtype(), src0->dtype(),
                               dst->dtype(), ld_src1 / src1_blck_size, ld_src0 / src0_blck_size, ld_dst / blck_size(dst->dtype()))
         && dst->dtypeAt(0, 0, 0, 0) == MLLM_TYPE_F32 && dst->ctype() == BSHD
         && dst->aggregatedTensors().empty()) {

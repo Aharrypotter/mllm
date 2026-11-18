@@ -62,3 +62,25 @@ void vec_dot_fp16(const int n, float *__restrict s, const mllm_fp16_t *__restric
 
     *s = sumf;
 }
+
+void vec_dot_fp16_accumulate_f32(int n, float *s, const void *x, const void *y) {
+    const auto *vx = static_cast<const mllm_fp16_t *>(x);
+    const auto *vy = static_cast<const mllm_fp16_t *>(y);
+    int i = 0;
+    float sum = 0.0F;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    float32x4_t low = vdupq_n_f32(0.0F);
+    float32x4_t high = vdupq_n_f32(0.0F);
+    for (; i + 8 <= n; i += 8) {
+        const auto a = vld1q_f16(vx + i);
+        const auto b = vld1q_f16(vy + i);
+        low = vfmaq_f32(low, vcvt_f32_f16(vget_low_f16(a)), vcvt_f32_f16(vget_low_f16(b)));
+        high = vfmaq_f32(high, vcvt_f32_f16(vget_high_f16(a)), vcvt_f32_f16(vget_high_f16(b)));
+    }
+    sum = vaddvq_f32(vaddq_f32(low, high));
+#endif
+    for (; i < n; ++i) {
+        sum += MLLM_FP16_TO_FP32(vx[i]) * MLLM_FP16_TO_FP32(vy[i]);
+    }
+    *s = sum;
+}

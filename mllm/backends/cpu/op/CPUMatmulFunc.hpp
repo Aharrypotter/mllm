@@ -261,7 +261,11 @@ private:
         }
         bool isSame = std::equal(inputs[0]->chls().begin(), inputs[0]->chls().end(), inputs[1]->chls().begin());
         assert(inputs[0]->dtype() == MLLM_TYPE_F32);
-        mat_mul(inputs[0].get(), inputs[1].get(), outputs[0].get(), false, nullptr, false, isSame, thread_count);
+        const char *wide_qk = std::getenv("MLLM_QWEN_QK_FP32_ACCUMULATION");
+        const bool widen_fp16_qk = attention_worker_ && output_divisor_ != 1.0F && inputs[0]->sequence() > 1
+            && wide_qk != nullptr && std::strcmp(wide_qk, "1") == 0;
+        mat_mul(inputs[0].get(), inputs[1].get(), outputs[0].get(), false, nullptr, false, isSame,
+                thread_count, widen_fp16_qk);
         applyOutputDivisor(outputs[0]);
         logAttentionOutput(outputs[0]);
         return MLLM_NO_ERROR;
