@@ -243,8 +243,8 @@ bool dumpAttentionBoundary(const std::filesystem::path &dir, CPUModuleWrapper &g
         throw std::runtime_error("unexpected first attention quantizer bindings");
     }
     std::ofstream metadata(dir / "metadata.tsv", std::ios::app);
-    writeProjectionBoundary(dir, metadata, *call.opInputs.front(), "attention", 1, 1536, false);
-    writeProjectionBoundary(dir, metadata, *call.opOutputs.front(), "attention-quantized", 1, 1536, false);
+    writeProjectionBoundary(dir, metadata, *call.opInputs.front(), "attention", 12, 128, false);
+    writeProjectionBoundary(dir, metadata, *call.opOutputs.front(), "attention-quantized", 12, 128, false);
     metadata.close();
     if (!metadata) throw std::runtime_error("writing first attention boundary metadata failed");
     return true;
