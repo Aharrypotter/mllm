@@ -11,6 +11,8 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #if defined(__linux__)
@@ -43,6 +45,97 @@
 namespace mllm::qnn {
 
 namespace {
+
+bool sequenceTileNodeProfileRequested(std::string_view graph) {
+  static const std::string selected_graphs = [] {
+    const auto* value = std::getenv("MLLM_QNN_NODE_PROFILE_GRAPHS");
+    return std::string(value ? value : "");
+  }();
+  std::string_view remaining = selected_graphs;
+  while (!remaining.empty()) {
+    const auto comma = remaining.find(',');
+    if (remaining.substr(0, comma) == graph) { return true; }
+    if (comma == std::string_view::npos) { break; }
+    remaining.remove_prefix(comma + 1);
+  }
+  return false;
+}
+
+class ScopedQnnNodeProfile {
+ public:
+  ScopedQnnNodeProfile(const QNN_INTERFACE_VER_TYPE& api, Qnn_BackendHandle_t backend,
+                       const std::string& graph, bool requested)
+      : api_(api), graph_(graph) {
+    if (!requested) { return; }
+    if (!api_.profileCreate || !api_.profileGetEvents || !api_.profileGetSubEvents || !api_.profileGetEventData
+        || !api_.profileFree) {
+      MLLM_WARN("QNN_NODE_PROFILE_UNAVAILABLE graph={} reason=missing_profile_api", graph_);
+      return;
+    }
+    const auto status = api_.profileCreate(backend, QNN_PROFILE_LEVEL_DETAILED, &handle_);
+    MLLM_INFO("QNN_NODE_PROFILE_CREATE graph={} status={} has_handle={}", graph_, status, handle_ != nullptr);
+    if (status != QNN_PROFILE_NO_ERROR && handle_) {
+      api_.profileFree(handle_);
+      handle_ = nullptr;
+    }
+  }
+
+  ~ScopedQnnNodeProfile() {
+    if (handle_) { api_.profileFree(handle_); }
+  }
+  ScopedQnnNodeProfile(const ScopedQnnNodeProfile&) = delete;
+  ScopedQnnNodeProfile& operator=(const ScopedQnnNodeProfile&) = delete;
+
+  Qnn_ProfileHandle_t handle() const { return handle_; }
+
+  void dump() {
+    if (!handle_) { return; }
+    const QnnProfile_EventId_t* events = nullptr;
+    uint32_t count = 0;
+    const auto status = api_.profileGetEvents(handle_, &events, &count);
+    MLLM_INFO("QNN_NODE_PROFILE_ROOT graph={} status={} root_count={}", graph_, status, count);
+    if (status != QNN_PROFILE_NO_ERROR || (count != 0 && !events)) { return; }
+    for (uint32_t i = 0; i < count && !truncated_; ++i) { dumpEvent(events[i], 0, 0); }
+    MLLM_INFO("QNN_NODE_PROFILE_END graph={} events={} truncated={} read_errors={}", graph_, events_, truncated_, errors_);
+  }
+
+ private:
+  void dumpEvent(QnnProfile_EventId_t id, QnnProfile_EventId_t parent, unsigned depth) {
+    if (depth >= 8 || events_ >= 4096) {
+      truncated_ = true;
+      return;
+    }
+    ++events_;
+    QnnProfile_EventData_t data = QNN_PROFILE_EVENT_DATA_INIT;
+    const auto status = api_.profileGetEventData(id, &data);
+    if (status == QNN_PROFILE_NO_ERROR) {
+      std::string identifier = data.identifier ? data.identifier : "";
+      std::replace(identifier.begin(), identifier.end(), '\n', ' ');
+      std::replace(identifier.begin(), identifier.end(), '\r', ' ');
+      MLLM_INFO("QNN_NODE_PROFILE_EVENT graph={} depth={} id={} parent={} type={} unit={} value={} ident={}", graph_, depth,
+                id, parent, data.type, data.unit, data.value, identifier);
+    } else {
+      ++errors_;
+      MLLM_WARN("QNN_NODE_PROFILE_DATA_ERROR graph={} id={} status={}", graph_, id, status);
+    }
+    const QnnProfile_EventId_t* children = nullptr;
+    uint32_t count = 0;
+    const auto child_status = api_.profileGetSubEvents(id, &children, &count);
+    if (child_status != QNN_PROFILE_NO_ERROR || (count != 0 && !children)) {
+      ++errors_;
+      MLLM_WARN("QNN_NODE_PROFILE_CHILD_ERROR graph={} id={} status={}", graph_, id, child_status);
+      return;
+    }
+    for (uint32_t i = 0; i < count && !truncated_; ++i) { dumpEvent(children[i], id, depth + 1); }
+  }
+
+  const QNN_INTERFACE_VER_TYPE& api_;
+  const std::string& graph_;
+  Qnn_ProfileHandle_t handle_ = nullptr;
+  unsigned events_ = 0;
+  unsigned errors_ = 0;
+  bool truncated_ = false;
+};
 
 bool sequenceTileGraphProfilingEnabled() {
   static const bool enabled = [] {
@@ -939,6 +1032,8 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
     const auto elapsed_us = [](clock::time_point start, clock::time_point end) {
       return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
     };
+    const bool profile_graph_nodes = sequenceTileNodeProfileRequested(graphName);
+    const bool profile_first_call = profile_graph_nodes && state.profile.graph_calls == 0;
     SequenceTileProfile calls;
     calls.graph_calls = 1;
     calls.tile_calls = state.tile_count;
@@ -950,10 +1045,15 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
       }
       calls.input_copy_us += elapsed_us(stage_start, clock::now());
 
+      // Sample one compiled tile per selected graph. The vendor events are diagnostic data.
+      ScopedQnnNodeProfile node_profile(runtime_->qnnInterface, runtime_->backendHandle, graphName,
+                                        profile_first_call && tile_index == 0);
+      const auto profile_handle = node_profile.handle() ? node_profile.handle() : runtime_->profileHandle;
       stage_start = clock::now();
       CALL_QNN(runtime_->qnnInterface.graphExecute(model->getQnnGraph(), qnn_inputs.data(), qnn_inputs.size(),
-                                                   qnn_outputs.data(), qnn_outputs.size(), runtime_->profileHandle, nullptr));
+                                                   qnn_outputs.data(), qnn_outputs.size(), profile_handle, nullptr));
       calls.execute_us += elapsed_us(stage_start, clock::now());
+      node_profile.dump();
 
       stage_start = clock::now();
       for (size_t index = 0; index < outputs.size(); ++index) {
@@ -963,7 +1063,7 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
       calls.output_copy_us += elapsed_us(stage_start, clock::now());
     }
     accumulateTileCalls(sequenceTileProfile_, calls);
-    if (sequenceTileGraphProfilingEnabled()) { accumulateTileCalls(state.profile, calls); }
+    if (sequenceTileGraphProfilingEnabled() || profile_graph_nodes) { accumulateTileCalls(state.profile, calls); }
     if (ProfilingLevel::OFF != profilingLevel_) { extractBackendProfilingInfo(runtime_->profileHandle); }
     return;
   }
