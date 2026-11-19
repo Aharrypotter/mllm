@@ -31,39 +31,63 @@ inline auto makeRoPEInvFreq(int output_dim, float rope_theta) -> Tensor {
   return inv_freq;
 }
 
-inline auto stageHmxPrefillKV(Tensor states) -> Tensor {
 #if defined(MLLM_HOST_ARCH_ARM64)
-  static const bool direct_cast = [] {
+inline bool hmxDirectKVCastEnabled() {
+  static const bool enabled = [] {
     const char* value = std::getenv("MLLM_HMX_DIRECT_KV_CAST");
     return value && value[0] == '1' && value[1] == '\0';
   }();
-  if (direct_cast && !Context::instance().thisThread()->trace_mode && states.device() == kCPU
-      && states.dtype() == kFloat32 && !states.isContiguous()) {
-    const auto shape = states.shape();
+  return enabled;
+}
+
+inline bool supportsDirectHmxKVStage(const Tensor& states) {
+  const auto shape = states.shape();
+  if (states.device() != kCPU || states.dtype() != kFloat32 || shape.size() != 4 || shape[0] != 1 || shape[1] <= 0
+      || shape[2] <= 0 || shape[3] <= 0) {
+    return false;
+  }
+  const auto stride = states.stride();
+  const int64_t head_elements = static_cast<int64_t>(shape[2]) * shape[3];
+  return stride[3] == 1 && stride[2] == shape[3] && stride[1] >= head_elements
+         && head_elements <= std::numeric_limits<int>::max();
+}
+#endif
+
+inline auto stageHmxPrefillKV(Tensor states, int head_group_size = 1) -> Tensor {
+#if defined(MLLM_HOST_ARCH_ARM64)
+  if (hmxDirectKVCastEnabled() && !Context::instance().thisThread()->trace_mode
+      && (head_group_size > 1 || !states.isContiguous()) && supportsDirectHmxKVStage(states)) {
+    auto shape = states.shape();
     const auto stride = states.stride();
-    if (shape.size() == 4 && shape[0] == 1 && shape[1] > 0 && shape[2] > 0 && shape[3] > 0
-        && stride[3] == 1 && stride[2] == shape[3]) {
-      const int64_t head_elements = static_cast<int64_t>(shape[2]) * shape[3];
-      if (head_elements <= std::numeric_limits<int>::max() && stride[1] >= head_elements) {
-        auto staged = Tensor::empty(shape, kFloat16, kCPU).alloc();
-        const auto* input = states.ptr<mllm_fp32_t>();
-        auto* output = staged.ptr<mllm_fp16_t>();
-        for (int64_t head = 0; head < shape[1]; ++head) {
-          cpu::arm::fp32_2_fp16(input + head * stride[1], output + head * head_elements,
-                                static_cast<int>(head_elements), 1);
-        }
-        static std::once_flag log_first_cast;
-        std::call_once(log_first_cast, [&] {
-          MLLM_INFO("SHADOWNPU_HMX_DIRECT_KV_CAST head_stride={} live_head_elements={} heads={}", stride[1],
-                    head_elements, shape[1]);
-        });
-        return staged;
-      }
+    const int64_t head_elements = static_cast<int64_t>(shape[2]) * shape[3];
+    const int64_t repeated_heads = shape[1];
+    MLLM_RT_ASSERT(head_group_size > 0 && repeated_heads % head_group_size == 0);
+    shape[1] /= head_group_size;
+    auto staged = Tensor::empty(shape, kFloat16, kCPU).alloc();
+    const auto* input = states.ptr<mllm_fp32_t>();
+    auto* output = staged.ptr<mllm_fp16_t>();
+    for (int64_t head = 0; head < shape[1]; ++head) {
+      const int64_t source_head = head * head_group_size;
+      cpu::arm::fp32_2_fp16(input + source_head * stride[1], output + head * head_elements,
+                           static_cast<int>(head_elements), 1);
     }
+    static std::once_flag log_first_cast;
+    std::call_once(log_first_cast, [&] {
+      MLLM_INFO("SHADOWNPU_HMX_DIRECT_KV_CAST head_stride={} live_head_elements={} heads={}", stride[1], head_elements,
+                repeated_heads);
+    });
+    if (head_group_size > 1) {
+      static std::once_flag log_first_compact_cast;
+      std::call_once(log_first_compact_cast, [&] {
+        MLLM_INFO("SHADOWNPU_HMX_COMPACT_KV_STAGE query_heads={} kv_heads={} group_size={}", repeated_heads, shape[1],
+                  head_group_size);
+      });
+    }
+    return staged;
   }
 #endif
-  // The live BHSD view can retain the full-capacity head stride. The normal
-  // cast expects contiguous data, including each physically repeated GQA head.
+  MLLM_RT_ASSERT(head_group_size == 1);
+  // The live BHSD view can retain the full-capacity head stride.
   return states.contiguous().to(kFloat16);
 }
 
@@ -348,8 +372,23 @@ class QwenAttentionMatmul final : public nn::Module {
     if (use_sparse_prefill_attention_ && S > 1) {
       if (use_pattern_sparse_prefill_attention_) {
         if (use_hmx_key_staging_) {
-          const auto sparse_key_states = stageHmxPrefillKV(key_states);
-          const auto sparse_value_states = stageHmxPrefillKV(value_states);
+          int kv_head_group_size = 1;
+#if defined(MLLM_HOST_ARCH_ARM64)
+          static const bool compact_kv_stage = [] {
+            const char* value = std::getenv("MLLM_HMX_COMPACT_KV_STAGE");
+            return value && value[0] == '1' && value[1] == '\0';
+          }();
+          // StaticCache stores replicas of each KV head consecutively. Both
+          // sparse attention and the HMX selector already map query heads to KV heads.
+          if (compact_kv_stage && num_key_value_groups_ > 1 && hmxDirectKVCastEnabled()
+              && !Context::instance().thisThread()->trace_mode && supportsDirectHmxKVStage(key_states)
+              && supportsDirectHmxKVStage(value_states) && key_states.shape()[1] == num_attention_heads_
+              && value_states.shape()[1] == num_attention_heads_) {
+            kv_head_group_size = num_key_value_groups_;
+          }
+#endif
+          const auto sparse_key_states = stageHmxPrefillKV(key_states, kv_head_group_size);
+          const auto sparse_value_states = stageHmxPrefillKV(value_states, kv_head_group_size);
           output =
               pattern_sparse_attention_(query_states.to(kFloat32), sparse_key_states, sparse_value_states, sparse_key_states);
         } else {
