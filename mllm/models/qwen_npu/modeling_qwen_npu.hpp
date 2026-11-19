@@ -524,14 +524,18 @@ class QwenDecoder final : public nn::Module {
     auto x = inputs[0];
     x = attentionFromProjection(self_attn_proj_(x.to(kQNN)), inputs[1], inputs[2]);
     auto residual = inputs[0];
-    auto out_mlp_states = self_attn_out_mlp_(x, residual.to(kQNN));
+    return {finishMlp(x, residual.to(kQNN))};
+  }
+
+  Tensor finishMlp(const Tensor& attention, const Tensor& residual) {
+    auto out_mlp_states = self_attn_out_mlp_(attention, residual);
     if (shadow_down_proj_) {
       MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 3);
-      return {down_proj_shadow_correction_(out_mlp_states[0].to(kCPU).contiguous(), out_mlp_states[1].to(kCPU).contiguous(),
-                                          out_mlp_states[2].to(kCPU).contiguous())};
+      return down_proj_shadow_correction_(out_mlp_states[0].to(kCPU).contiguous(), out_mlp_states[1].to(kCPU).contiguous(),
+                                          out_mlp_states[2].to(kCPU).contiguous());
     }
     MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 1);
-    return out_mlp_states;
+    return out_mlp_states[0];
   }
 
   Tensor attentionFromProjection(std::vector<Tensor> states, const Tensor& sin, const Tensor& cos) {
@@ -579,7 +583,7 @@ class QwenMlpAndNextQkv final : public nn::Module {
 
 class QwenText final : public nn::Module {
   nn::ModuleListWithIdx<QwenDecoder> decode_blocks_;
-  std::vector<QwenMlpAndNextQkv> cross_layer_graphs_;
+  std::vector<std::optional<QwenMlpAndNextQkv>> cross_layer_graphs_;
   nn::RMSNorm norm_;
   bool capture_layer_outputs_ = false;
   std::vector<Tensor> captured_layer_outputs_;
@@ -590,16 +594,23 @@ class QwenText final : public nn::Module {
   QwenText(const std::string& name, const QwenNPUConfig& cfg) : nn::Module(name) {
     decode_blocks_ = reg<nn::ModuleListWithIdx<QwenDecoder>>("layers", cfg.num_hidden_layers, cfg);
     if (cfg.qnn_cross_layer_graphs) {
-      if (!cfg.qnn_qkv_bias_after_dequant || cfg.num_hidden_layers < 2 || !cfg.shadow_down_proj_layers.empty()) {
-        throw std::invalid_argument("Qwen cross-layer QNN graphs require post-dequantization QKV bias and no shadow correction");
+      if (!cfg.qnn_qkv_bias_after_dequant || cfg.num_hidden_layers < 2) {
+        throw std::invalid_argument("Qwen cross-layer QNN graphs require at least two layers and post-dequantization QKV bias");
       }
       auto& blocks = decode_blocks_.list();
       cross_layer_graphs_.reserve(blocks.size() - 1);
-      for (size_t index = 0; index + 1 < blocks.size(); ++index) {
-        cross_layer_graphs_.emplace_back(blocks[index].getModuleName() + "_2", blocks[index], blocks[index + 1]);
+      for (size_t index = 0; index < blocks.size(); ++index) {
+        auto& block = blocks[index];
+        const auto graph_name = block.getModuleName() + "_2";
+        block.self_attn_out_mlp_.impl()->setAbsoluteName(graph_name);
+        if (index + 1 == blocks.size()) { break; }
+        // The next QKV projection must see the CPU-corrected residual at these boundaries.
+        if (block.shadow_down_proj_) {
+          cross_layer_graphs_.emplace_back(std::nullopt);
+        } else {
+          cross_layer_graphs_.emplace_back(std::in_place, graph_name, block, blocks[index + 1]);
+        }
       }
-      // Keep the final MLP graph eligible for the same HVX operators as the fused graphs.
-      blocks.back().self_attn_out_mlp_.impl()->setAbsoluteName(blocks.back().getModuleName() + "_2");
     }
 
     norm_ = reg<nn::RMSNorm>("norm", cfg.rms_norm_eps);
@@ -630,15 +641,21 @@ class QwenText final : public nn::Module {
       x = x.to(kQNN);
       auto qkv = blocks.front().self_attn_proj_(x);
       for (size_t index = 0; index < cross_layer_graphs_.size(); ++index) {
-        auto attention = blocks[index].attentionFromProjection(std::move(qkv), llm_embedding_sin, llm_embedding_cos);
-        auto next = cross_layer_graphs_[index](attention, x);
-        x = next[0];
-        qkv = {next[1], next[2], next[3]};
+        auto& block = blocks[index];
+        auto attention = block.attentionFromProjection(std::move(qkv), llm_embedding_sin, llm_embedding_cos);
+        if (auto& fused = cross_layer_graphs_[index]) {
+          auto next = (*fused)(attention, x);
+          x = next[0];
+          qkv = {next[1], next[2], next[3]};
+        } else {
+          x = block.finishMlp(attention, x).to(kQNN);
+          qkv = blocks[index + 1].self_attn_proj_(x);
+        }
         if (capture_layer_outputs_) { captured_layer_outputs_.push_back(x.to(kCPU).contiguous()); }
       }
       auto& last = blocks.back();
       auto attention = last.attentionFromProjection(std::move(qkv), llm_embedding_sin, llm_embedding_cos);
-      x = last.self_attn_out_mlp_(attention, x)[0];
+      x = last.finishMlp(attention, x);
       if (capture_layer_outputs_) { captured_layer_outputs_.push_back(x.to(kCPU).contiguous()); }
     }
 

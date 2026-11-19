@@ -484,8 +484,10 @@ int main(int argc, char** argv) {
       ::mllm::shutdownContext();
       return 2;
     }
+    const auto shadow_boundaries = std::count_if(cpu_cfg.shadow_down_proj_layers.begin(), cpu_cfg.shadow_down_proj_layers.end(),
+                                                 [&](int32_t layer) { return layer + 1 < cpu_cfg.num_hidden_layers; });
     fmt::print("SHADOWNPU_QNN_CROSS_LAYER_GRAPHS layers={} graph_count={}\n", cpu_cfg.num_hidden_layers,
-               cpu_cfg.num_hidden_layers + 1);
+               cpu_cfg.num_hidden_layers + 1 + shadow_boundaries);
   }
   if (cpu_cfg.qnn_qkv_bias_after_dequant) {
     fmt::print("SHADOWNPU_QKV_BIAS_ORDER mode=after_dequantization\n");
