@@ -272,14 +272,16 @@ public:
         } else {
             auto qk = Tensor::attention_mm(
                 q, k.transpose(Chl::SEQUENCE, Chl::DIMENSION),
-                std::sqrt(static_cast<float>(head_dim)));
+                std::sqrt(static_cast<float>(head_dim)),
+                Tensor::AttentionMatmulRole::QueryKey);
             if (sparse_prompt) {
                 o = Tensor::sparse_softmax_value(
                     qk, v, prefill_attention_sparsity, true, 0,
                     prefill_attention_head_retentions);
             } else {
                 qk = softmax(qk);
-                o = Tensor::attention_mm(qk, v);
+                o = Tensor::attention_mm(
+                    qk, v, 1.0F, Tensor::AttentionMatmulRole::ProbabilityValue);
             }
         }
 

@@ -891,8 +891,11 @@ public:
     // Dense-attention matmul executed by the optional persistent attention
     // worker. output_divisor is fused into the matmul task so QK scaling does
     // not fall back to the model thread between QK and softmax.
+    enum class AttentionMatmulRole { Unspecified, QueryKey, ProbabilityValue };
     static Tensor attention_mm(Tensor input0, Tensor input1,
                                float output_divisor = 1.0F);
+    static Tensor attention_mm(Tensor input0, Tensor input1,
+                               float output_divisor, AttentionMatmulRole role);
     Tensor norm(int L_n);
     Tensor where(float value, Chl axis);
     static Tensor range(int start, int end);

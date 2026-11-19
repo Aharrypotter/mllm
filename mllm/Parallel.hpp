@@ -6,6 +6,7 @@
 #include "Tensor.hpp"
 #include "Trace.hpp"
 #include "Types.hpp"
+#include "backends/cpu/AttentionProfiler.hpp"
 #include "tokenizers/Tokenizer.hpp"
 #include <functional>
 #include <memory>
@@ -86,6 +87,7 @@ public:
             chunked_tensors[chunk_id]->shallowCopyFrom(input_copy_sp, false, {0, 0, chunk_id * chunk_size, 0}, 1);
         }
 
+        const bool profile_graphs = CPUAttentionProfiler::enabled();
         std::function<void(int, int)> executeFunc = [&](int chunk_id, int graphIdx) {
             int i = graphIdx - chunk_id;
             // out of range
@@ -104,7 +106,16 @@ public:
             auto graph_start = mllm_time_us();
 #endif
             auto &graph = Tracer::model_[i];
+            const auto graph_start_ns = profile_graphs ? CPUAttentionProfiler::nowNs() : 0;
             graph->Forward({}, {chunk_id});
+            if (profile_graphs) {
+                const auto elapsed = CPUAttentionProfiler::nowNs() - graph_start_ns;
+                const bool is_qnn = dynamic_cast<QNNModuleWrapper *>(graph.get()) != nullptr;
+                CPUAttentionProfiler::add(
+                    is_qnn ? AttentionProfileStage::PREFILL_QNN_GRAPH
+                           : AttentionProfileStage::PREFILL_CPU_GRAPH,
+                    elapsed);
+            }
             if (after_graph) after_graph(chunk_id, *graph);
 #ifdef DEBUGPRINT
             auto graph_end = mllm_time_us();

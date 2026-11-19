@@ -952,6 +952,14 @@ int main(int argc, char **argv) {
         const auto profile_calls = [&](AttentionProfileStage stage) {
             return attention_profile.callCount(stage);
         };
+        std::cout << std::fixed << std::setprecision(3)
+                  << "QWEN_PREFILL_GRAPH_PROFILE"
+                  << " scope=" << (parallel_chunks ? "summed_overlapping" : "chunk_major")
+                  << " cpu_ms=" << profile_ms(AttentionProfileStage::PREFILL_CPU_GRAPH)
+                  << " cpu_calls=" << profile_calls(AttentionProfileStage::PREFILL_CPU_GRAPH)
+                  << " qnn_ms=" << profile_ms(AttentionProfileStage::PREFILL_QNN_GRAPH)
+                  << " qnn_calls=" << profile_calls(AttentionProfileStage::PREFILL_QNN_GRAPH)
+                  << std::endl;
         const double legacy_profiled_attention_wall_ms =
             profile_ms(AttentionProfileStage::QK)
             + profile_ms(AttentionProfileStage::DENSE_SOFTMAX)

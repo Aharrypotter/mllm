@@ -34,6 +34,7 @@ private:
     int thread_count = 4;
     bool attention_worker_ = false;
     float output_divisor_ = 1.0F;
+    Tensor::AttentionMatmulRole attention_role_;
 
     static void tranTensorChl(Tensor &input) {
         transposeAttentionValueChannels(input);
@@ -42,10 +43,12 @@ private:
 public:
     CPUmmFunction(Backend *bn, string name, int threadCount,
                   bool attention_worker = false,
-                  float output_divisor = 1.0F) :
+                  float output_divisor = 1.0F,
+                  Tensor::AttentionMatmulRole attention_role =
+                      Tensor::AttentionMatmulRole::Unspecified) :
         Op(bn, name), thread_count(threadCount),
         attention_worker_(attention_worker),
-        output_divisor_(output_divisor) {
+        output_divisor_(output_divisor), attention_role_(attention_role) {
     }
 
     ErrorCode setUp(vector<shared_ptr<Tensor>> inputs, vector<shared_ptr<Tensor>> outputs) override {
@@ -191,12 +194,14 @@ private:
         logAttentionInputs(inputs, outputs);
         const bool profile_attention = CPUAttentionProfiler::enabled()
             && inputs[0]->sequence() > 1;
-        // PhoneLM uses D=160 and chunked K lengths that are multiples of 64.
-        // QK has lhs.dimension()==160, while P*V has output.dimension()==160.
-        // Tensor names aren't used because traced cache views can rename them.
+        using Role = Tensor::AttentionMatmulRole;
+        // The traced Qwen call sites carry the role. Keep the original
+        // PhoneLM classification for callers that supply no role.
         const bool profile_dense_pv = profile_attention
-            && inputs[0]->dimension() != 160
-            && outputs[0]->dimension() == 160;
+            && (attention_role_ == Role::ProbabilityValue
+                || (attention_role_ == Role::Unspecified
+                    && inputs[0]->dimension() != 160
+                    && outputs[0]->dimension() == 160));
         ScopedAttentionProfile profile(
             profile_dense_pv ? AttentionProfileStage::DENSE_PV
                              : AttentionProfileStage::QK,
@@ -277,10 +282,14 @@ public:
     virtual Op *create(OpParam op_param, Backend *bn, string name, int threadCount) const override {
         const auto attention_it = op_param.find("attention_worker");
         const auto divisor_it = op_param.find("output_divisor");
+        const auto role_it = op_param.find("attention_matmul_role");
         return new CPUmmFunction(
             bn, name, threadCount,
             attention_it != op_param.end() && attention_it->second != 0.0F,
-            divisor_it == op_param.end() ? 1.0F : divisor_it->second);
+            divisor_it == op_param.end() ? 1.0F : divisor_it->second,
+            role_it == op_param.end() ? Tensor::AttentionMatmulRole::Unspecified
+                : static_cast<Tensor::AttentionMatmulRole>(
+                    static_cast<int>(role_it->second)));
     }
 };
 

@@ -648,9 +648,18 @@ Tensor Tensor::mm(Tensor input0, Tensor input1) {
 
 Tensor Tensor::attention_mm(Tensor input0, Tensor input1,
                             float output_divisor) {
+    return attention_mm(input0, input1, output_divisor,
+                        AttentionMatmulRole::Unspecified);
+}
+
+Tensor Tensor::attention_mm(Tensor input0, Tensor input1,
+                            float output_divisor, AttentionMatmulRole role) {
     OpParam param;
     param["attention_worker"] = 1.0F;
     param["output_divisor"] = output_divisor;
+    if (role != AttentionMatmulRole::Unspecified) {
+        param["attention_matmul_role"] = static_cast<float>(role);
+    }
     string nname = input0.name() + "-attention-mm-" + input1.name();
     return runFunc({nname}, F_MM, param, {input0, input1})[0];
 }

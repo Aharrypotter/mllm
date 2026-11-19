@@ -46,6 +46,8 @@ enum class AttentionProfileStage : size_t {
     HMX_TOPK,
     HMX_BUFFER_FREE,
     HMX_SESSION_FINALIZE,
+    PREFILL_CPU_GRAPH,
+    PREFILL_QNN_GRAPH,
     COUNT,
 };
 
