@@ -3,7 +3,12 @@
 
 #include <arm_neon.h>
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #include "mllm/utils/Common.hpp"
 #include "mllm/backends/cpu/kernels/arm/mllm_blas/mllm_blas_sgemm.hpp"
@@ -363,6 +368,108 @@ static inline void dispatch_tile_nt_t(int rm, int rn, const float* a, int64_t ld
 #undef KERNEL
 }
 __MLLM_UNSAFE_OPT_END
+constexpr int kPvRows = 512;
+constexpr int kPvCols = 128;
+constexpr int kPvTileRows = 8;
+constexpr int kPvTileCols = 16;
+constexpr int kPvRowTiles = kPvRows / kPvTileRows;
+constexpr int kPvColTiles = kPvCols / kPvTileCols;
+constexpr uint32_t kFp32Magnitude = 0x7fffffffU;
+constexpr uint32_t kFp32Infinity = 0x7f800000U;
+
+bool pvTailIsZero(const float* weights, int prefix, int cutoff) {
+  const uint32x4_t magnitude = vdupq_n_u32(kFp32Magnitude);
+  for (int row = 0; row < kPvTileRows; ++row) {
+    const float* row_weights = weights + row * prefix;
+    uint32x4_t nonzero = vdupq_n_u32(0);
+    for (int key = cutoff; key < prefix; key += 4) {
+      const auto bits = vreinterpretq_u32_f32(vld1q_f32(row_weights + key));
+      nonzero = vorrq_u32(nonzero, bits);
+    }
+    if (vmaxvq_u32(vandq_u32(nonzero, magnitude)) != 0) return false;
+  }
+  return true;
+}
+
+bool pvValuesAreFinite(const float* values, int prefix) {
+  const uint32x4_t magnitude = vdupq_n_u32(kFp32Magnitude);
+  uint32x4_t maximum = vdupq_n_u32(0);
+  // Earlier values are used by every row tile, including the first tile.
+  for (int i = (prefix - kPvRows + kPvTileRows) * kPvCols; i < prefix * kPvCols; i += 4) {
+    const auto bits = vreinterpretq_u32_f32(vld1q_f32(values + i));
+    maximum = vmaxq_u32(maximum, vandq_u32(bits, magnitude));
+  }
+  return vmaxvq_u32(maximum) < kFp32Infinity;
+}
+
+bool pvNeedsFullReduction(const float* output) {
+  const uint32x4_t magnitude = vdupq_n_u32(kFp32Magnitude);
+  for (int row = 0; row < kPvTileRows; ++row) {
+    for (int col = 0; col < kPvTileCols; col += 4) {
+      const auto bits = vreinterpretq_u32_f32(vld1q_f32(output + row * kPvCols + col));
+      const auto absolute = vandq_u32(bits, magnitude);
+      // Redo signed zero and nonfinite results to preserve the baseline bits.
+      if (vminvq_u32(absolute) == 0 || vmaxvq_u32(absolute) >= kFp32Infinity) return true;
+    }
+  }
+  return false;
+}
+
+void guardedBatchedPrefillPv(int heads, int prefix, int dst_stride, int weight_stride, int value_stride, float* dst,
+                            const float* weights, const float* values, int threads) {
+  static const bool diagnostic = [] {
+    const char* value = std::getenv("MLLM_QWEN_NPU_CAUSAL_PV_DIAGNOSTIC");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  int shortened_tiles = 0;
+  std::atomic<int> recomputed_tiles{0};
+  for (int head = 0; head < heads; ++head) {
+    const float* head_weights = weights + static_cast<int64_t>(head) * weight_stride;
+    const float* head_values = values + static_cast<int64_t>(head) * value_stride;
+    float* head_dst = dst + static_cast<int64_t>(head) * dst_stride;
+    if (!pvValuesAreFinite(head_values, prefix)) {
+      __mllm_blas_sgemm_nt_nt(kPvRows, kPvCols, prefix, head_weights, prefix, head_values, kPvCols, head_dst, kPvCols, 0,
+                              threads);
+      continue;
+    }
+
+    std::array<int, kPvRowTiles> lengths;
+    for (int tile = 0; tile < kPvRowTiles; ++tile) {
+      const int row = tile * kPvTileRows;
+      const int cutoff = prefix - kPvRows + row + kPvTileRows;
+      lengths[tile] = cutoff < prefix && pvTailIsZero(head_weights + row * prefix, prefix, cutoff) ? cutoff : prefix;
+      if (diagnostic && lengths[tile] < prefix) shortened_tiles += kPvColTiles;
+    }
+
+    MLLM_CONDITIONAL_PARALLEL_FOR(threads > 1, threads, job, 0, kPvRowTiles * kPvColTiles, 1, {
+      const int tile = job / kPvColTiles;
+      const int row = tile * kPvTileRows;
+      const int col = (job % kPvColTiles) * kPvTileCols;
+      const float* tile_weights = head_weights + row * prefix;
+      const float* tile_values = head_values + col;
+      float* tile_dst = head_dst + row * kPvCols + col;
+      const int k = lengths[tile];
+      dispatch_tile(kPvTileRows, kPvTileCols, tile_weights, prefix, tile_values, kPvCols, tile_dst, kPvCols, k);
+      if (k < prefix && pvNeedsFullReduction(tile_dst)) {
+        dispatch_tile(kPvTileRows, kPvTileCols, tile_weights, prefix, tile_values, kPvCols, tile_dst, kPvCols, prefix);
+        if (diagnostic) recomputed_tiles.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+  if (diagnostic) {
+    std::fprintf(stderr, "SHADOWNPU_CAUSAL_PV prefix=%d heads=%d shortened_tiles=%d recomputed_tiles=%d\n", prefix, heads,
+                 shortened_tiles, recomputed_tiles.load(std::memory_order_relaxed));
+  }
+}
+
+bool guardedPrefillPvEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("MLLM_QWEN_NPU_CAUSAL_PV");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
 }  // namespace
 
 bool __mllm_blas_sgemm_nt_nt(int64_t m, int64_t n, int64_t k, const float* A, int64_t lda, const float* B, int64_t ldb,
@@ -458,6 +565,12 @@ void mllm_blas_batch_matmul_fp32(const int BATCH, const int M, const int K, cons
     // gemm
     {
       if (C) { NYI("C not supported in mllm_blas_batch_matmul_fp32::__mllm_blas_sgemm_nt_nt"); }
+      if (BATCH == 12 && M == kPvRows && N == kPvCols && K >= M && K <= 4096 && K % M == 0
+          && Dst_batch_stride >= M * N && A_batch_stride >= M * K && B_batch_stride >= K * N
+          && thread_count > 0 && guardedPrefillPvEnabled()) {
+        guardedBatchedPrefillPv(BATCH, K, Dst_batch_stride, A_batch_stride, B_batch_stride, dst, A, B, thread_count);
+        return;
+      }
       // Parallel is in the inner loops, not here.
       for (int i = 0; i < BATCH; ++i) {
         __mllm_blas_sgemm_nt_nt(M, N, K, A + i * A_batch_stride, K, B + i * B_batch_stride, N, dst + i * Dst_batch_stride, N, 0,
