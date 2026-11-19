@@ -364,6 +364,21 @@ class QwenAttentionMatmul final : public nn::Module {
       // attention weight
       // [B, H, S, S]
       Tensor attn;
+#if defined(MLLM_HOST_ARCH_ARM64) && !defined(MLLM_USE_BLAS)
+      static const bool fused_qk = [] {
+        const char* value = std::getenv("MLLM_QWEN_NPU_CAUSAL_QK");
+        return value && value[0] == '1' && value[1] == '\0';
+      }();
+      const int prefix = fused_qk ? key_states.shape()[2] : 0;
+      if (fused_qk && !Context::instance().thisThread()->trace_mode && B == 1 && S == 512 && head_dim_ == 128
+          && num_attention_heads_ == 12 && prefix >= S && prefix <= 4096 && prefix % S == 0 && query_states.device() == kCPU
+          && key_states.device() == kCPU && query_states.dtype() == kFloat32 && key_states.dtype() == kFloat32
+          && query_states.stride()[3] == 1 && query_states.stride()[2] == head_dim_
+          && key_states.stride()[3] == 1 && key_states.stride()[2] == head_dim_) {
+        attn = nn::functional::matmul(query_states, key_states, false, true, aops::MatMulOpType::kCausalScaledQK);
+        attn = softmax_(attn);
+      } else
+#endif
       if (key_states.dtype() == kFloat32) {
         attn = nn::functional::matmul(query_states, key_states, false, true) * (1.f / sqrtf(head_dim_));
         attn = mask_(attn);

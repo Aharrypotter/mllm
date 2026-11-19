@@ -239,12 +239,13 @@ inline __m512 load(const mllm_fp16_t* p) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // FLOATING POINT MATRIX MULTIPLICATION
 
-template<int KN, typename D, typename V, typename TA, typename TB, typename TC>
+template<int KN, typename D, typename V, typename TA, typename TB, typename TC, bool CausalScaled = false>
 class tinyBLAS {
  public:
   tinyBLAS(int64_t k, const TA* A, int64_t lda, const TB* B, int64_t ldb, TC* C, int64_t ldc, int ith, int nth,
-           const float* bias = nullptr)
-      : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth), bias(bias) {}
+           const float* bias = nullptr, int64_t causal_offset = 0, float scale = 1.f)
+      : A(A), B(B), bias(bias), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth),
+        causal_offset(causal_offset), scale(scale) {}
 
   void matmul(int64_t m, int64_t n) { mnpack(0, m, 0, n); }
 
@@ -411,6 +412,13 @@ class tinyBLAS {
     for (int64_t job = start; job < end; ++job) {
       int64_t ii = m0 + job / xtiles * RM;
       int64_t jj = n0 + job % xtiles * RN;
+      if constexpr (CausalScaled) {
+        if (ii > causal_offset + jj + RN - 1) {
+          for (int64_t j = 0; j < RN; ++j)
+            for (int64_t i = 0; i < RM; ++i) C[ldc * (jj + j) + ii + i] = -1e10f;
+          continue;
+        }
+      }
       D Cv[RN][RM] = {};
       for (int64_t l = 0; l < k; l += KN) {
         for (int64_t j = 0; j < RN; ++j) {
@@ -420,7 +428,16 @@ class tinyBLAS {
         }
       }
 
-      if (bias) {
+      if constexpr (CausalScaled) {
+        if (ii + RM - 1 <= causal_offset + jj) {
+          for (int64_t j = 0; j < RN; ++j)
+            for (int64_t i = 0; i < RM; ++i) C[ldc * (jj + j) + ii + i] = hsum(Cv[j][i]) * scale;
+        } else {
+          for (int64_t j = 0; j < RN; ++j)
+            for (int64_t i = 0; i < RM; ++i)
+              C[ldc * (jj + j) + ii + i] = ii + i <= causal_offset + jj + j ? hsum(Cv[j][i]) * scale : -1e10f;
+        }
+      } else if (bias) {
         for (int64_t j = 0; j < RN; ++j) {
           for (int64_t i = 0; i < RM; ++i) C[ldc * (jj + j) + (ii + i)] = bias[ii + i] + hsum(Cv[j][i]);
         }
@@ -442,6 +459,8 @@ class tinyBLAS {
   const int64_t ldc;
   const int ith;
   const int nth;
+  const int64_t causal_offset;
+  const float scale;
 };
 
 //////////////////////////////////////////////////////////////////////////////////////////
@@ -954,6 +973,15 @@ bool llamafile_sgemm(int64_t m, int64_t n, int64_t k, const void* A, int64_t lda
   (void)Btype;
   (void)Ctype;
 }
+
+#if defined(__ARM_NEON)
+void llamafile_causal_scaled_qk_f32(int64_t keys, int64_t queries, int64_t width, const float* key, const float* query,
+                                    float* out, float scale, int ith, int nth) {
+  tinyBLAS<4, float32x4_t, float32x4_t, float, float, float, true> tb{
+      width, key, width, query, width, out, keys, ith, nth, nullptr, keys - queries, scale};
+  tb.matmul(keys, queries);
+}
+#endif
 
 bool check_llamafile_sgemm(int64_t m, int64_t n, int64_t k, DataTypes Atype, DataTypes Btype, DataTypes Ctype, int64_t lda,
                            int64_t ldb, int64_t ldc) {

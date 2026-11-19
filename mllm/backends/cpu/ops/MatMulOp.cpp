@@ -1,14 +1,19 @@
 // Copyright (c) MLLM Team.
 // Licensed under the MIT License.
 
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include "mllm/core/DataTypes.hpp"
+#include "mllm/core/Parallel.hpp"
 #include "mllm/core/aops/MatMulOp.hpp"
 #include "mllm/utils/Common.hpp"
 #include "mllm/backends/cpu/ops/MatMulOp.hpp"
 #include "mllm/backends/cpu/kernels/Kernels.hpp"
 #include "mllm/backends/cpu/kernels/common/ggml/matmul.hpp"
 #include "mllm/backends/cpu/kernels/common/blas.hpp"
+#include "mllm/backends/cpu/kernels/common/llamafile/llamafile_sgemm.hpp"
 
 namespace mllm::cpu {
 
@@ -89,6 +94,39 @@ void CPUMatMulOp::forward(const std::vector<Tensor>& inputs, std::vector<Tensor>
       }
 #else
       NYI("BLAS not supported. Pls set MLLM_USE_BLAS=ON to enable BLAS supports in cmake.");
+#endif
+      break;
+    }
+    case aops::MatMulOpType::kCausalScaledQK: {
+#if defined(__ARM_NEON)
+      MLLM_RT_ASSERT(!transpose_a && transpose_b && M > 1 && N >= M && K > 0 && K % 4 == 0);
+      MLLM_RT_ASSERT(lhs_shape.size() == 4 && rhs_shape.size() == 4 && lhs_shape[0] == 1 && rhs_shape[0] == 1);
+      MLLM_RT_ASSERT(lhs.dtype() == kFloat32 && rhs.dtype() == kFloat32 && o.dtype() == kFloat32);
+      const auto query_strides = lhs.stride();
+      const auto key_strides = rhs.stride();
+      const auto out_strides = o.stride();
+      MLLM_RT_ASSERT(query_strides[3] == 1 && query_strides[2] == K && key_strides[3] == 1 && key_strides[2] == K);
+      MLLM_RT_ASSERT(out_strides[3] == 1 && out_strides[2] == N);
+      MLLM_RT_ASSERT(query_strides[1] >= static_cast<int64_t>(M) * K && key_strides[1] >= static_cast<int64_t>(N) * K
+                        && out_strides[1] >= static_cast<int64_t>(M) * N);
+      const auto threads = options_.getThreads();
+      MLLM_RT_ASSERT(threads > 0);
+      const float scale = 1.f / sqrtf(K);
+      for (int head = 0; head < batch_count; ++head) {
+        const auto* query = lhs.ptr<float>() + static_cast<int64_t>(head) * query_strides[1];
+        const auto* key = rhs.ptr<float>() + static_cast<int64_t>(head) * key_strides[1];
+        auto* out = o.ptr<float>() + static_cast<int64_t>(head) * out_strides[1];
+        MLLM_CONDITIONAL_PARALLEL_FOR(threads > 1, threads, id, 0, threads, 1, {
+          llamafile_causal_scaled_qk_f32(N, M, K, key, query, out, scale, id, threads);
+        });
+      }
+      static const bool diagnostic = [] {
+        const char* value = std::getenv("MLLM_QWEN_NPU_CAUSAL_QK_DIAGNOSTIC");
+        return value && std::strcmp(value, "1") == 0;
+      }();
+      if (diagnostic) std::fprintf(stderr, "SHADOWNPU_CAUSAL_QK prefix=%d queries=%d heads=%d\n", N, M, batch_count);
+#else
+      NYI("CausalScaledQK requires ARM NEON");
 #endif
       break;
     }
