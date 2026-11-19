@@ -361,9 +361,6 @@ class QwenAttentionMatmul final : public nn::Module {
         output = sparse_softmax_value_(logits, value_states);
       }
     } else {
-      // attention weight
-      // [B, H, S, S]
-      Tensor attn;
 #if defined(MLLM_HOST_ARCH_ARM64) && !defined(MLLM_USE_BLAS)
       static const bool fused_qk = [] {
         const char* value = std::getenv("MLLM_QWEN_NPU_CAUSAL_QK");
@@ -375,23 +372,42 @@ class QwenAttentionMatmul final : public nn::Module {
           && key_states.device() == kCPU && query_states.dtype() == kFloat32 && key_states.dtype() == kFloat32
           && query_states.stride()[3] == 1 && query_states.stride()[2] == head_dim_
           && key_states.stride()[3] == 1 && key_states.stride()[2] == head_dim_) {
-        attn = nn::functional::matmul(query_states, key_states, false, true, aops::MatMulOpType::kCausalScaledQK);
-        attn = softmax_(attn);
+        static const bool stream_heads = [] {
+          const char* value = std::getenv("MLLM_QWEN_NPU_DENSE_HEAD_STREAMING");
+          return value && value[0] == '1' && value[1] == '\0';
+        }();
+        if (stream_heads && value_states.device() == kCPU && value_states.dtype() == kFloat32
+            && value_states.stride()[3] == 1 && value_states.stride()[2] == head_dim_) {
+          std::vector<Tensor> heads;
+          heads.reserve(num_attention_heads_);
+          for (int head = 0; head < num_attention_heads_; ++head) {
+            const SliceIndices slice{kAll, {head, head + 1}, kAll, kAll};
+            // The scores and probabilities can be released before the next head.
+            auto weights = softmax_(nn::functional::matmul(query_states[slice], key_states[slice], false, true,
+                                                            aops::MatMulOpType::kCausalScaledQK));
+            heads.emplace_back(nn::functional::matmul(weights, value_states[slice]));
+          }
+          output = nn::functional::concat(heads, 1);
+        } else {
+          auto attn = softmax_(nn::functional::matmul(query_states, key_states, false, true, aops::MatMulOpType::kCausalScaledQK));
+          output = nn::functional::matmul(attn, value_states.to(attn.dtype()));
+        }
       } else
 #endif
-      if (key_states.dtype() == kFloat32) {
-        attn = nn::functional::matmul(query_states, key_states, false, true) * (1.f / sqrtf(head_dim_));
-        attn = mask_(attn);
-        attn = softmax_(attn);
-      } else if (key_states.dtype() == kFloat16) {
-        attn =
-            nn::functional::matmul(query_states.to(kFloat32), key_states.to(kFloat32), false, true) * (1.f / sqrtf(head_dim_));
-        attn = mask_(attn);
-        attn = softmax_(attn);
+      {
+        Tensor attn;
+        if (key_states.dtype() == kFloat32) {
+          attn = nn::functional::matmul(query_states, key_states, false, true) * (1.f / sqrtf(head_dim_));
+          attn = mask_(attn);
+          attn = softmax_(attn);
+        } else if (key_states.dtype() == kFloat16) {
+          attn = nn::functional::matmul(query_states.to(kFloat32), key_states.to(kFloat32), false, true)
+                 * (1.f / sqrtf(head_dim_));
+          attn = mask_(attn);
+          attn = softmax_(attn);
+        }
+        output = nn::functional::matmul(attn, value_states.to(attn.dtype()));
       }
-
-      // [B, H, S, S] @ [B, H, S, D] -> [B, H, S, D]
-      output = nn::functional::matmul(attn, value_states.to(attn.dtype()));
     }
     // [B, H, S, D] -> [B, S, H, D] -> [B, S, H * D]
     output = output.transpose(1, 2).view({B, S, num_attention_heads_ * head_dim_});
