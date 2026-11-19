@@ -160,15 +160,17 @@ bool QNNMulPattern::addNode(const std::string& graphName, const ir::op_ptr_t& op
   constexpr std::string_view layer_prefix = "model.layers.";
   bool use_hvx = false;
   if (request != nullptr && std::string_view(request) == "1" && graph.starts_with(layer_prefix)
-      && (graph.ends_with("_1") || graph.ends_with("_2")) && node_name == graphName + ".Mul.0") {
+      && (graph.ends_with("_1") || graph.ends_with("_2")) && node_name == graphName + ".Mul.0"
+      && inputs.size() == 2 && outputs.size() == 1) {
     // The output graph is _1 after the QKV graph receives its own name, and _2 in the fused-bias trace.
     const auto layer = graph.substr(layer_prefix.size(), graph.size() - layer_prefix.size() - 2);
-    const Tensor::shape_t expected_shape{1, 256, 1, 8960};
-    const auto matches_tile = [&expected_shape](const auto& value) {
-      return value->tensor_.dtype() == kFloat32 && value->tensor_.shape() == expected_shape;
+    const auto& shape = inputs[0]->tensor_.shape();
+    const bool supported_tile = shape == Tensor::shape_t{1, 256, 1, 8960} || shape == Tensor::shape_t{1, 16, 16, 8960};
+    const auto matches_tile = [&shape](const auto& value) {
+      return value->tensor_.dtype() == kFloat32 && value->tensor_.shape() == shape;
     };
-    use_hvx = !layer.empty() && layer.find_first_not_of("0123456789") == std::string_view::npos && inputs.size() == 2
-              && outputs.size() == 1 && matches_tile(inputs[0]) && matches_tile(inputs[1]) && matches_tile(outputs[0]);
+    use_hvx = supported_tile && !layer.empty() && layer.find_first_not_of("0123456789") == std::string_view::npos
+              && matches_tile(inputs[0]) && matches_tile(inputs[1]) && matches_tile(outputs[0]);
   }
   if (use_hvx) {
     qnnBackend->graphAddNode(graphName, node_name + ".llama_hvx_f32", "LLaMAMul", inputTensorNames, {outputs[0]->name()}, {},

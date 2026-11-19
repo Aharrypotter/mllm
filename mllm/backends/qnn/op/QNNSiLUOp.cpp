@@ -73,11 +73,11 @@ bool QNNSiLUPattern::addNode(const std::string& graphName, const ir::op_ptr_t& o
     // Only change the FP32 gate activation of Qwen 1.5B at the compiled M256 shape.
     const auto layer_name = graph.substr(0, graph.size() - 2);
     const auto layer = layer_name.substr(layer_prefix.size());
-    const Tensor::shape_t expected_shape{1, 256, 1, 8960};
-    use_hvx = !layer.empty() && layer.find_first_not_of("0123456789") == std::string_view::npos
-              && node_name == std::string(layer_name) + ".mlp.act"
-              && inputs[0]->tensor_.dtype() == kFloat32 && inputs[0]->tensor_.shape() == expected_shape
-              && outputs[0]->tensor_.dtype() == kFloat32 && outputs[0]->tensor_.shape() == expected_shape;
+    const auto& shape = inputs[0]->tensor_.shape();
+    const bool supported_tile = shape == Tensor::shape_t{1, 256, 1, 8960} || shape == Tensor::shape_t{1, 16, 16, 8960};
+    use_hvx = supported_tile && !layer.empty() && layer.find_first_not_of("0123456789") == std::string_view::npos
+              && node_name == std::string(layer_name) + ".mlp.act" && inputs[0]->tensor_.dtype() == kFloat32
+              && outputs[0]->tensor_.dtype() == kFloat32 && outputs[0]->tensor_.shape() == shape;
   }
   if (qnnSiLUOp->options().high_precision && !use_hvx) {
     const auto sigmoidTensorName = qnnSiLUOp->getName() + ".sigmoid";

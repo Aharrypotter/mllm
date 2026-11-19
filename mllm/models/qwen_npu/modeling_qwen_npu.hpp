@@ -404,6 +404,7 @@ class QwenOutProjAndMLP final : public nn::Module {
   int hidden_size_, intermediate_size_;
   bool shadow_down_proj_ = false;
   bool spatial_down_proj_tokens_ = false;
+  bool spatial_mlp_tokens_ = false;
 
  public:
   QwenOutProjAndMLP() = default;
@@ -412,6 +413,7 @@ class QwenOutProjAndMLP final : public nn::Module {
     intermediate_size_ = cfg.intermediate_size;
     shadow_down_proj_ = shadow_down_proj;
     spatial_down_proj_tokens_ = cfg.qnn_down_proj_spatial_tiles;
+    spatial_mlp_tokens_ = cfg.qnn_mlp_spatial_tiles && !shadow_down_proj_;
 
     o_proj_ = reg<nn::Linear>("self_attn.o_proj",
                               aops::LinearOpOptions{.in_channels = cfg.hidden_size,
@@ -466,25 +468,31 @@ class QwenOutProjAndMLP final : public nn::Module {
 
     x = post_attention_layer_norm_(tmp);
 
-    x = x.view({B, S, 1, hidden_size_});
+    constexpr int spatial_width = 16;
+    const bool use_spatial_tiles = S % spatial_width == 0;
+    const int mlp_width = spatial_mlp_tokens_ && use_spatial_tiles ? spatial_width : 1;
+    x = x.view({B, S / mlp_width, mlp_width, hidden_size_});
+    if (mlp_width != 1) {
+      MLLM_INFO("QNN_MLP_SPATIAL_LAYOUT module={} shape=[{},{},{},{}]",
+                getModuleName(), B, S / mlp_width, mlp_width, hidden_size_);
+    }
     x.attach("qnn_quant_scale", pre_mlp_proj_quantize_scale_.weight().impl());
     x = x.to(kInt8);
     auto gate = gate_proj_(x);
-    gate = gate.view({B, S, 1, intermediate_size_});
+    gate = gate.view({B, S / mlp_width, mlp_width, intermediate_size_});
     gate = gate.to(kFloat32);
 
     gate = silu_(gate);
     auto up = up_proj_(x);
-    up = up.view({B, S, 1, intermediate_size_});
+    up = up.view({B, S / mlp_width, mlp_width, intermediate_size_});
     up = up.to(kFloat32);
 
     x = gate * up;
     auto shadow_input = x;
 
-    // Keep token order while exposing a square M256 activation to Conv2d.
-    constexpr int spatial_width = 16;
-    const int token_width = spatial_down_proj_tokens_ && S % spatial_width == 0 ? spatial_width : 1;
-    x = x.view({B, S / token_width, token_width, intermediate_size_});
+    const int token_width = spatial_down_proj_tokens_ && use_spatial_tiles ? spatial_width : mlp_width;
+    // The spatial MLP already produces a square activation for the down projection.
+    if (mlp_width == 1) { x = x.view({B, S / token_width, token_width, intermediate_size_}); }
     if (token_width != 1) {
       MLLM_INFO("QNN_DOWN_PROJ_SPATIAL_LAYOUT module={} shape=[{},{},{},{}]",
                 getModuleName(), B, S / token_width, token_width, intermediate_size_);
