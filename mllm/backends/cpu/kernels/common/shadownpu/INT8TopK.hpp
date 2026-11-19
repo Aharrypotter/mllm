@@ -5,9 +5,14 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 namespace mllm::cpu::shadownpu {
 
@@ -181,19 +186,54 @@ class INT8TopK final {
 
   static bool emitThreshold(const Score* scores, std::size_t score_count, std::size_t keep, Index* indices, Score threshold,
                             std::size_t greater_count) noexcept {
-    const std::size_t threshold_ties_to_take = keep - greater_count;
-    std::size_t threshold_ties_taken = 0;
+    std::size_t ties_remaining = keep - greater_count;
     std::size_t selected = 0;
-    for (std::size_t column = 0; column < score_count; ++column) {
+    std::size_t column = 0;
+#if defined(__aarch64__)
+    const int8x16_t threshold_vector = vdupq_n_s8(threshold);
+    for (; column + 16 <= score_count; column += 16) {
+      const int8x16_t values = vld1q_s8(scores + column);
+      unsigned selected_lanes = laneMask(vcgtq_s8(values, threshold_vector));
+      if (ties_remaining != 0) {
+        unsigned ties = laneMask(vceqq_s8(values, threshold_vector));
+        const auto tie_count = static_cast<std::size_t>(std::popcount(ties));
+        if (tie_count <= ties_remaining) {
+          selected_lanes |= ties;
+          ties_remaining -= tie_count;
+        } else {
+          // Keep the earliest equal scores when this block exhausts the tie budget.
+          while (ties_remaining != 0) {
+            selected_lanes |= 1U << std::countr_zero(ties);
+            ties &= ties - 1U;
+            --ties_remaining;
+          }
+        }
+      }
+      while (selected_lanes != 0) {
+        indices[selected++] = static_cast<Index>(column + std::countr_zero(selected_lanes));
+        selected_lanes &= selected_lanes - 1U;
+      }
+    }
+#endif
+    for (; column < score_count; ++column) {
       const Score score = scores[column];
-      const bool take_threshold = score == threshold && threshold_ties_taken < threshold_ties_to_take;
+      const bool take_threshold = score == threshold && ties_remaining != 0;
       if (score > threshold || take_threshold) {
         indices[selected++] = static_cast<Index>(column);
-        threshold_ties_taken += static_cast<std::size_t>(take_threshold);
+        ties_remaining -= static_cast<std::size_t>(take_threshold);
       }
     }
     return selected == keep;
   }
+
+#if defined(__aarch64__)
+  static unsigned laneMask(uint8x16_t comparisons) noexcept {
+    constexpr std::uint8_t bits[16]{1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    const uint8x16_t weighted = vandq_u8(comparisons, vld1q_u8(bits));
+    return static_cast<unsigned>(vaddv_u8(vget_low_u8(weighted))) |
+           (static_cast<unsigned>(vaddv_u8(vget_high_u8(weighted))) << 8);
+  }
+#endif
 
   static constexpr unsigned bucket(Score score) noexcept { return static_cast<unsigned>(static_cast<int>(score) + 128); }
 };
