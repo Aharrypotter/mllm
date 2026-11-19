@@ -39,6 +39,10 @@ struct QwenNPUConfig : protected ConfigFile {
     qnn_mlp_spatial_tiles = data().value("qnn_mlp_spatial_tiles", false);
     qnn_mlp_spatial_shadow_tiles = data().value("qnn_mlp_spatial_shadow_tiles", false);
     shadow_down_proj_layers = data().value("shadow_down_proj_layers", shadow_down_proj_layers);
+    qnn_cross_layer_graphs = data().value("qnn_cross_layer_graphs", false);
+    if (qnn_cross_layer_graphs && num_hidden_layers < 2) {
+      throw std::invalid_argument("Qwen cross-layer QNN graphs require at least two layers");
+    }
     auto sorted_shadow_layers = shadow_down_proj_layers;
     std::sort(sorted_shadow_layers.begin(), sorted_shadow_layers.end());
     if (std::adjacent_find(sorted_shadow_layers.begin(), sorted_shadow_layers.end()) != sorted_shadow_layers.end()) {
@@ -92,6 +96,7 @@ struct QwenNPUConfig : protected ConfigFile {
   bool qnn_mlp_spatial_tiles = false;
   bool qnn_mlp_spatial_shadow_tiles = false;
   std::vector<int32_t> shadow_down_proj_layers;
+  bool qnn_cross_layer_graphs = false;
   // Rotated checkpoints may carry Q/K/V ranges calibrated before adding their Float32 biases.
   bool qnn_qkv_bias_after_dequant = false;
 
