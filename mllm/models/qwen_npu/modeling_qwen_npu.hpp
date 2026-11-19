@@ -1,13 +1,18 @@
 // Copyright (c) MLLM Team.
 // Licensed under the MIT License.
 
+#include <cstdlib>
+#include <limits>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 
+#include "mllm/backends/cpu/kernels/arm/cast_types.hpp"
 #include "mllm/backends/qnn/CustomLayers.hpp"
 #include "mllm/compile/ir/Trace.hpp"
 #include "mllm/core/DataTypes.hpp"
 #include "mllm/core/DeviceTypes.hpp"
+#include "mllm/engine/Context.hpp"
 #include "mllm/mllm.hpp"
 #include "mllm/nn/Module.hpp"
 #include "mllm/nn/Nn.hpp"
@@ -26,15 +31,41 @@ inline auto makeRoPEInvFreq(int output_dim, float rope_theta) -> Tensor {
   return inv_freq;
 }
 
-inline auto stageHmxSelectorKey(Tensor key_states) -> Tensor {
-  // StaticCache returns the live sequence as a BHSD view whose head stride
-  // still reflects the full cache capacity. Materialize that logical view
-  // before converting it so every repeated GQA head reaches the F16 selector
-  // input instead of reading the unused capacity between heads.
-  return key_states.contiguous().to(kFloat16);
+inline auto stageHmxPrefillKV(Tensor states) -> Tensor {
+#if defined(MLLM_HOST_ARCH_ARM64)
+  static const bool direct_cast = [] {
+    const char* value = std::getenv("MLLM_HMX_DIRECT_KV_CAST");
+    return value && value[0] == '1' && value[1] == '\0';
+  }();
+  if (direct_cast && !Context::instance().thisThread()->trace_mode && states.device() == kCPU
+      && states.dtype() == kFloat32 && !states.isContiguous()) {
+    const auto shape = states.shape();
+    const auto stride = states.stride();
+    if (shape.size() == 4 && shape[0] == 1 && shape[1] > 0 && shape[2] > 0 && shape[3] > 0
+        && stride[3] == 1 && stride[2] == shape[3]) {
+      const int64_t head_elements = static_cast<int64_t>(shape[2]) * shape[3];
+      if (head_elements <= std::numeric_limits<int>::max() && stride[1] >= head_elements) {
+        auto staged = Tensor::empty(shape, kFloat16, kCPU).alloc();
+        const auto* input = states.ptr<mllm_fp32_t>();
+        auto* output = staged.ptr<mllm_fp16_t>();
+        for (int64_t head = 0; head < shape[1]; ++head) {
+          cpu::arm::fp32_2_fp16(input + head * stride[1], output + head * head_elements,
+                                static_cast<int>(head_elements), 1);
+        }
+        static std::once_flag log_first_cast;
+        std::call_once(log_first_cast, [&] {
+          MLLM_INFO("SHADOWNPU_HMX_DIRECT_KV_CAST head_stride={} live_head_elements={} heads={}", stride[1],
+                    head_elements, shape[1]);
+        });
+        return staged;
+      }
+    }
+  }
+#endif
+  // The live BHSD view can retain the full-capacity head stride. The normal
+  // cast expects contiguous data, including each physically repeated GQA head.
+  return states.contiguous().to(kFloat16);
 }
-
-inline auto stageHmxSparseValue(Tensor value_states) -> Tensor { return value_states.contiguous().to(kFloat16); }
 
 inline auto makeRotaryPosEmbedding(Tensor& position_ids, const Tensor& inv_freq, float attention_scaling = 1.0f)
     -> std::pair<Tensor, Tensor> {
@@ -317,8 +348,8 @@ class QwenAttentionMatmul final : public nn::Module {
     if (use_sparse_prefill_attention_ && S > 1) {
       if (use_pattern_sparse_prefill_attention_) {
         if (use_hmx_key_staging_) {
-          const auto sparse_key_states = stageHmxSelectorKey(key_states);
-          const auto sparse_value_states = stageHmxSparseValue(value_states);
+          const auto sparse_key_states = stageHmxPrefillKV(key_states);
+          const auto sparse_value_states = stageHmxPrefillKV(value_states);
           output =
               pattern_sparse_attention_(query_states.to(kFloat32), sparse_key_states, sparse_value_states, sparse_key_states);
         } else {
