@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -415,8 +416,36 @@ bool pvNeedsFullReduction(const float* output) {
   return false;
 }
 
+using PvClock = std::chrono::steady_clock;
+
+long long pvElapsedNs(PvClock::time_point start, PvClock::time_point end) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+}
+
+struct PvProfile {
+  long long value_ns = 0;
+  long long weight_ns = 0;
+  long long execute_ns = 0;
+  long long reduce_ns = 0;
+  long long output_ns = 0;
+  long long redo_ns = 0;
+  int reduce_calls = 0;
+  int output_calls = 0;
+  int redo_calls = 0;
+  int fallback_heads = 0;
+};
+
+struct PvTileTiming {
+  long long reduce_ns = 0;
+  long long output_ns = 0;
+  long long redo_ns = 0;
+  bool checked = false;
+  bool redone = false;
+};
+
+template <bool Profile>
 void guardedBatchedPrefillPv(int heads, int prefix, int dst_stride, int weight_stride, int value_stride, float* dst,
-                            const float* weights, const float* values, int threads) {
+                            const float* weights, const float* values, int threads, PvProfile& profile) {
   static const bool diagnostic = [] {
     const char* value = std::getenv("MLLM_QWEN_NPU_CAUSAL_PV_DIAGNOSTIC");
     return value != nullptr && std::strcmp(value, "1") == 0;
@@ -427,9 +456,21 @@ void guardedBatchedPrefillPv(int heads, int prefix, int dst_stride, int weight_s
     const float* head_weights = weights + static_cast<int64_t>(head) * weight_stride;
     const float* head_values = values + static_cast<int64_t>(head) * value_stride;
     float* head_dst = dst + static_cast<int64_t>(head) * dst_stride;
-    if (!pvValuesAreFinite(head_values, prefix)) {
+    PvClock::time_point phase_start;
+    if constexpr (Profile) phase_start = PvClock::now();
+    const bool values_are_finite = pvValuesAreFinite(head_values, prefix);
+    if constexpr (Profile) {
+      const auto checked = PvClock::now();
+      profile.value_ns += pvElapsedNs(phase_start, checked);
+      phase_start = checked;
+    }
+    if (!values_are_finite) {
       __mllm_blas_sgemm_nt_nt(kPvRows, kPvCols, prefix, head_weights, prefix, head_values, kPvCols, head_dst, kPvCols, 0,
                               threads);
+      if constexpr (Profile) {
+        profile.execute_ns += pvElapsedNs(phase_start, PvClock::now());
+        ++profile.fallback_heads;
+      }
       continue;
     }
 
@@ -441,6 +482,11 @@ void guardedBatchedPrefillPv(int heads, int prefix, int dst_stride, int weight_s
       if (diagnostic && lengths[tile] < prefix) shortened_tiles += kPvColTiles;
     }
 
+    if constexpr (Profile) profile.weight_ns += pvElapsedNs(phase_start, PvClock::now());
+    // Sample one tile in sixteen and stagger the column and row choices by head.
+    constexpr int sample_stride = 16;
+    std::array<PvTileTiming, Profile ? kPvRowTiles * kPvColTiles / sample_stride : 0> samples{};
+    if constexpr (Profile) phase_start = PvClock::now();
     MLLM_CONDITIONAL_PARALLEL_FOR(threads > 1, threads, job, 0, kPvRowTiles * kPvColTiles, 1, {
       const int tile = job / kPvColTiles;
       const int row = tile * kPvTileRows;
@@ -449,12 +495,47 @@ void guardedBatchedPrefillPv(int heads, int prefix, int dst_stride, int weight_s
       const float* tile_values = head_values + col;
       float* tile_dst = head_dst + row * kPvCols + col;
       const int k = lengths[tile];
+      PvTileTiming* sample = nullptr;
+      PvClock::time_point tile_start;
+      if constexpr (Profile) {
+        if (job % sample_stride == head % sample_stride) {
+          sample = &samples[job / sample_stride];
+          tile_start = PvClock::now();
+        }
+      }
       dispatch_tile(kPvTileRows, kPvTileCols, tile_weights, prefix, tile_values, kPvCols, tile_dst, kPvCols, k);
-      if (k < prefix && pvNeedsFullReduction(tile_dst)) {
+      if (sample) {
+        const auto reduced = PvClock::now();
+        sample->reduce_ns = pvElapsedNs(tile_start, reduced);
+        tile_start = reduced;
+      }
+      const bool needs_full_reduction = k < prefix && pvNeedsFullReduction(tile_dst);
+      if (sample && k < prefix) {
+        const auto checked = PvClock::now();
+        sample->checked = true;
+        sample->output_ns = pvElapsedNs(tile_start, checked);
+        tile_start = checked;
+      }
+      if (needs_full_reduction) {
         dispatch_tile(kPvTileRows, kPvTileCols, tile_weights, prefix, tile_values, kPvCols, tile_dst, kPvCols, prefix);
+        if (sample) {
+          sample->redone = true;
+          sample->redo_ns = pvElapsedNs(tile_start, PvClock::now());
+        }
         if (diagnostic) recomputed_tiles.fetch_add(1, std::memory_order_relaxed);
       }
     });
+    if constexpr (Profile) {
+      profile.execute_ns += pvElapsedNs(phase_start, PvClock::now());
+      for (const auto& sample : samples) {
+        profile.reduce_ns += sample.reduce_ns;
+        profile.output_ns += sample.output_ns;
+        profile.redo_ns += sample.redo_ns;
+        ++profile.reduce_calls;
+        profile.output_calls += sample.checked;
+        profile.redo_calls += sample.redone;
+      }
+    }
   }
   if (diagnostic) {
     std::fprintf(stderr, "SHADOWNPU_CAUSAL_PV prefix=%d heads=%d shortened_tiles=%d recomputed_tiles=%d\n", prefix, heads,
@@ -468,6 +549,15 @@ bool guardedPrefillPvEnabled() {
     return value != nullptr && std::strcmp(value, "1") == 0;
   }();
   return enabled;
+}
+
+int prefillPvProfileMode() {
+  static const int mode = [] {
+    const char* value = std::getenv("MLLM_QWEN_NPU_CAUSAL_PV_PROFILE");
+    if (value != nullptr && std::strcmp(value, "2") == 0) return 2;
+    return value != nullptr && std::strcmp(value, "1") == 0 ? 1 : 0;
+  }();
+  return mode;
 }
 
 }  // namespace
@@ -565,16 +655,34 @@ void mllm_blas_batch_matmul_fp32(const int BATCH, const int M, const int K, cons
     // gemm
     {
       if (C) { NYI("C not supported in mllm_blas_batch_matmul_fp32::__mllm_blas_sgemm_nt_nt"); }
-      if (BATCH == 12 && M == kPvRows && N == kPvCols && K >= M && K <= 4096 && K % M == 0
-          && Dst_batch_stride >= M * N && A_batch_stride >= M * K && B_batch_stride >= K * N
-          && thread_count > 0 && guardedPrefillPvEnabled()) {
-        guardedBatchedPrefillPv(BATCH, K, Dst_batch_stride, A_batch_stride, B_batch_stride, dst, A, B, thread_count);
-        return;
+      const bool prefill_pv = BATCH == 12 && M == kPvRows && N == kPvCols && K >= M && K <= 4096 && K % M == 0
+          && Dst_batch_stride >= M * N && A_batch_stride >= M * K && B_batch_stride >= K * N && thread_count > 0;
+      const bool guarded = prefill_pv && guardedPrefillPvEnabled();
+      const int profile_mode = prefill_pv ? prefillPvProfileMode() : 0;
+      PvClock::time_point pv_start;
+      PvProfile profile;
+      if (profile_mode != 0) pv_start = PvClock::now();
+      if (guarded && profile_mode == 2) {
+        guardedBatchedPrefillPv<true>(BATCH, K, Dst_batch_stride, A_batch_stride, B_batch_stride, dst, A, B, thread_count,
+                                     profile);
+      } else if (guarded) {
+        guardedBatchedPrefillPv<false>(BATCH, K, Dst_batch_stride, A_batch_stride, B_batch_stride, dst, A, B, thread_count,
+                                      profile);
+      } else {
+        // Parallel is in the inner loops, not here.
+        for (int i = 0; i < BATCH; ++i) {
+          __mllm_blas_sgemm_nt_nt(M, N, K, A + i * A_batch_stride, K, B + i * B_batch_stride, N, dst + i * Dst_batch_stride, N,
+                                  0, thread_count);
+        }
       }
-      // Parallel is in the inner loops, not here.
-      for (int i = 0; i < BATCH; ++i) {
-        __mllm_blas_sgemm_nt_nt(M, N, K, A + i * A_batch_stride, K, B + i * B_batch_stride, N, dst + i * Dst_batch_stride, N, 0,
-                                thread_count);
+      if (profile_mode != 0) {
+        std::fprintf(stderr,
+                     "SHADOWNPU_CAUSAL_PV_TIMING prefix=%d heads=%d arm=%s mode=%d total_ns=%lld value_ns=%lld weight_ns=%lld "
+                     "execute_ns=%lld reduce_ns=%lld reduce_calls=%d output_ns=%lld output_calls=%d redo_ns=%lld "
+                     "redo_calls=%d fallback_heads=%d\n",
+                     K, BATCH, guarded ? "guarded" : "baseline", profile_mode, pvElapsedNs(pv_start, PvClock::now()),
+                     profile.value_ns, profile.weight_ns, profile.execute_ns, profile.reduce_ns, profile.reduce_calls,
+                     profile.output_ns, profile.output_calls, profile.redo_ns, profile.redo_calls, profile.fallback_heads);
       }
     }
     return;
