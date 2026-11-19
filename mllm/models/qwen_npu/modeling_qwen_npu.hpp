@@ -538,15 +538,25 @@ class QwenDecoder final : public nn::Module {
   }
 
   std::vector<Tensor> forward(const std::vector<Tensor>& inputs, const std::vector<AnyValue>& args) override {
-    captured_debug_boundaries_.clear();
     auto x = inputs[0];
-    auto llm_embedding_sin = inputs[1];
-    auto llm_embedding_cos = inputs[2];
+    x = attentionFromProjection(self_attn_proj_(x.to(kQNN)), inputs[1], inputs[2]);
+    auto residual = inputs[0];
+    return {finishMlp(x, residual.to(kQNN))};
+  }
 
-    x = x.to(kQNN);
+  Tensor finishMlp(const Tensor& attention, const Tensor& residual) {
+    auto out_mlp_states = self_attn_out_mlp_(attention, residual);
+    if (shadow_down_proj_) {
+      MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 3);
+      return down_proj_shadow_correction_(out_mlp_states[0].to(kCPU).contiguous(), out_mlp_states[1].to(kCPU).contiguous(),
+                                          out_mlp_states[2].to(kCPU).contiguous());
+    }
+    MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 1);
+    return out_mlp_states[0];
+  }
 
-    auto states = self_attn_proj_(x);
-
+  Tensor attentionFromProjection(std::vector<Tensor> states, const Tensor& sin, const Tensor& cos) {
+    captured_debug_boundaries_.clear();
     auto query_states = states[0].to(kCPU);
     auto key_states = states[1].to(kCPU);
     auto value_states = states[2].to(kCPU);
@@ -557,24 +567,9 @@ class QwenDecoder final : public nn::Module {
       captured_debug_boundaries_.push_back(value_states.transpose(1, 2).contiguous());
     }
 
-    x = self_attn_matmul_(query_states, key_states, value_states, llm_embedding_sin, llm_embedding_cos)[0];
+    auto x = self_attn_matmul_(query_states, key_states, value_states, sin, cos)[0];
     if (capture_debug_boundaries_) { captured_debug_boundaries_.push_back(x.contiguous()); }
-
-    x = x.to(kQNN);
-    auto res = inputs[0];
-    res = res.to(kQNN);
-
-    auto out_mlp_states = self_attn_out_mlp_(x, res);
-    if (shadow_down_proj_) {
-      MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 3);
-      x = down_proj_shadow_correction_(out_mlp_states[0].to(kCPU).contiguous(), out_mlp_states[1].to(kCPU).contiguous(),
-                                       out_mlp_states[2].to(kCPU).contiguous());
-    } else {
-      MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 1);
-      x = out_mlp_states[0];
-    }
-
-    return {x};
+    return x.to(kQNN);
   }
 
   nn::KVCache& getKVCache() { return self_attn_matmul_.getKVCache(); }
@@ -582,8 +577,30 @@ class QwenDecoder final : public nn::Module {
   const std::vector<Tensor>& capturedDebugBoundaries() const { return captured_debug_boundaries_; }
 };
 
+class QwenMlpAndNextQkv final : public nn::Module {
+  QwenOutProjAndMLP mlp_;
+  QwenAttentionProjNPU next_qkv_;
+
+ public:
+  QwenMlpAndNextQkv(const std::string& name, const QwenDecoder& layer, const QwenDecoder& next_layer)
+      : nn::Module(name), mlp_(layer.self_attn_out_mlp_), next_qkv_(next_layer.self_attn_proj_) {
+    to(kQNN);
+  }
+
+  std::vector<Tensor> forward(const std::vector<Tensor>& inputs, const std::vector<AnyValue>& args) override {
+    // Trace both sets of operations inside this graph. The decoder blocks own
+    // the parameters and keep their checkpoint names.
+    auto residual = mlp_.forward(inputs, args)[0];
+    auto qkv = next_qkv_.forward({residual}, args);
+    // QNN binds outputs by registration order. The residual is produced
+    // before the next layer's Q, K and V.
+    return {residual, qkv[0], qkv[1], qkv[2]};
+  }
+};
+
 class QwenText final : public nn::Module {
   nn::ModuleListWithIdx<QwenDecoder> decode_blocks_;
+  std::vector<std::optional<QwenMlpAndNextQkv>> cross_layer_graphs_;
   nn::RMSNorm norm_;
   bool capture_layer_outputs_ = false;
   std::vector<Tensor> captured_layer_outputs_;
@@ -593,6 +610,25 @@ class QwenText final : public nn::Module {
 
   QwenText(const std::string& name, const QwenNPUConfig& cfg) : nn::Module(name) {
     decode_blocks_ = reg<nn::ModuleListWithIdx<QwenDecoder>>("layers", cfg.num_hidden_layers, cfg);
+    if (cfg.qnn_cross_layer_graphs) {
+      if (!cfg.qnn_qkv_bias_after_dequant || cfg.num_hidden_layers < 2) {
+        throw std::invalid_argument("Qwen cross-layer QNN graphs require at least two layers and post-dequantization QKV bias");
+      }
+      auto& blocks = decode_blocks_.list();
+      cross_layer_graphs_.reserve(blocks.size() - 1);
+      for (size_t index = 0; index < blocks.size(); ++index) {
+        auto& block = blocks[index];
+        const auto graph_name = block.getModuleName() + "_2";
+        block.self_attn_out_mlp_.impl()->setAbsoluteName(graph_name);
+        if (index + 1 == blocks.size()) { break; }
+        // The next QKV projection must see the CPU-corrected residual at these boundaries.
+        if (block.shadow_down_proj_) {
+          cross_layer_graphs_.emplace_back(std::nullopt);
+        } else {
+          cross_layer_graphs_.emplace_back(std::in_place, graph_name, block, blocks[index + 1]);
+        }
+      }
+    }
 
     norm_ = reg<nn::RMSNorm>("norm", cfg.rms_norm_eps);
     embedding_ = reg<nn::Embedding>("embed_tokens", cfg.vocab_size, cfg.hidden_size);
@@ -613,8 +649,30 @@ class QwenText final : public nn::Module {
 
     captured_layer_outputs_.clear();
     if (capture_layer_outputs_) { captured_layer_outputs_.push_back(x.to(kCPU).contiguous()); }
-    for (auto& block : blocks) {
-      x = block(x, llm_embedding_sin, llm_embedding_cos)[0];
+    if (cross_layer_graphs_.empty()) {
+      for (auto& block : blocks) {
+        x = block(x, llm_embedding_sin, llm_embedding_cos)[0];
+        if (capture_layer_outputs_) { captured_layer_outputs_.push_back(x.to(kCPU).contiguous()); }
+      }
+    } else {
+      x = x.to(kQNN);
+      auto qkv = blocks.front().self_attn_proj_(x);
+      for (size_t index = 0; index < cross_layer_graphs_.size(); ++index) {
+        auto& block = blocks[index];
+        auto attention = block.attentionFromProjection(std::move(qkv), llm_embedding_sin, llm_embedding_cos);
+        if (auto& fused = cross_layer_graphs_[index]) {
+          auto next = (*fused)(attention, x);
+          x = next[0];
+          qkv = {next[1], next[2], next[3]};
+        } else {
+          x = block.finishMlp(attention, x).to(kQNN);
+          qkv = blocks[index + 1].self_attn_proj_(x);
+        }
+        if (capture_layer_outputs_) { captured_layer_outputs_.push_back(x.to(kCPU).contiguous()); }
+      }
+      auto& last = blocks.back();
+      auto attention = last.attentionFromProjection(std::move(qkv), llm_embedding_sin, llm_embedding_cos);
+      x = last.finishMlp(attention, x);
       if (capture_layer_outputs_) { captured_layer_outputs_.push_back(x.to(kCPU).contiguous()); }
     }
 
