@@ -521,9 +521,10 @@ class QwenDecoder final : public nn::Module {
   }
 
   std::vector<Tensor> forward(const std::vector<Tensor>& inputs, const std::vector<AnyValue>& args) override {
-    const auto residual = inputs[0].to(kQNN);
-    auto x = attentionFromProjection(self_attn_proj_(residual), inputs[1], inputs[2]);
-    auto out_mlp_states = self_attn_out_mlp_(x, residual);
+    auto x = inputs[0];
+    x = attentionFromProjection(self_attn_proj_(x.to(kQNN)), inputs[1], inputs[2]);
+    auto residual = inputs[0];
+    auto out_mlp_states = self_attn_out_mlp_(x, residual.to(kQNN));
     if (shadow_down_proj_) {
       MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 3);
       return {down_proj_shadow_correction_(out_mlp_states[0].to(kCPU).contiguous(), out_mlp_states[1].to(kCPU).contiguous(),
@@ -533,7 +534,7 @@ class QwenDecoder final : public nn::Module {
     return out_mlp_states;
   }
 
-  Tensor attentionFromProjection(const std::vector<Tensor>& states, const Tensor& sin, const Tensor& cos) {
+  Tensor attentionFromProjection(std::vector<Tensor> states, const Tensor& sin, const Tensor& cos) {
     captured_debug_boundaries_.clear();
     auto query_states = states[0].to(kCPU);
     auto key_states = states[1].to(kCPU);
@@ -628,14 +629,14 @@ class QwenText final : public nn::Module {
       x = x.to(kQNN);
       auto qkv = blocks.front().self_attn_proj_(x);
       for (size_t index = 0; index < cross_layer_graphs_.size(); ++index) {
-        auto attention = blocks[index].attentionFromProjection(qkv, llm_embedding_sin, llm_embedding_cos);
+        auto attention = blocks[index].attentionFromProjection(std::move(qkv), llm_embedding_sin, llm_embedding_cos);
         qkv = cross_layer_graphs_[index](attention, x);
         x = qkv.back();
         qkv.pop_back();
         if (capture_layer_outputs_) { captured_layer_outputs_.push_back(x.to(kCPU).contiguous()); }
       }
       auto& last = blocks.back();
-      auto attention = last.attentionFromProjection(qkv, llm_embedding_sin, llm_embedding_cos);
+      auto attention = last.attentionFromProjection(std::move(qkv), llm_embedding_sin, llm_embedding_cos);
       x = last.self_attn_out_mlp_(attention, x)[0];
       if (capture_layer_outputs_) { captured_layer_outputs_.push_back(x.to(kCPU).contiguous()); }
     }
