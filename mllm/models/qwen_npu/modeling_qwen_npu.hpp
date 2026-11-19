@@ -571,8 +571,9 @@ class QwenMlpAndNextQkv final : public nn::Module {
     // the parameters and keep their checkpoint names.
     auto residual = mlp_.forward(inputs, args)[0];
     auto qkv = next_qkv_.forward({residual}, args);
-    qkv.push_back(residual);
-    return qkv;
+    // QNN binds outputs by registration order. The residual is produced
+    // before the next layer's Q, K and V.
+    return {residual, qkv[0], qkv[1], qkv[2]};
   }
 };
 
@@ -630,9 +631,9 @@ class QwenText final : public nn::Module {
       auto qkv = blocks.front().self_attn_proj_(x);
       for (size_t index = 0; index < cross_layer_graphs_.size(); ++index) {
         auto attention = blocks[index].attentionFromProjection(std::move(qkv), llm_embedding_sin, llm_embedding_cos);
-        qkv = cross_layer_graphs_[index](attention, x);
-        x = qkv.back();
-        qkv.pop_back();
+        auto next = cross_layer_graphs_[index](attention, x);
+        x = next[0];
+        qkv = {next[1], next[2], next[3]};
         if (capture_layer_outputs_) { captured_layer_outputs_.push_back(x.to(kCPU).contiguous()); }
       }
       auto& last = blocks.back();
