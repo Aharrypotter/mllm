@@ -1,6 +1,7 @@
 #include <fmt/core.h>
 #include <algorithm>
 #include <bit>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -45,6 +46,32 @@ std::string readPromptFile(const std::string& path) {
   contents << input.rdbuf();
   if (contents.str().empty()) { throw std::invalid_argument("prompt file is empty: " + path); }
   return contents.str();
+}
+
+mllm::Tensor readPromptTokens(const std::string& path, int64_t vocabulary_size, int32_t capacity) {
+  std::ifstream input(path);
+  if (!input) { throw std::invalid_argument("cannot open prompt token ID file: " + path); }
+  if (capacity <= 0) { throw std::invalid_argument("prompt token capacity must be positive"); }
+  std::vector<int64_t> tokens;
+  std::string value;
+  while (input >> value) {
+    int64_t token = -1;
+    const auto end = value.data() + value.size();
+    const auto parsed = std::from_chars(value.data(), end, token);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || token < 0 || token >= vocabulary_size) {
+      throw std::invalid_argument("invalid token ID in prompt file: " + path);
+    }
+    if (tokens.size() >= static_cast<size_t>(capacity)) {
+      throw std::invalid_argument("prompt token ID file exceeds cache capacity: " + path);
+    }
+    tokens.push_back(token);
+  }
+  if (input.bad() || tokens.empty()) {
+    throw std::invalid_argument("empty or unreadable prompt token ID file: " + path);
+  }
+  auto result = mllm::Tensor::empty({1, static_cast<int32_t>(tokens.size())}, mllm::kInt64, mllm::kCPU).alloc();
+  std::copy(tokens.begin(), tokens.end(), result.ptr<int64_t>());
+  return result;
 }
 
 std::string jsonEscape(const std::string& input) {
@@ -265,6 +292,8 @@ int main(int argc, char** argv) {
           .help("Exact layer-major per-head retention profile for f32-topk or hmx-topk");
   auto& prompt = Argparse::add<std::string>("-p|--prompt").help("Prompt text");
   auto& prompt_file = Argparse::add<std::string>("--prompt-file").help("Read the prompt from a file");
+  auto& prompt_ids = Argparse::add<std::string>("--prompt-token-ids-file")
+                         .help("Read prepared prompt token IDs in decimal, separated by whitespace");
   auto& max_new_tokens = Argparse::add<int32_t>("-g|--max-new-tokens").help("Maximum generated tokens").def(8);
   auto& expected_prompt_tokens =
       Argparse::add<int32_t>("--expected-prompt-tokens").help("Fail if tokenized prompt length differs");
@@ -319,8 +348,10 @@ int main(int argc, char** argv) {
     ::mllm::shutdownContext();
     return 2;
   }
-  if (prompt.isSet() == prompt_file.isSet()) {
-    fmt::print(stderr, "Error: set exactly one of --prompt and --prompt-file.\n");
+  const int prompt_sources = static_cast<int>(prompt.isSet()) + static_cast<int>(prompt_file.isSet())
+                             + static_cast<int>(prompt_ids.isSet());
+  if (prompt_sources != 1) {
+    fmt::print(stderr, "Error: set exactly one of --prompt, --prompt-file, and --prompt-token-ids-file.\n");
     ::mllm::shutdownContext();
     return 2;
   }
@@ -472,7 +503,8 @@ int main(int argc, char** argv) {
     cpu_cfg.prefill_attention_head_retentions.clear();
   }
 
-  const std::string prompt_text = prompt.isSet() ? prompt.get() : readPromptFile(prompt_file.get());
+  const std::string prompt_text =
+      prompt_ids.isSet() ? std::string{} : (prompt.isSet() ? prompt.get() : readPromptFile(prompt_file.get()));
   auto qwen_tokenizer = mllm::models::qwen_npu::QwenTokenizer(tokenizer_path.get(), merges_path.get());
 
   const std::string context_mode = prepare_context ? "prepare" : (qnn_context_path.isSet() ? "load" : "live-build");
@@ -544,7 +576,9 @@ int main(int argc, char** argv) {
     }
   }
 
-  auto raw_input_tokens = qwen_tokenizer.convertMessage({.prompt = prompt_text})["sequence"];
+  auto raw_input_tokens = prompt_ids.isSet()
+                              ? readPromptTokens(prompt_ids.get(), cpu_cfg.vocab_size, cpu_cfg.max_cache_length)
+                              : qwen_tokenizer.convertMessage({.prompt = prompt_text})["sequence"];
   MLLM_INFO("Input tokens: {} tokens", raw_input_tokens.shape()[1]);
   if (expected_prompt_tokens.isSet() && raw_input_tokens.shape()[1] != expected_prompt_tokens.get()) {
     fmt::print(stderr, "Error: tokenized prompt length {} does not match expected {}.\n", raw_input_tokens.shape()[1],
@@ -705,7 +739,7 @@ int main(int argc, char** argv) {
 
     mllm::cpu::shadownpu::CPUAttentionProfiler::reset();
     mllm::cpu::shadownpu::CPUSparseSelectionStats::reset();
-    auto prefill_start = std::chrono::high_resolution_clock::now();
+    auto prefill_start = std::chrono::steady_clock::now();
     mllm::models::ARGenerationOutputPast prefill_output;
     prefill_chunk_count = prefill_seq_len / logical_chunk;
     for (int32_t chunk_index = 0; chunk_index < prefill_chunk_count; ++chunk_index) {
@@ -728,23 +762,9 @@ int main(int argc, char** argv) {
       prefill_output = npu_model->forward(chunk_past, prefill_args);
     }
 
-    auto prefill_end = std::chrono::high_resolution_clock::now();
+    auto prefill_end = std::chrono::steady_clock::now();
     const auto prefill_duration = std::chrono::duration<double, std::milli>(prefill_end - prefill_start);
     prefill_time_ms = prefill_duration.count();
-    MLLM_INFO("QNN prefill completed: seq_len={}, chunks={}, logical_chunk={}, qnn_tile={}, time={:.2f}s", prefill_seq_len,
-              prefill_chunk_count, logical_chunk, qnn_sequence_tile.get(), prefill_duration.count() / 1000.0);
-
-    if (debug_qnn_layer_outputs.isSet() || debug_qnn_boundary_dir.isSet()) {
-      printLayerSummaries("qnn_prefill", npu_model->capturedLayerOutputs(), true);
-      for (size_t layer_index = 0; layer_index < npu_model->capturedBoundaryLayerCount(); ++layer_index) {
-        printLayerBoundarySummaries(layer_index, npu_model->capturedLayerBoundaries(layer_index));
-      }
-      if (debug_qnn_boundary_dir.isSet()) {
-        dumpQNNBoundaryTensors(debug_qnn_boundary_dir.get(), *npu_model);
-      }
-      auto prefill_hidden_states = prefill_output.at("hidden_states").to(mllm::kFloat32).contiguous();
-      printLogitSummary("qnn_prefill_hidden", prefill_hidden_states.ptr<float>(), prefill_hidden_states.numel());
-    }
 
     auto prefill_logits = prefill_output["sequence"];
     auto prefill_logits_f = prefill_logits.to(mllm::kFloat32);
@@ -756,7 +776,6 @@ int main(int argc, char** argv) {
 
       const int64_t vocab_size = prefill_shape[2];
       auto* logits_data = last_logits.ptr<float>();
-      printLogitSummary("qnn_prefill", logits_data, vocab_size);
       int first_next_id = 0;
       float max_logit = logits_data[0];
       for (int64_t i = 1; i < vocab_size; ++i) {
@@ -765,6 +784,28 @@ int main(int argc, char** argv) {
           first_next_id = static_cast<int>(i);
         }
       }
+
+      const auto first_token_ready = std::chrono::steady_clock::now();
+      const auto ttft = std::chrono::duration<double, std::milli>(first_token_ready - prefill_start);
+      fmt::print("SHADOWNPU_TTFT basis=prefill_start_to_first_token attention_mode={} prompt_tokens={} "
+                 "first_token_id={} ttft_ms={:.3f}\n",
+                 attention_mode.get(), prefill_seq_len, first_next_id, ttft.count());
+      MLLM_INFO("QNN prefill completed: seq_len={}, chunks={}, logical_chunk={}, qnn_tile={}, time={:.2f}s", prefill_seq_len,
+                prefill_chunk_count, logical_chunk, qnn_sequence_tile.get(), prefill_duration.count() / 1000.0);
+
+      if (debug_qnn_layer_outputs.isSet() || debug_qnn_boundary_dir.isSet()) {
+        printLayerSummaries("qnn_prefill", npu_model->capturedLayerOutputs(), true);
+        for (size_t layer_index = 0; layer_index < npu_model->capturedBoundaryLayerCount(); ++layer_index) {
+          printLayerBoundarySummaries(layer_index, npu_model->capturedLayerBoundaries(layer_index));
+        }
+        if (debug_qnn_boundary_dir.isSet()) {
+          dumpQNNBoundaryTensors(debug_qnn_boundary_dir.get(), *npu_model);
+        }
+        auto prefill_hidden_states = prefill_output.at("hidden_states").to(mllm::kFloat32).contiguous();
+        printLogitSummary("qnn_prefill_hidden", prefill_hidden_states.ptr<float>(), prefill_hidden_states.numel());
+      }
+
+      printLogitSummary("qnn_prefill", logits_data, vocab_size);
 
       past["sequence"] = mllm::Tensor::empty({1, 1}, mllm::kInt64, mllm::kCPU).alloc();
       past["sequence"].at<mllm::mllm_int64_t>({0, 0}) = static_cast<mllm::mllm_int64_t>(first_next_id);
