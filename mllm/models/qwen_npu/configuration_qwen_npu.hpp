@@ -35,6 +35,7 @@ struct QwenNPUConfig : protected ConfigFile {
     max_cache_length = data()["max_cache_length"];
 
     linear_impl_type = aops::str2LinearImplTypes(data()["linear_impl_type"]);
+    qnn_down_proj_spatial_tiles = data().value("qnn_down_proj_spatial_tiles", false);
     shadow_down_proj_layers = data().value("shadow_down_proj_layers", shadow_down_proj_layers);
     auto sorted_shadow_layers = shadow_down_proj_layers;
     std::sort(sorted_shadow_layers.begin(), sorted_shadow_layers.end());
@@ -85,6 +86,7 @@ struct QwenNPUConfig : protected ConfigFile {
   int32_t end_of_text_token_id = 151645;
 
   aops::LinearImplTypes linear_impl_type = aops::LinearImplTypes::kDefault;
+  bool qnn_down_proj_spatial_tiles = false;
   std::vector<int32_t> shadow_down_proj_layers;
   // Rotated checkpoints may carry Q/K/V ranges calibrated before adding their Float32 biases.
   bool qnn_qkv_bias_after_dequant = false;

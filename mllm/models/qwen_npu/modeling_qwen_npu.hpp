@@ -403,6 +403,7 @@ class QwenOutProjAndMLP final : public nn::Module {
 
   int hidden_size_, intermediate_size_;
   bool shadow_down_proj_ = false;
+  bool spatial_down_proj_tokens_ = false;
 
  public:
   QwenOutProjAndMLP() = default;
@@ -410,6 +411,7 @@ class QwenOutProjAndMLP final : public nn::Module {
     hidden_size_ = cfg.hidden_size;
     intermediate_size_ = cfg.intermediate_size;
     shadow_down_proj_ = shadow_down_proj;
+    spatial_down_proj_tokens_ = cfg.qnn_down_proj_spatial_tiles;
 
     o_proj_ = reg<nn::Linear>("self_attn.o_proj",
                               aops::LinearOpOptions{.in_channels = cfg.hidden_size,
@@ -479,7 +481,14 @@ class QwenOutProjAndMLP final : public nn::Module {
     x = gate * up;
     auto shadow_input = x;
 
-    x = x.view({B, S, 1, intermediate_size_});
+    // Keep token order while exposing a square M256 activation to Conv2d.
+    constexpr int spatial_width = 16;
+    const int token_width = spatial_down_proj_tokens_ && S % spatial_width == 0 ? spatial_width : 1;
+    x = x.view({B, S / token_width, token_width, intermediate_size_});
+    if (token_width != 1) {
+      MLLM_INFO("QNN_DOWN_PROJ_SPATIAL_LAYOUT module={} shape=[{},{},{},{}]",
+                getModuleName(), B, S / token_width, token_width, intermediate_size_);
+    }
     x.attach("qnn_quant_scale", down_proj_quantize_scale_.weight().impl());
     x = x.to(kInt16);
     x = down_proj_(x);
