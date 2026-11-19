@@ -88,6 +88,19 @@ Tensor flashAttention2(const Tensor& Q, const Tensor& K, const Tensor& V) {
                                                   {Q, K, V})[0];
 }
 
+Tensor flashAttention2StreamedBHSD(const Tensor& query, const Tensor& key, const Tensor& value) {
+  MLLM_RT_ASSERT(query.rank() == 4 && key.rank() == 4 && value.rank() == 4);
+  return Context::instance().buildOpAndSubmitTask(OpTypes::kFlashAttention2,
+                                                  aops::FlashAttention2OpOptions{
+                                                      .B = query.size(0),
+                                                      .q_head = query.size(1),
+                                                      .kv_head = key.size(1),
+                                                      .D = query.size(3),
+                                                      .streamed_bhsd = true,
+                                                  },
+                                                  {query, key, value})[0];
+}
+
 Tensor groupedQueryAttentionDecode(const Tensor& query, const Tensor& key, const Tensor& value) {
   return Context::instance().buildOpAndSubmitTask(OpTypes::kGroupedQueryAttentionDecode,
                                                   aops::GroupedQueryAttentionDecodeOpOptions{}, {query, key, value})[0];

@@ -15,6 +15,8 @@ struct FlashAttention2OpOptions : public BaseOpOptions<FlashAttention2OpOptions>
   int32_t D;
   bool hp_exp = false;
   bool causal_mask = true;
+  // Use expanded FP32 BHSD heads with the CPU dense QK, softmax, and PV kernels.
+  bool streamed_bhsd = false;
 };
 
 class FlashAttention2Op : public BaseOp {

@@ -217,9 +217,11 @@ nlohmann::json dumpSTFTOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op) {
 }
 
 nlohmann::json dumpFlashAttention2OpIROptions(const ir::linalg::LinalgIROp::ptr_t& op) {
-  auto options = ((aops::FlashAttention2Op*)op->getAOp())->options();
-  return {{"B", options.B}, {"q_head", options.q_head}, {"kv_head", options.kv_head},
-          {"D", options.D}, {"hp_exp", options.hp_exp}, {"causal_mask", options.causal_mask}};
+  const auto& options = static_cast<aops::FlashAttention2Op*>(op->getAOp())->options();
+  nlohmann::json result = {{"B", options.B}, {"q_head", options.q_head}, {"kv_head", options.kv_head},
+                           {"D", options.D}, {"hp_exp", options.hp_exp}, {"causal_mask", options.causal_mask}};
+  if (options.streamed_bhsd) result["streamed_bhsd"] = true;
+  return result;
 }
 
 nlohmann::json dumpGroupedQueryAttentionDecodeOpIROptions(const ir::linalg::LinalgIROp::ptr_t& op) { return {}; }

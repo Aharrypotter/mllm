@@ -597,6 +597,7 @@ BaseOp::ptr_t __flashAttention2FromJson(const nlohmann::json& json) {
     if (opts.contains("D")) options.D = opts["D"];
     if (opts.contains("hp_exp")) options.hp_exp = opts["hp_exp"];
     if (opts.contains("causal_mask")) options.causal_mask = opts["causal_mask"];
+    options.streamed_bhsd = opts.value("streamed_bhsd", false);
   }
 
   DeviceTypes backend = DeviceTypes::kCPU;

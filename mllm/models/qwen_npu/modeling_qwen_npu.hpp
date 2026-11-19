@@ -378,16 +378,7 @@ class QwenAttentionMatmul final : public nn::Module {
         }();
         if (stream_heads && value_states.device() == kCPU && value_states.dtype() == kFloat32
             && value_states.stride()[3] == 1 && value_states.stride()[2] == head_dim_) {
-          std::vector<Tensor> heads;
-          heads.reserve(num_attention_heads_);
-          for (int head = 0; head < num_attention_heads_; ++head) {
-            const SliceIndices slice{kAll, {head, head + 1}, kAll, kAll};
-            // The scores and probabilities can be released before the next head.
-            auto weights = softmax_(nn::functional::matmul(query_states[slice], key_states[slice], false, true,
-                                                            aops::MatMulOpType::kCausalScaledQK));
-            heads.emplace_back(nn::functional::matmul(weights, value_states[slice]));
-          }
-          output = nn::functional::concat(heads, 1);
+          output = nn::functional::flashAttention2StreamedBHSD(query_states, key_states, value_states);
         } else {
           auto attn = softmax_(nn::functional::matmul(query_states, key_states, false, true, aops::MatMulOpType::kCausalScaledQK));
           output = nn::functional::matmul(attn, value_states.to(attn.dtype()));
