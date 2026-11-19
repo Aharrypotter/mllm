@@ -36,6 +36,10 @@ struct QwenNPUConfig : protected ConfigFile {
 
     linear_impl_type = aops::str2LinearImplTypes(data()["linear_impl_type"]);
     shadow_down_proj_layers = data().value("shadow_down_proj_layers", shadow_down_proj_layers);
+    qnn_cross_layer_graphs = data().value("qnn_cross_layer_graphs", false);
+    if (qnn_cross_layer_graphs && (num_hidden_layers < 2 || !shadow_down_proj_layers.empty())) {
+      throw std::invalid_argument("Qwen cross-layer QNN graphs require at least two layers without shadow correction");
+    }
     auto sorted_shadow_layers = shadow_down_proj_layers;
     std::sort(sorted_shadow_layers.begin(), sorted_shadow_layers.end());
     if (std::adjacent_find(sorted_shadow_layers.begin(), sorted_shadow_layers.end()) != sorted_shadow_layers.end()) {
@@ -86,6 +90,7 @@ struct QwenNPUConfig : protected ConfigFile {
 
   aops::LinearImplTypes linear_impl_type = aops::LinearImplTypes::kDefault;
   std::vector<int32_t> shadow_down_proj_layers;
+  bool qnn_cross_layer_graphs = false;
   // Rotated checkpoints may carry Q/K/V ranges calibrated before adding their Float32 biases.
   bool qnn_qkv_bias_after_dequant = false;
 

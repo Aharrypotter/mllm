@@ -478,6 +478,15 @@ int main(int argc, char** argv) {
 
   auto cpu_cfg = mllm::models::qwen_npu::QwenNPUConfig(config_path.get());
   cpu_cfg.qnn_qkv_bias_after_dequant = qnn_qkv_bias_after_dequant.isSet();
+  if (cpu_cfg.qnn_cross_layer_graphs) {
+    if (!use_npu_prefill || !cpu_cfg.qnn_qkv_bias_after_dequant) {
+      fmt::print(stderr, "Error: cross-layer QNN graphs require QNN prefill with --qnn-qkv-bias-after-dequant.\n");
+      ::mllm::shutdownContext();
+      return 2;
+    }
+    fmt::print("SHADOWNPU_QNN_CROSS_LAYER_GRAPHS layers={} graph_count={}\n", cpu_cfg.num_hidden_layers,
+               cpu_cfg.num_hidden_layers + 1);
+  }
   if (cpu_cfg.qnn_qkv_bias_after_dequant) {
     fmt::print("SHADOWNPU_QKV_BIAS_ORDER mode=after_dequantization\n");
   }
