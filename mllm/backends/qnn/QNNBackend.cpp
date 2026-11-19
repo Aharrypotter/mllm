@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
@@ -40,6 +41,26 @@
 #include "mllm/utils/Log.hpp"
 
 namespace mllm::qnn {
+
+namespace {
+
+bool sequenceTileGraphProfilingEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("MLLM_QNN_SEQUENCE_TILE_GRAPH_PROFILE");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+void accumulateTileCalls(QNNBackend::SequenceTileProfile& total, const QNNBackend::SequenceTileProfile& calls) {
+  total.graph_calls += calls.graph_calls;
+  total.tile_calls += calls.tile_calls;
+  total.input_copy_us += calls.input_copy_us;
+  total.execute_us += calls.execute_us;
+  total.output_copy_us += calls.output_copy_us;
+}
+
+}  // namespace
 
 QNNBackend::QNNBackend() : Backend(kQNN, createQNNAllocator()) {
   // register ops
@@ -93,6 +114,20 @@ QNNBackend::QNNBackend() : Backend(kQNN, createQNNAllocator()) {
 }
 
 QNNBackend::~QNNBackend() {
+  if (sequenceTileGraphProfilingEnabled()) {
+    for (const auto& [name, state] : sequenceTileGraphs_) {
+      const auto& profile = state.profile;
+      if (profile.graph_calls == 0) { continue; }
+      std::fprintf(stderr,
+                   "QNN_SEQUENCE_TILE_GRAPH_PROFILE graph=%s graph_calls=%llu tile_calls=%llu input_copy_us=%llu "
+                   "execute_us=%llu output_copy_us=%llu scratch_bytes=%zu\n",
+                   name.c_str(), static_cast<unsigned long long>(profile.graph_calls),
+                   static_cast<unsigned long long>(profile.tile_calls), static_cast<unsigned long long>(profile.input_copy_us),
+                   static_cast<unsigned long long>(profile.execute_us), static_cast<unsigned long long>(profile.output_copy_us),
+                   profile.scratch_bytes);
+    }
+  }
+
   // Cleanup order is critical - we hold all QNN library handles to control unload order:
   // 1. Allocator shutdown (memDeRegister + rpcmem_free) - needs QNN alive
   // 2. Clear models - tensor destructors try to free but allocator is shut down
@@ -853,7 +888,7 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
 
         auto tile = Tensor::empty(plan.compiled_shape, logical.dtype(), kQNN).alloc();
         tile.setName("qnn_sequence_tile_" + graphName + "_" + direction + std::to_string(index));
-        sequenceTileProfile_.scratch_bytes += tile.bytes();
+        state.profile.scratch_bytes += tile.bytes();
         wrapper->__rebindDataContainerForExecution(tile);
         wrapper->alloc();
         plans.push_back(std::move(plan));
@@ -870,6 +905,7 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
         if (outputs[index].impl()->storage()->ptr_ == nullptr) { outputs[index].alloc(); }
         prepare_boundary(outputs[index], output_wrappers[index], state.output_plans, state.tile_outputs, "output", index);
       }
+      sequenceTileProfile_.scratch_bytes += state.profile.scratch_bytes;
       MLLM_INFO("QNN_SEQUENCE_TILE_SETUP graph={} tile_sequence={} tiles={} scratch_bytes={}", graphName, sequenceTile_,
                 state.tile_count, sequenceTileProfile_.scratch_bytes);
       state_it = sequenceTileGraphs_.emplace(graphName, std::move(state)).first;
@@ -903,28 +939,31 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
     const auto elapsed_us = [](clock::time_point start, clock::time_point end) {
       return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
     };
-    ++sequenceTileProfile_.graph_calls;
+    SequenceTileProfile calls;
+    calls.graph_calls = 1;
+    calls.tile_calls = state.tile_count;
     for (int32_t tile_index = 0; tile_index < state.tile_count; ++tile_index) {
       auto stage_start = clock::now();
       for (size_t index = 0; index < inputs.size(); ++index) {
         const auto& plan = state.input_plans[index];
         copyQnnSequenceTile(state.tile_inputs[index], 0, inputs[index], tile_index * sequenceTile_, sequenceTile_, plan.axis);
       }
-      sequenceTileProfile_.input_copy_us += elapsed_us(stage_start, clock::now());
+      calls.input_copy_us += elapsed_us(stage_start, clock::now());
 
       stage_start = clock::now();
       CALL_QNN(runtime_->qnnInterface.graphExecute(model->getQnnGraph(), qnn_inputs.data(), qnn_inputs.size(),
                                                    qnn_outputs.data(), qnn_outputs.size(), runtime_->profileHandle, nullptr));
-      sequenceTileProfile_.execute_us += elapsed_us(stage_start, clock::now());
+      calls.execute_us += elapsed_us(stage_start, clock::now());
 
       stage_start = clock::now();
       for (size_t index = 0; index < outputs.size(); ++index) {
         const auto& plan = state.output_plans[index];
         copyQnnSequenceTile(outputs[index], tile_index * sequenceTile_, state.tile_outputs[index], 0, sequenceTile_, plan.axis);
       }
-      sequenceTileProfile_.output_copy_us += elapsed_us(stage_start, clock::now());
-      ++sequenceTileProfile_.tile_calls;
+      calls.output_copy_us += elapsed_us(stage_start, clock::now());
     }
+    accumulateTileCalls(sequenceTileProfile_, calls);
+    if (sequenceTileGraphProfilingEnabled()) { accumulateTileCalls(state.profile, calls); }
     if (ProfilingLevel::OFF != profilingLevel_) { extractBackendProfilingInfo(runtime_->profileHandle); }
     return;
   }

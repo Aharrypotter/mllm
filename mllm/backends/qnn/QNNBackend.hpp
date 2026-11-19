@@ -171,6 +171,7 @@ class QNNBackend final : public Backend {
     std::vector<QNNSequenceTilePlan> output_plans;
     std::vector<Tensor> tile_inputs;
     std::vector<Tensor> tile_outputs;
+    SequenceTileProfile profile;
   };
   int32_t sequenceTile_ = 0;
   std::map<std::string, SequenceTileGraphState> sequenceTileGraphs_;
