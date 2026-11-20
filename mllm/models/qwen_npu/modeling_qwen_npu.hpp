@@ -489,6 +489,10 @@ class QwenOutProjAndMLP final : public nn::Module {
 
     x = gate * up;
     auto shadow_input = x;
+    if (shadow_down_proj_ && mlp_width != 1) {
+      // Export a separate tensor for CPU correction while the down projection consumes the packed activation.
+      shadow_input = x.view({B, S, 1, intermediate_size_});
+    }
 
     const int token_width = spatial_down_proj_tokens_ && use_spatial_tiles ? spatial_width : mlp_width;
     // The spatial MLP already produces a square activation for the down projection.
