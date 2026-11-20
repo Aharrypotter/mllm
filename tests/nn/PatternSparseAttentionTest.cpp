@@ -480,6 +480,28 @@ TEST_F(PatternSparseAttentionTest, PlansExactQnnSequenceTiles) {
   EXPECT_EQ(plan.compiled_shape, (Tensor::shape_t{1, 256, 1536}));
 }
 
+TEST_F(PatternSparseAttentionTest, CopiesPackedQnnTokensInOrder) {
+  constexpr int32_t channels = 3;
+  auto logical = Tensor::empty({1, 32, 16, channels}, mllm::kFloat32, mllm::kCPU).alloc();
+  auto tile = Tensor::empty({1, 16, 16, channels}, mllm::kFloat32, mllm::kCPU).alloc();
+  auto restored = Tensor::zeros(logical.shape(), mllm::kFloat32, mllm::kCPU);
+  for (int32_t i = 0; i < logical.numel(); ++i) { logical.ptr<float>()[i] = static_cast<float>(i); }
+
+  const auto plan = mllm::qnn::planQnnSequenceTiling(logical.shape(), tile.shape(), 256);
+  EXPECT_EQ(plan.axis, 1U);
+  ASSERT_EQ(plan.tile_count, 2);
+  const int32_t rows = plan.compiled_shape[plan.axis];
+  ASSERT_EQ(rows, 16);
+  for (int32_t i = 0; i < plan.tile_count; ++i) {
+    mllm::qnn::copyQnnSequenceTile(tile, 0, logical, i * rows, rows, plan.axis);
+    EXPECT_FLOAT_EQ(tile.ptr<float>()[0], static_cast<float>(i * 256 * channels));
+    mllm::qnn::copyQnnSequenceTile(restored, i * rows, tile, 0, rows, plan.axis);
+  }
+  for (int32_t i = 0; i < logical.numel(); ++i) {
+    EXPECT_FLOAT_EQ(restored.ptr<float>()[i], logical.ptr<float>()[i]);
+  }
+}
+
 TEST_F(PatternSparseAttentionTest, CopiesQnnSequenceTilesAcrossOuterDimensions) {
   std::vector<float> values(2 * 4 * 3);
   for (size_t index = 0; index < values.size(); ++index) { values[index] = static_cast<float>(index); }
@@ -504,6 +526,7 @@ TEST_F(PatternSparseAttentionTest, RejectsAmbiguousQnnSequenceTiling) {
   EXPECT_THROW((void)mllm::qnn::planQnnSequenceTiling({2, 512, 16}, {1, 256, 16}, 256), std::invalid_argument);
   EXPECT_THROW((void)mllm::qnn::planQnnSequenceTiling({1, 500, 16}, {1, 256, 16}, 256), std::invalid_argument);
   EXPECT_THROW((void)mllm::qnn::planQnnSequenceTiling({1, 256, 16}, {1, 256, 16}, 256), std::invalid_argument);
+  EXPECT_THROW((void)mllm::qnn::planQnnSequenceTiling({1, 32, 8, 3}, {1, 16, 8, 3}, 256), std::invalid_argument);
 }
 
 TEST_F(PatternSparseAttentionTest, SparseSoftmaxValueBreaksTiesByLowestKeyIndex) {

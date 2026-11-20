@@ -908,7 +908,8 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
       auto stage_start = clock::now();
       for (size_t index = 0; index < inputs.size(); ++index) {
         const auto& plan = state.input_plans[index];
-        copyQnnSequenceTile(state.tile_inputs[index], 0, inputs[index], tile_index * sequenceTile_, sequenceTile_, plan.axis);
+        const int32_t rows = plan.compiled_shape[plan.axis];
+        copyQnnSequenceTile(state.tile_inputs[index], 0, inputs[index], tile_index * rows, rows, plan.axis);
       }
       sequenceTileProfile_.input_copy_us += elapsed_us(stage_start, clock::now());
 
@@ -920,7 +921,8 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
       stage_start = clock::now();
       for (size_t index = 0; index < outputs.size(); ++index) {
         const auto& plan = state.output_plans[index];
-        copyQnnSequenceTile(outputs[index], tile_index * sequenceTile_, state.tile_outputs[index], 0, sequenceTile_, plan.axis);
+        const int32_t rows = plan.compiled_shape[plan.axis];
+        copyQnnSequenceTile(outputs[index], tile_index * rows, state.tile_outputs[index], 0, rows, plan.axis);
       }
       sequenceTileProfile_.output_copy_us += elapsed_us(stage_start, clock::now());
       ++sequenceTileProfile_.tile_calls;

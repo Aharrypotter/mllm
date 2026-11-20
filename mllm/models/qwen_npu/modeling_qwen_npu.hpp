@@ -413,7 +413,7 @@ class QwenOutProjAndMLP final : public nn::Module {
     intermediate_size_ = cfg.intermediate_size;
     shadow_down_proj_ = shadow_down_proj;
     spatial_down_proj_tokens_ = cfg.qnn_down_proj_spatial_tiles;
-    spatial_mlp_tokens_ = cfg.qnn_mlp_spatial_tiles && !shadow_down_proj_;
+    spatial_mlp_tokens_ = shadow_down_proj_ ? cfg.qnn_mlp_spatial_shadow_tiles : cfg.qnn_mlp_spatial_tiles;
 
     o_proj_ = reg<nn::Linear>("self_attn.o_proj",
                               aops::LinearOpOptions{.in_channels = cfg.hidden_size,
