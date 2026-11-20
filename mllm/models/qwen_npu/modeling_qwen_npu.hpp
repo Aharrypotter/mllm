@@ -405,6 +405,7 @@ class QwenOutProjAndMLP final : public nn::Module {
   bool shadow_down_proj_ = false;
   bool spatial_down_proj_tokens_ = false;
   bool spatial_mlp_tokens_ = false;
+  bool quantize_mlp_before_spatial_view_ = false;
 
  public:
   QwenOutProjAndMLP() = default;
@@ -414,6 +415,7 @@ class QwenOutProjAndMLP final : public nn::Module {
     shadow_down_proj_ = shadow_down_proj;
     spatial_down_proj_tokens_ = cfg.qnn_down_proj_spatial_tiles;
     spatial_mlp_tokens_ = shadow_down_proj_ ? cfg.qnn_mlp_spatial_shadow_tiles : cfg.qnn_mlp_spatial_tiles;
+    quantize_mlp_before_spatial_view_ = cfg.qnn_mlp_quantize_before_spatial_view;
 
     o_proj_ = reg<nn::Linear>("self_attn.o_proj",
                               aops::LinearOpOptions{.in_channels = cfg.hidden_size,
@@ -471,13 +473,21 @@ class QwenOutProjAndMLP final : public nn::Module {
     constexpr int spatial_width = 16;
     const bool use_spatial_tiles = S % spatial_width == 0;
     const int mlp_width = spatial_mlp_tokens_ && use_spatial_tiles ? spatial_width : 1;
-    x = x.view({B, S / mlp_width, mlp_width, hidden_size_});
+    const Tensor::shape_t mlp_shape{B, S / mlp_width, mlp_width, hidden_size_};
+    const bool quantize_before_view = quantize_mlp_before_spatial_view_ && mlp_width != 1;
+    // The QNN quantizer requires rank 4. Keep the token axis flat until the conversion to INT8.
+    x = quantize_before_view ? x.view({B, S, 1, hidden_size_}) : x.view(mlp_shape);
     if (mlp_width != 1) {
       MLLM_INFO("QNN_MLP_SPATIAL_LAYOUT module={} shape=[{},{},{},{}]",
                 getModuleName(), B, S / mlp_width, mlp_width, hidden_size_);
     }
     x.attach("qnn_quant_scale", pre_mlp_proj_quantize_scale_.weight().impl());
     x = x.to(kInt8);
+    if (quantize_before_view) {
+      MLLM_INFO("QNN_MLP_INT8_SPATIAL_VIEW module={} shape=[{},{},{},{}]",
+                getModuleName(), B, S / mlp_width, mlp_width, hidden_size_);
+      x = x.view(mlp_shape);
+    }
     auto gate = gate_proj_(x);
     gate = gate.view({B, S / mlp_width, mlp_width, intermediate_size_});
     gate = gate.to(kFloat32);
