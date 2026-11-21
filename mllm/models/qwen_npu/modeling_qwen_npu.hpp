@@ -527,6 +527,7 @@ class QwenOutProjAndMLP final : public nn::Module {
 
   int hidden_size_, intermediate_size_;
   bool shadow_down_proj_ = false;
+  bool shadow_activation_fp16_ = false;
   bool spatial_down_proj_tokens_ = false;
   bool spatial_mlp_tokens_ = false;
 
@@ -536,6 +537,7 @@ class QwenOutProjAndMLP final : public nn::Module {
     hidden_size_ = cfg.hidden_size;
     intermediate_size_ = cfg.intermediate_size;
     shadow_down_proj_ = shadow_down_proj;
+    shadow_activation_fp16_ = shadow_down_proj && cfg.qnn_shadow_activation_fp16;
     spatial_down_proj_tokens_ = cfg.qnn_down_proj_spatial_tiles;
     spatial_mlp_tokens_ = cfg.qnn_mlp_spatial_tiles && !shadow_down_proj_;
 
@@ -630,7 +632,10 @@ class QwenOutProjAndMLP final : public nn::Module {
     x = x.view({B, S, hidden_size_});
 
     x = x + tmp;
-    if (shadow_down_proj_) { return {shadow_input, quantized_down_proj, x}; }
+    if (shadow_down_proj_) {
+      if (shadow_activation_fp16_) { shadow_input = shadow_input.to(kFloat16); }
+      return {shadow_input, quantized_down_proj, x};
+    }
     return {x};
   }
 };
@@ -672,7 +677,9 @@ class QwenDecoder final : public nn::Module {
     auto out_mlp_states = self_attn_out_mlp_(attention, residual);
     if (shadow_down_proj_) {
       MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 3);
-      return down_proj_shadow_correction_(out_mlp_states[0].to(kCPU).contiguous(), out_mlp_states[1].to(kCPU).contiguous(),
+      auto activation = out_mlp_states[0].to(kCPU).contiguous();
+      if (activation.dtype() == kFloat16) { activation = activation.to(kFloat32); }
+      return down_proj_shadow_correction_(activation, out_mlp_states[1].to(kCPU).contiguous(),
                                           out_mlp_states[2].to(kCPU).contiguous());
     }
     MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 1);

@@ -8,6 +8,7 @@
 #include "mllm/core/DataTypes.hpp"
 #include "mllm/utils/Common.hpp"
 #include "mllm/utils/Log.hpp"
+#include "QnnOpDef.h"
 #include "QnnTypes.h"
 #include <cmath>
 
@@ -68,6 +69,16 @@ bool QNNCastTypePattern::addNode(const std::string& graphName, const ir::op_ptr_
     return addQuantizeNode(graphName, qnnCastTypeOp, inputs, outputs, qnnBackend);
   } else if (isDequantize) {
     return addDequantizeNode(graphName, qnnCastTypeOp, inputs, outputs, qnnBackend);
+  } else if (inputDtype == kFloat32 && outputDtype == kFloat16) {
+    const auto& output = outputs[0];
+    if (!qnnBackend->addTensor(graphName, output->name(), getQnnOutputTensorType(output), output->tensor_)) {
+      MLLM_ERROR("Failed to add Float16 cast output {} to graph {}", output->name(), graphName);
+      return false;
+    }
+    qnnBackend->graphAddNode(graphName, qnnCastTypeOp->getName(), QNN_OP_CAST, {inputs[0]->name()},
+                            {output->name()}, {}, {}, QNN_OP_PACKAGE_NAME_QTI_AISW);
+    MLLM_INFO("QNN_FLOAT32_TO_FP16_CAST graph={} output={}", graphName, output->name());
+    return true;
   } else {
     MLLM_ERROR("Unsupported CastType conversion from {} to {}", (int)inputDtype, (int)outputDtype);
     return false;
