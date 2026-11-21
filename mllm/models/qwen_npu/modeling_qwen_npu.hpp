@@ -21,6 +21,7 @@
 #include "mllm/nn/layers/Param.hpp"
 #include "mllm/utils/Common.hpp"
 #include "mllm/models/ARGeneration.hpp"
+#include "mllm/models/qwen_npu/ShadowNPUAttentionQuantization.hpp"
 #include "configuration_qwen_npu.hpp"
 
 namespace mllm::models::qwen_npu {
@@ -528,6 +529,7 @@ class QwenOutProjAndMLP final : public nn::Module {
   int hidden_size_, intermediate_size_;
   bool shadow_down_proj_ = false;
   bool shadow_activation_fp16_ = false;
+  bool shadow_int8_input_ = false;
   bool spatial_down_proj_tokens_ = false;
   bool spatial_mlp_tokens_ = false;
 
@@ -538,6 +540,7 @@ class QwenOutProjAndMLP final : public nn::Module {
     intermediate_size_ = cfg.intermediate_size;
     shadow_down_proj_ = shadow_down_proj;
     shadow_activation_fp16_ = shadow_down_proj && cfg.qnn_shadow_activation_fp16;
+    shadow_int8_input_ = shadow_down_proj && cfg.qnn_shadow_int8_input;
     spatial_down_proj_tokens_ = cfg.qnn_down_proj_spatial_tiles;
     spatial_mlp_tokens_ = cfg.qnn_mlp_spatial_tiles && !shadow_down_proj_;
 
@@ -571,6 +574,23 @@ class QwenOutProjAndMLP final : public nn::Module {
         reg<nn::Param>("pre_mlp_proj_quantize_scale_", getModuleName() + ".mlp.gate_proj.input_scale", Tensor::shape_t{1});
     down_proj_quantize_scale_ =
         reg<nn::Param>("down_proj_quantize_scale_", getModuleName() + ".mlp.down_proj.input_scale", Tensor::shape_t{1});
+  }
+
+  Tensor prepareAttentionInput(Tensor attention) {
+    if (!shadow_int8_input_) { return attention.to(kQNN); }
+    MLLM_RT_ASSERT_EQ(attention.device(), kCPU);
+    MLLM_RT_ASSERT_EQ(attention.dtype(), kFloat32);
+    const auto& scale = o_proj_quantize_scale_.weight();
+    auto input = Tensor::empty(attention.shape(), kInt8, kQNN);
+    input.attach("qnn_quant_scale", scale.impl());
+    if (!Context::instance().thisThread()->trace_mode) {
+      const float step = scale.ptr<float>()[0];
+      MLLM_RT_ASSERT(std::isfinite(step) && step > 0.0F);
+      attention = attention.contiguous();
+      input.alloc();
+      quantizeShadowAttentionInt8(attention.ptr<float>(), input.ptr<int8_t>(), attention.numel(), 1.0F / step);
+    }
+    return input;
   }
 
   std::vector<Tensor> forward(const std::vector<Tensor>& inputs, const std::vector<AnyValue>& args) override {
@@ -702,7 +722,7 @@ class QwenDecoder final : public nn::Module {
 
     auto x = self_attn_matmul_(query_states, key_states, value_states, sin, cos)[0];
     if (capture_debug_boundaries_) { captured_debug_boundaries_.push_back(x.contiguous()); }
-    return x.to(kQNN);
+    return self_attn_out_mlp_.prepareAttentionInput(x);
   }
 
   nn::KVCache& getKVCache() { return self_attn_matmul_.getKVCache(); }
