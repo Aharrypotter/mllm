@@ -42,16 +42,20 @@ inline QNNSequenceTilePlan planQnnSequenceTiling(const Tensor::shape_t& logical_
   if (sequence_axis == logical_shape.size()) {
     throw std::invalid_argument("QNN sequence tiling requires one expanded boundary dimension");
   }
-  const int32_t compiled_sequence = compiled_shape[sequence_axis];
-  const int32_t logical_sequence = logical_shape[sequence_axis];
-  if (compiled_sequence != configured_tile_sequence || logical_sequence <= compiled_sequence
-      || logical_sequence % compiled_sequence != 0) {
+  const int32_t compiled_rows = compiled_shape[sequence_axis];
+  const int32_t logical_rows = logical_shape[sequence_axis];
+  // Packed NHWC graph boundaries can keep the token columns inside each copied row.
+  const bool packed_tokens = sequence_axis == 1 && compiled_shape.size() == 4
+                             && configured_tile_sequence % compiled_rows == 0
+                             && compiled_shape[2] == configured_tile_sequence / compiled_rows;
+  if ((compiled_rows != configured_tile_sequence && !packed_tokens) || logical_rows <= compiled_rows
+      || logical_rows % compiled_rows != 0) {
     throw std::invalid_argument("QNN logical sequence is not an exact multiple of the compiled tile");
   }
 
   return {
       .axis = sequence_axis,
-      .tile_count = logical_sequence / compiled_sequence,
+      .tile_count = logical_rows / compiled_rows,
       .compiled_shape = compiled_shape,
   };
 }
