@@ -1420,7 +1420,13 @@ int hmx_i8_kernel_qk_i8_packed_shared_key(
     const size_t query_stride = (size_t)m * (size_t)k;
     const size_t key_stride = (size_t)n * (size_t)k;
     const size_t output_stride = (size_t)m * (size_t)n;
-    const int chunk_n = HMX_I8_DMA_N_TILES * HMX_I8_N_TILE;
+    const int first_capacity = HMX_I8_DMA_N_TILES * HMX_I8_N_TILE;
+    const int tail_capacity = HMX_I8_SHARED_KEY_WIDE_TAIL
+        ? 2 * first_capacity : first_capacity;
+    const int first_size = n < first_capacity ? n : first_capacity;
+    const int tail_size = n - first_size < tail_capacity
+        ? n - first_size : tail_capacity;
+    const int largest_chunk = first_size > tail_size ? first_size : tail_size;
 
     uintptr_t cursor = align_up_uintptr((uintptr_t)vtcm, 2048u);
     uint8_t *config = (uint8_t *)cursor;
@@ -1433,7 +1439,9 @@ int hmx_i8_kernel_qk_i8_packed_shared_key(
         cursor = align_up_uintptr(cursor + query_tile_bytes, 2048u);
     }
     int8_t *key_buffer = (int8_t *)cursor;
-    const size_t maximum_key_bytes = (size_t)(n < chunk_n ? n : chunk_n) * k;
+    /* The first chunk follows the producer's first progress event.
+     * Subsequent chunks can use both reserved K buffers as one span. */
+    const size_t maximum_key_bytes = (size_t)largest_chunk * k;
     if (cursor + maximum_key_bytes > (uintptr_t)vtcm + vtcm_size) return -1;
 
     hmx_dma_desc_1d dma __attribute__((aligned(64)));
@@ -1445,9 +1453,10 @@ int hmx_i8_kernel_qk_i8_packed_shared_key(
         const int32_t *owner_sums = key_sums + (size_t)owner * n;
         volatile int32_t *owner_progress = producer_progress
             + (size_t)owner * HMX_I8_CPU_PACK_READY_STRIDE;
-        for (int first_col = 0; first_col < n; first_col += chunk_n) {
+        for (int first_col = 0; first_col < n;) {
             const int remaining_cols = n - first_col;
-            const int cols = remaining_cols < chunk_n ? remaining_cols : chunk_n;
+            const int capacity = first_col == 0 ? first_capacity : tail_capacity;
+            const int cols = remaining_cols < capacity ? remaining_cols : capacity;
             if (hmx_i8_cpu_pack_progress(
                     owner_progress, 0, (first_col + cols) / HMX_I8_N_TILE,
                     1) <= 0) {
@@ -1530,6 +1539,7 @@ int hmx_i8_kernel_qk_i8_packed_shared_key(
                         owner_sums, scale);
                 }
             }
+            first_col += cols;
         }
     }
     return 0;
