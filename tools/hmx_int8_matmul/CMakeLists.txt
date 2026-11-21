@@ -225,11 +225,14 @@ if(${OS_TYPE} MATCHES "HLOS")
 else()
     # Hexagon-side FastRPC skel. The GEMM source contains the raw HMX
     # instructions; it does not link HexKL/SDKL matmul implementations.
+    enable_language(ASM)
     add_library(hmx_int8_rpc_skel SHARED
         ${CMAKE_CURRENT_BINARY_DIR}/hmx_int8_rpc_skel.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/commu.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/hvx_worker_pool.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/hmx_i8_kernel.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/hvx_score_topk.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/hvx_score_histogram.S
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/runtime.c
     )
     build_idl(include/hmx_int8_rpc.idl hmx_int8_rpc_skel)
@@ -242,7 +245,7 @@ else()
     )
 
     target_compile_options(hmx_int8_rpc_skel PRIVATE
-        -Wall -Wextra -Werror
+        $<$<COMPILE_LANGUAGE:C>:-Wall;-Wextra;-Werror>
         -mhmx -mhvx -mhvx-length=128B
     )
     target_compile_definitions(hmx_int8_rpc_skel PRIVATE

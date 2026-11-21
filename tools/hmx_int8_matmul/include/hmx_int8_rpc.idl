@@ -217,6 +217,21 @@ interface hmx_int8_rpc : remote_handle64 {
         in int32 n,
         in uint32 key_sources_low,
         in uint32 key_sources_high);
+
+    AEEResult execute_qk_i8_cpu_packed_shared_key_topk(
+        in int32 buffer_fd,
+        in int32 query_offset,
+        in int32 key_offset,
+        in int32 key_sums_offset,
+        in int32 output_offset,
+        in int32 scales_offset,
+        in int32 ready_offset,
+        in int32 heads,
+        in int32 n,
+        in uint32 key_sources_low,
+        in uint32 key_sources_high,
+        in int32 index_arena_offset,
+        in int32 valid_columns);
 };
 
 #endif /* HMX_INT8_RPC_IDL */

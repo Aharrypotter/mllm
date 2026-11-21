@@ -24,6 +24,7 @@ HMX_QK_I8_OPERATOR_1.0 {
         hmx_qk_i8_operator_cpu_pack_ready_data;
         hmx_qk_i8_operator_execute_cpu_packed_per_head_hn;
         hmx_qk_i8_operator_execute_cpu_packed_shared_key_hn;
+        hmx_qk_i8_operator_execute_cpu_packed_shared_key_topk_hn;
         hmx_qk_i8_operator_execute_raw_scaled_hn;
         hmx_qk_i8_operator_execute_raw_dynamic_hn;
         hmx_qk_i8_operator_execute_raw_i32_topk_hn;

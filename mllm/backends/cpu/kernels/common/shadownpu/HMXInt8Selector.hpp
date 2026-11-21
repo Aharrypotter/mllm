@@ -9,6 +9,7 @@
 #include "PipelineTaskExecutor.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -424,16 +425,17 @@ private:
     };
 
     // View of one in-flight all-head long RPC.  The DSP publishes each
-    // ready word only after flushing the corresponding score matrix, so a
-    // CPU consumer can select Top-k directly from rpcmem after an acquire
-    // load without copying through scores_.  The view is valid only for the
-    // duration of the callback.
+    // ready word after flushing the corresponding score matrix or compact
+    // index list. The CPU reads rpcmem after an acquire load. The view stays
+    // valid for the duration of the callback.
     struct DirectScoreStream {
         volatile std::int32_t *ready = nullptr;
         std::size_t ready_stride = 0;
         const std::int8_t *scores = nullptr;
         std::size_t score_head_stride = 0;
         std::size_t score_row_stride = 0;
+        const std::uint16_t *indices = nullptr;
+        std::size_t index_head_stride = 0;
         const std::size_t *matrices = nullptr;
         std::size_t count = 0;
     };
@@ -662,6 +664,9 @@ private:
         void *, std::int32_t, std::int32_t, const float *);
     using ExecuteCpuPackedSharedKeyHnFn = int (*)(
         void *, std::int32_t, std::int32_t, const float *, std::uint64_t);
+    using ExecuteCpuPackedSharedKeyTopKHnFn = int (*)(
+        void *, std::int32_t, std::int32_t, const float *, std::uint64_t,
+        const std::int32_t *const *, std::int32_t);
     using PrepareRawKeyFn = int (*)(void *, std::int32_t, std::int32_t,
                                     std::int32_t);
     using PrepareRawKeyScaledFn = int (*)(void *, std::int32_t,
@@ -729,6 +734,7 @@ private:
         CpuPackReadyDataFn cpu_pack_ready_data = nullptr;
         ExecuteCpuPackedPerHeadHnFn execute_cpu_packed_per_head_hn = nullptr;
         ExecuteCpuPackedSharedKeyHnFn execute_cpu_packed_shared_key_hn = nullptr;
+        ExecuteCpuPackedSharedKeyTopKHnFn execute_cpu_packed_shared_key_topk_hn = nullptr;
         PrepareRawKeyFn prepare_raw_key = nullptr;
         PrepareRawKeyScaledFn prepare_raw_key_scaled = nullptr;
         ExecuteRawHnFn execute_raw_hn = nullptr;
@@ -3026,6 +3032,35 @@ private:
                                 ? packedKeySources(request, group, count,
                                                    per_head_k_scales.data())
                                 : std::nullopt;
+                            static const bool native_topk_enabled = [] {
+                                const char *value = std::getenv("MLLM_HMX_INT8_NATIVE_TOPK");
+                                return value != nullptr && std::strcmp(value, "1") == 0;
+                            }();
+                            const std::size_t index_head_stride =
+                                static_cast<std::size_t>(bucket.info.n) * bucket.info.k;
+                            std::array<const std::int32_t *, 16> native_row_offsets{};
+                            const std::uint16_t *native_indices = nullptr;
+                            if (native_topk_enabled && key_sources && long_rpc_pipeline
+                                && on_direct_stream && ready_stride == kLongRpcReadyStride
+                                && bucket.execute_cpu_packed_shared_key_topk_hn != nullptr
+                                && bucket.raw_key_data != nullptr && bucket.info.m == 512
+                                && bucket.info.n % 32 == 0 && bucket.info.k % 32 == 0
+                                && query_begin == 0 && request.query_len == bucket.info.m
+                                && request.key_len - request.query_len
+                                    == validated.causal_prefix_tokens
+                                && topKOversample() == 1.0F) {
+                                const std::size_t offset_bytes =
+                                    (static_cast<std::size_t>(bucket.info.m + 1)
+                                        * sizeof(std::int32_t) + 127) & ~std::size_t{127};
+                                bool fits = index_head_stride > offset_bytes / sizeof(std::uint16_t);
+                                for (std::size_t local = 0; local < count && fits; ++local) {
+                                    const auto *offsets = rowOffsetsForMatrix(request, group[local]);
+                                    native_row_offsets[local] = offsets;
+                                    fits = static_cast<std::size_t>(offsets[request.query_len])
+                                        <= index_head_stride - offset_bytes / sizeof(std::uint16_t);
+                                }
+                                if (fits) native_indices = bucket.raw_key_data(context);
+                            }
                             const bool combined_cpu_stage =
                                 scale_staging.cpu_job != nullptr;
                             std::future<void> pack_future;
@@ -3113,6 +3148,11 @@ private:
                             std::string long_rpc_error;
                             const auto execute_cpu_packed = [&]() {
                                 const auto heads = static_cast<std::int32_t>(count);
+                                if (native_indices != nullptr) {
+                                    return bucket.execute_cpu_packed_shared_key_topk_hn(
+                                        context, heads, actual_n, per_head_requant_scales.data(),
+                                        *key_sources, native_row_offsets.data(), request.key_len);
+                                }
                                 if (key_sources) {
                                     return bucket.execute_cpu_packed_shared_key_hn(
                                         context, heads, actual_n,
@@ -3166,6 +3206,13 @@ private:
                                             stream.score_row_stride =
                                                 static_cast<std::size_t>(
                                                     actual_n);
+                                            stream.indices = native_indices;
+                                            stream.index_head_stride = index_head_stride;
+                                            if (native_indices != nullptr && profile_enabled) {
+                                                std::fprintf(stderr,
+                                                    "[HMX_INT8_NATIVE_TOPK] layer=%d key_len=%d heads=%zu\n",
+                                                    request.layer_id, request.key_len, count);
+                                            }
                                             stream.matrices = group;
                                             stream.count = count;
                                             stream_ok = on_direct_stream(
@@ -4790,9 +4837,10 @@ private:
         const Request &request, const ValidatedRequest &validated,
         std::size_t matrix, const std::int8_t *source,
         std::size_t source_row_stride, std::size_t worker,
-        std::size_t worker_count) noexcept {
+        std::size_t worker_count, const std::uint16_t *indices = nullptr) noexcept {
         if (matrix >= validated.matrix_count || source == nullptr
-            || source_row_stride < static_cast<std::size_t>(request.key_len)
+            || (indices == nullptr
+                && source_row_stride < static_cast<std::size_t>(request.key_len))
             || worker_count == 0 || worker >= worker_count
             || topKOversample() != 1.0F
             || topk_preselected_[matrix] != 0) {
@@ -4814,6 +4862,12 @@ private:
         const std::int32_t *offsets = rowOffsetsForMatrix(request, matrix);
         std::int32_t *destination = request.topk_indices
             + matrix * validated.topk_head_stride;
+        if (indices != nullptr) {
+            const std::size_t first = offsets[row_begin];
+            const std::size_t last = offsets[row_end];
+            std::copy(indices + first, indices + last, destination + first);
+            return true;
+        }
         return INT8TopK::selectCausalRowRange(
             source, total_rows, row_begin, row_end - row_begin,
             source_row_stride,
@@ -5541,7 +5595,9 @@ private:
                         request, validated, matrix,
                         stream->scores
                             + local * stream->score_head_stride,
-                        stream->score_row_stride, worker, worker_count)) {
+                        stream->score_row_stride, worker, worker_count,
+                        stream->indices == nullptr ? nullptr
+                            : stream->indices + local * stream->index_head_stride)) {
                     report_topk_error(
                         "direct cooperative rpcmem INT8 Top-k failed for "
                         "head " + std::to_string(matrix));
@@ -6288,6 +6344,10 @@ private:
                     bucket.library,
                     "hmx_qk_i8_operator_execute_cpu_packed_shared_key_hn",
                     bucket.execute_cpu_packed_shared_key_hn);
+                (void)loadOptionalSymbolFrom(
+                    bucket.library,
+                    "hmx_qk_i8_operator_execute_cpu_packed_shared_key_topk_hn",
+                    bucket.execute_cpu_packed_shared_key_topk_hn);
                 (void)loadOptionalSymbolFrom(
                     bucket.library,
                     "hmx_qk_i8_operator_prepare_raw_key_scaled_hn",

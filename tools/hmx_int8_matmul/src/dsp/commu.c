@@ -9,10 +9,12 @@
 #include <stdint.h>
 
 #include "dsp/hmx_i8_kernel.h"
+#include "dsp/hvx_score_topk.h"
 #include "dsp/hvx_worker_pool.h"
 #include "dsp/runtime.h"
 #include "hmx_i8_common.h"
 #include "hmx_i8_dsp_timing.h"
+#include "hmx_i8_packed_topk_layout.h"
 #include "hmx_int8_rpc.h"
 
 #ifndef HMX_HVX_EPILOGUE_LANES
@@ -1322,27 +1324,9 @@ AEEResult hmx_int8_rpc_execute_qk_i8_packed(
     return kernel_status == 0 ? AEE_SUCCESS : AEE_EFAILED;
 }
 
-static void publish_cpu_packed_scores(
-    int8_t *output,
-    size_t output_stride,
-    volatile int32_t *ready,
-    int32 publish_begin,
-    int32 publish_end,
-    hmx_i8_dsp_timing *timing) {
-    /* RpcMem is uncached on ARM but cached on the DSP. Publish one
-     * contiguous macro-group only after every score block in it has
-     * reached DDR. Keeping the HMX loop H12-fused while reducing
-     * cache-maintenance and host notification frequency avoids the
-     * per-head long-RPC protocol overhead. */
+static void publish_cpu_packed_ready(
+    volatile int32_t *ready, int32 publish_begin, int32 publish_end) {
     const int32 publish_count = publish_end - publish_begin;
-    const uint64_t output_flush = HAP_perf_get_qtimer_count();
-    qurt_mem_cache_clean(
-        (qurt_addr_t)(output
-                      + (size_t)publish_begin * output_stride),
-        (size_t)publish_count * output_stride,
-        QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
-    timing->output_flush_ticks +=
-        HAP_perf_get_qtimer_count() - output_flush;
     __asm__ __volatile__("barrier" : : : "memory");
     for (int32 published = publish_begin;
          published < publish_end; ++published) {
@@ -1364,6 +1348,30 @@ static void publish_cpu_packed_scores(
         QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
 }
 
+static void publish_cpu_packed_scores(
+    int8_t *output,
+    size_t output_stride,
+    volatile int32_t *ready,
+    int32 publish_begin,
+    int32 publish_end,
+    hmx_i8_dsp_timing *timing) {
+    /* RpcMem is uncached on ARM but cached on the DSP. Publish one
+     * contiguous macro-group only after every score block in it has
+     * reached DDR. Keeping the HMX loop H12-fused while reducing
+     * cache-maintenance and host notification frequency avoids the
+     * per-head long-RPC protocol overhead. */
+    const int32 publish_count = publish_end - publish_begin;
+    const uint64_t output_flush = HAP_perf_get_qtimer_count();
+    qurt_mem_cache_clean(
+        (qurt_addr_t)(output
+                      + (size_t)publish_begin * output_stride),
+        (size_t)publish_count * output_stride,
+        QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+    timing->output_flush_ticks +=
+        HAP_perf_get_qtimer_count() - output_flush;
+    publish_cpu_packed_ready(ready, publish_begin, publish_end);
+}
+
 #if HMX_I8_VTCM_SHARED_KEY
 typedef struct {
     int8_t *output;
@@ -1372,16 +1380,49 @@ typedef struct {
     hmx_i8_dsp_timing *timing;
     int32 next_head;
     uint64_t elapsed_ticks;
+    uint8_t *index_slabs;
+    size_t index_stride;
+    int32 padded_columns;
+    int32 valid_columns;
 } hmx_cpu_packed_score_publication;
 
-static void publish_cpu_packed_prefix(void *opaque, unsigned end) {
+static int publish_cpu_packed_prefix(void *opaque, unsigned end) {
     hmx_cpu_packed_score_publication *publication = opaque;
     const uint64_t begin = HAP_perf_get_qtimer_count();
-    publish_cpu_packed_scores(
-        publication->output, publication->output_stride, publication->ready,
-        publication->next_head, (int32)end, publication->timing);
+    if (publication->index_slabs != NULL) {
+        const size_t offset_start = hmx_i8_topk_offsets_start(
+            publication->index_stride, HMX_FIXED_M_PADDED);
+        for (unsigned head = (unsigned)publication->next_head; head < end; ++head) {
+            uint8_t *slab = publication->index_slabs + head * publication->index_stride;
+            const int32_t *offsets = (const int32_t *)(slab + offset_start);
+            const uint8_t *scores = (const uint8_t *)publication->output
+                + head * publication->output_stride;
+            qurt_mem_cache_clean((qurt_addr_t)offsets,
+                (HMX_FIXED_M_PADDED + 1) * sizeof(*offsets),
+                QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+            if (hmx_i8_hvx_topk_native(
+                    scores, HMX_FIXED_M_PADDED, publication->padded_columns,
+                    publication->valid_columns, offsets, (uint16_t *)slab,
+                    offset_start / sizeof(uint16_t)) != 0) {
+                publication->elapsed_ticks += HAP_perf_get_qtimer_count() - begin;
+                return -1;
+            }
+            const uint64_t flush_begin = HAP_perf_get_qtimer_count();
+            qurt_mem_cache_clean((qurt_addr_t)slab,
+                (size_t)offsets[HMX_FIXED_M_PADDED] * sizeof(uint16_t),
+                QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+            publication->timing->output_flush_ticks +=
+                HAP_perf_get_qtimer_count() - flush_begin;
+        }
+        publish_cpu_packed_ready(publication->ready, publication->next_head, (int32)end);
+    } else {
+        publish_cpu_packed_scores(
+            publication->output, publication->output_stride, publication->ready,
+            publication->next_head, (int32)end, publication->timing);
+    }
     publication->next_head = (int32)end;
     publication->elapsed_ticks += HAP_perf_get_qtimer_count() - begin;
+    return 0;
 }
 #endif
 
@@ -1396,12 +1437,20 @@ static AEEResult execute_qk_i8_cpu_packed(
     int32 heads,
     int32 n,
     int shared_key,
-    uint64_t key_sources) {
+    uint64_t key_sources,
+    int32 index_arena_offset,
+    int32 valid_columns) {
+    const int native_topk = index_arena_offset >= 0;
     if (buffer_fd < 0 || query_offset < 0 || key_offset < 0 ||
         key_sums_offset < 0 || output_offset < 0 || scales_offset < 0 ||
         ready_offset < 0 || heads <= 0 || heads > HMX_FIXED_HEADS ||
         n <= 0 || n > HMX_FIXED_N_PADDED || (n % 32) != 0 ||
-        (shared_key && !hmx_packed_key_map_valid(key_sources, heads))) {
+        (shared_key && !hmx_packed_key_map_valid(key_sources, heads)) ||
+        (native_topk && (!HMX_I8_VTCM_SHARED_KEY || !shared_key ||
+                         HMX_FIXED_M_PADDED != 512 ||
+                         heads != HMX_LONG_RPC_READY_GROUP_HEADS ||
+                         (index_arena_offset & 127) != 0 ||
+                         valid_columns < HMX_FIXED_M_PADDED || valid_columns > n))) {
         return AEE_EBADPARM;
     }
 
@@ -1472,22 +1521,28 @@ static AEEResult execute_qk_i8_cpu_packed(
         hmx_cpu_packed_score_publication publication = {
             .output = output, .output_stride = output_stride,
             .ready = ready, .timing = &timing,
+            .index_slabs = native_topk ? buffer + index_arena_offset : NULL,
+            .index_stride = (size_t)HMX_FIXED_N_PADDED * HMX_FIXED_K_PADDED
+                * sizeof(uint16_t),
+            .padded_columns = n, .valid_columns = valid_columns,
         };
         const uint64_t hmx_begin = HAP_perf_get_qtimer_count();
         status = hmx_i8_kernel_qk_i8_packed_shared_key(
             output, query, key, key_sums, head_requant,
             HMX_FIXED_M_PADDED, HMX_FIXED_K_PADDED, n, (unsigned)heads,
             key_sources, ready, session->vtcm_base, session->vtcm_size,
-            HMX_I8_VTCM_EARLY_SCORE_PUBLISH ? publish_cpu_packed_prefix : NULL,
+            native_topk,
+            (native_topk || HMX_I8_VTCM_EARLY_SCORE_PUBLISH)
+                ? publish_cpu_packed_prefix : NULL,
             &publication);
         timing.hmx_kernel_ticks += HAP_perf_get_qtimer_count() - hmx_begin
             - publication.elapsed_ticks;
         if (status == 0) {
-            publish_cpu_packed_scores(
-                output, output_stride, ready,
-                publication.next_head, heads, &timing);
+            status = publish_cpu_packed_prefix(&publication, (unsigned)heads);
             publish_begin = heads;
         }
+    } else if (native_topk) {
+        status = -1;
     }
 #endif
     for (int32 head = publish_begin; head < heads && status == 0; ++head) {
@@ -1614,7 +1669,7 @@ AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_per_head(
     (void)handle;
     return execute_qk_i8_cpu_packed(
         buffer_fd, query_offset, key_offset, key_sums_offset, output_offset,
-        scales_offset, ready_offset, heads, n, 0, 0);
+        scales_offset, ready_offset, heads, n, 0, 0, -1, 0);
 }
 
 AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_shared_key(
@@ -1627,7 +1682,23 @@ AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_shared_key(
         | ((uint64_t)key_sources_high << 32);
     return execute_qk_i8_cpu_packed(
         buffer_fd, query_offset, key_offset, key_sums_offset, output_offset,
-        scales_offset, ready_offset, heads, n, 1, key_sources);
+        scales_offset, ready_offset, heads, n, 1, key_sources, -1, 0);
+}
+
+AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_shared_key_topk(
+    remote_handle64 handle, int32 buffer_fd, int32 query_offset,
+    int32 key_offset, int32 key_sums_offset, int32 output_offset,
+    int32 scales_offset, int32 ready_offset, int32 heads, int32 n,
+    uint32 key_sources_low, uint32 key_sources_high,
+    int32 index_arena_offset, int32 valid_columns) {
+    (void)handle;
+    if (index_arena_offset < 0) return AEE_EBADPARM;
+    const uint64_t key_sources = (uint64_t)key_sources_low
+        | ((uint64_t)key_sources_high << 32);
+    return execute_qk_i8_cpu_packed(
+        buffer_fd, query_offset, key_offset, key_sums_offset, output_offset,
+        scales_offset, ready_offset, heads, n, 1, key_sources,
+        index_arena_offset, valid_columns);
 }
 
 AEEResult hmx_int8_rpc_prepare_qk_i8_raw_key(

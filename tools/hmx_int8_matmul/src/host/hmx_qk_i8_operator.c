@@ -74,6 +74,10 @@ int hmx_i8_execute_qk_i8_cpu_packed_per_head(
 int hmx_i8_execute_qk_i8_cpu_packed_shared_key(
     hmx_i8_context *context, int32_t heads, int32_t n,
     const float *requant_scales, uint64_t key_sources);
+int hmx_i8_execute_qk_i8_cpu_packed_shared_key_topk(
+    hmx_i8_context *context, int32_t heads, int32_t n,
+    const float *requant_scales, uint64_t key_sources,
+    const int32_t *const *row_offsets, int32_t valid_columns);
 int hmx_i8_begin_qk_i8_packed(hmx_i8_context *context, int32_t n);
 int hmx_i8_end_qk_i8_packed(hmx_i8_context *context);
 int hmx_i8_matmul_qk_i8_direct(
@@ -258,6 +262,14 @@ int hmx_qk_i8_operator_execute_cpu_packed_shared_key_hn(
     const float *requant_scales, uint64_t key_sources) {
     return hmx_i8_execute_qk_i8_cpu_packed_shared_key(
         context, heads, n, requant_scales, key_sources);
+}
+
+int hmx_qk_i8_operator_execute_cpu_packed_shared_key_topk_hn(
+    hmx_i8_context *context, int32_t heads, int32_t n,
+    const float *requant_scales, uint64_t key_sources,
+    const int32_t *const *row_offsets, int32_t valid_columns) {
+    return hmx_i8_execute_qk_i8_cpu_packed_shared_key_topk(
+        context, heads, n, requant_scales, key_sources, row_offsets, valid_columns);
 }
 
 int hmx_qk_i8_operator_begin(hmx_i8_context *context, int32_t n) {

@@ -303,7 +303,8 @@ static inline __attribute__((always_inline)) void quantize_readout_slot_i8_range
     int lane,
     int lanes,
     int aligned_rows,
-    int use_q15) {
+    int use_q15,
+    int native_tiles) {
     const HVX_Vector *plane0 = (const HVX_Vector *)(
         readout_slot + 0 * ACC_PLANE_BYTES);
     const HVX_Vector *plane1 = (const HVX_Vector *)(
@@ -354,12 +355,16 @@ static inline __attribute__((always_inline)) void quantize_readout_slot_i8_range
                 row2, correction, scale, positive_half, negative_half);
             row3 = round_and_bias_scores_i32(
                 row3, correction, scale, positive_half, negative_half);
-            if (HMX_I8_HVX_PACK4_SCORE_ROWS && aligned_rows) {
+            if (native_tiles || (HMX_I8_HVX_PACK4_SCORE_ROWS && aligned_rows)) {
                 const HVX_Vector rows01 = Q6_Vh_vpack_VwVw_sat(row1, row0);
                 const HVX_Vector rows23 = Q6_Vh_vpack_VwVw_sat(row3, row2);
                 const HVX_Vector packed = Q6_V_vxor_VV(
                     Q6_Vub_vpack_VhVh_sat(rows23, rows01),
                     Q6_V_vsplat_R((int32_t)0x80808080u));
+                if (native_tiles) {
+                    *(HVX_Vector *)(base + (size_t)column_start * 4) = packed;
+                    continue;
+                }
                 /* Rotate the selected row quarter into the store predicate. */
                 base += column_start - store_offset;
                 store_score_row32(base, store_offset, keep, packed);
@@ -416,20 +421,20 @@ static void quantize_readout_slot_i8_range(
         if (aligned_rows) {
             quantize_readout_slot_i8_range_impl(
                 output, output_leading_dimension, row_start, column_start,
-                readout_slot, rhs_sums, output_scale, lane, lanes, 1, 1);
+                readout_slot, rhs_sums, output_scale, lane, lanes, 1, 1, 0);
         } else {
             quantize_readout_slot_i8_range_impl(
                 output, output_leading_dimension, row_start, column_start,
-                readout_slot, rhs_sums, output_scale, lane, lanes, 0, 1);
+                readout_slot, rhs_sums, output_scale, lane, lanes, 0, 1, 0);
         }
     } else if (aligned_rows) {
         quantize_readout_slot_i8_range_impl(
             output, output_leading_dimension, row_start, column_start,
-            readout_slot, rhs_sums, output_scale, lane, lanes, 1, 0);
+            readout_slot, rhs_sums, output_scale, lane, lanes, 1, 0, 0);
     } else {
         quantize_readout_slot_i8_range_impl(
             output, output_leading_dimension, row_start, column_start,
-            readout_slot, rhs_sums, output_scale, lane, lanes, 0, 0);
+            readout_slot, rhs_sums, output_scale, lane, lanes, 0, 0, 0);
     }
 }
 
@@ -1518,6 +1523,17 @@ static void hmx_stage_packed_input(
     hmx_dma_start(dma);
 }
 
+static inline void quantize_shared_key_slot_i8(
+    int8_t *output, int columns, int row, int column,
+    const uint8_t *readout, const int32_t *sums, float scale, int native_tiles) {
+    if (native_tiles) {
+        quantize_readout_slot_i8_range_impl(
+            output, columns, row, column, readout, sums, scale, 0, 1, 0, 0, 1);
+    } else {
+        quantize_readout_slot_i8(output, columns, row, column, readout, sums, scale);
+    }
+}
+
 int hmx_i8_kernel_qk_i8_packed_shared_key(
     int8_t *output,
     const uint8_t *packed_query,
@@ -1532,10 +1548,12 @@ int hmx_i8_kernel_qk_i8_packed_shared_key(
     volatile int32_t *producer_progress,
     uint8_t *vtcm,
     uint32_t vtcm_size,
+    int native_tiles,
     hmx_i8_score_prefix_ready_fn prefix_ready,
     void *ready_context) {
     const uint32_t required = hmx_i8_qk_packed_vtcm_bytes(m, k, n);
-    if (required == 0 || required > vtcm_size) return -1;
+    if (required == 0 || required > vtcm_size ||
+        (native_tiles && ((uintptr_t)output & 127u) != 0)) return -1;
 
     const int m_tiles = m / HMX_I8_M_TILE;
     const int k_tiles = k / HMX_I8_K_TILE;
@@ -1644,23 +1662,23 @@ int hmx_i8_kernel_qk_i8_packed_shared_key(
                             query_buffers[query_slot],
                             key_buffer + (size_t)col * k, k_tiles);
                         if (col > 0) {
-                            quantize_readout_slot_i8(
+                            quantize_shared_key_slot_i8(
                                 head_output, n, row_start,
                                 first_col + col - HMX_I8_N_TILE,
                                 readout + (size_t)(slot ^ 1)
                                     * ACC_READOUT_SLOT_BYTES,
-                                owner_sums, scale);
+                                owner_sums, scale, native_tiles);
                         }
                         read_accumulator_planes(
                             config, readout + (size_t)slot
                                 * ACC_READOUT_SLOT_BYTES);
                         slot ^= 1;
                     }
-                    quantize_readout_slot_i8(
+                    quantize_shared_key_slot_i8(
                         head_output, n, row_start,
                         first_col + cols - HMX_I8_N_TILE,
                         readout + (size_t)(slot ^ 1) * ACC_READOUT_SLOT_BYTES,
-                        owner_sums, scale);
+                        owner_sums, scale, native_tiles);
                 }
             }
             first_col += cols;
@@ -1674,7 +1692,7 @@ int hmx_i8_kernel_qk_i8_packed_shared_key(
                 ++end;
             }
             if (end > published && end != heads) {
-                prefix_ready(ready_context, end);
+                if (prefix_ready(ready_context, end) != 0) return -1;
                 published = end;
             }
         }

@@ -203,6 +203,12 @@ HMX_I8_API int hmx_qk_i8_operator_execute_cpu_packed_per_head_hn(
 HMX_I8_API int hmx_qk_i8_operator_execute_cpu_packed_shared_key_hn(
     hmx_i8_context *context, int32_t heads, int32_t padded_n,
     const float *requant_scales, uint64_t key_sources);
+/* Run exact causal Top-k on the DSP and publish uint16 indices in raw-K
+ * storage. The caller owns the row offsets until the RPC has joined. */
+HMX_I8_API int hmx_qk_i8_operator_execute_cpu_packed_shared_key_topk_hn(
+    hmx_i8_context *context, int32_t heads, int32_t n,
+    const float *requant_scales, uint64_t key_sources,
+    const int32_t *const *row_offsets, int32_t valid_columns);
 HMX_I8_API int hmx_qk_i8_operator_begin(
     hmx_i8_context *context,
     int32_t n);

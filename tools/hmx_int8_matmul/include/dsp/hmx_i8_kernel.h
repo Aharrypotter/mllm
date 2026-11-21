@@ -118,7 +118,7 @@ int hmx_i8_kernel_qk_i8_packed_streamed(
     uint32_t vtcm_size);
 
 #if HMX_I8_VTCM_SHARED_KEY
-typedef void (*hmx_i8_score_prefix_ready_fn)(void *context, unsigned end);
+typedef int (*hmx_i8_score_prefix_ready_fn)(void *context, unsigned end);
 
 /* Each K chunk is staged once per source in the validated packed-head map.
  * An optional callback receives completed prefixes of query heads. The caller
@@ -138,6 +138,7 @@ int hmx_i8_kernel_qk_i8_packed_shared_key(
     volatile int32_t *producer_progress,
     uint8_t *vtcm,
     uint32_t vtcm_size,
+    int native_tiles,
     hmx_i8_score_prefix_ready_fn prefix_ready,
     void *ready_context);
 #endif
