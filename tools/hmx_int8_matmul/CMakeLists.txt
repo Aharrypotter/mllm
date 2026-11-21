@@ -35,6 +35,8 @@ option(HMX_I8_SHARED_KEY_WIDE_TAIL
 if(HMX_I8_VTCM_SHARED_KEY AND NOT "${HMX_HVX_EPILOGUE_LANES}" STREQUAL "1")
     message(FATAL_ERROR "HMX_I8_VTCM_SHARED_KEY requires one HVX epilogue lane")
 endif()
+option(HMX_I8_HVX_ALIGNED_SCORE_STORES
+    "Reuse one HVX store predicate when the INT8 QK score row stride is aligned" OFF)
 foreach(fixed_dimension HMX_FIXED_M HMX_FIXED_K HMX_FIXED_N HMX_FIXED_HEADS)
     if(NOT "${${fixed_dimension}}" MATCHES "^[1-9][0-9]*$")
         message(FATAL_ERROR "${fixed_dimension} must be a positive integer")
@@ -246,6 +248,7 @@ else()
         HMX_LONG_RPC_READY_GROUP_HEADS=${HMX_LONG_RPC_READY_GROUP_HEADS}
         HMX_I8_VTCM_SHARED_KEY=$<BOOL:${HMX_I8_VTCM_SHARED_KEY}>
         HMX_I8_SHARED_KEY_WIDE_TAIL=$<BOOL:${HMX_I8_SHARED_KEY_WIDE_TAIL}>
+        HMX_I8_HVX_ALIGNED_SCORE_STORES=$<BOOL:${HMX_I8_HVX_ALIGNED_SCORE_STORES}>
     )
     set_target_properties(hmx_int8_rpc_skel PROPERTIES
         OUTPUT_NAME ${HMX_RPC_SKEL_OUTPUT_NAME})

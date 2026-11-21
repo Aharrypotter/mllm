@@ -20,6 +20,9 @@
 #ifndef HMX_HVX_EPILOGUE_BATCH_TILES
 #define HMX_HVX_EPILOGUE_BATCH_TILES 8
 #endif
+#ifndef HMX_I8_HVX_ALIGNED_SCORE_STORES
+#define HMX_I8_HVX_ALIGNED_SCORE_STORES 0
+#endif
 
 #if HMX_HVX_EPILOGUE_LANES > 1
 #define HMX_I8_ACC_PIPELINE_SLOTS (2 * HMX_HVX_EPILOGUE_BATCH_TILES)
@@ -218,6 +221,15 @@ static inline __attribute__((always_inline)) void store_vector_bytes(
     Q6_vmem_QnRIV(left_mask, (HVX_Vector *)address, value);
 }
 
+static inline __attribute__((always_inline)) void store_score_row32(
+    int8_t *aligned_row,
+    int byte_offset,
+    HVX_VectorPred keep,
+    HVX_Vector scores) {
+    const HVX_Vector rotated = Q6_V_vlalign_VVR(scores, scores, byte_offset);
+    Q6_vmem_QnRIV(keep, (HVX_Vector *)aligned_row, rotated);
+}
+
 #define SHUFFLE_4XA8_VECTORS(v0, v1, v2, v3, out0, out1, out2, out3) do { \
     HVX_VectorPair pair_a_ = Q6_W_vshuff_VVR((v1), (v0), -1); \
     HVX_VectorPair pair_b_ = Q6_W_vshuff_VVR((v3), (v2), -1); \
@@ -256,7 +268,7 @@ quantize_i32_vector_to_i8_low32(
     return Q6_V_vxor_VV(packed, Q6_V_vsplat_R((int32_t)0x80808080u));
 }
 
-static void quantize_readout_slot_i8_range(
+static inline __attribute__((always_inline)) void quantize_readout_slot_i8_range_impl(
     int8_t *output,
     int output_leading_dimension,
     int row_start,
@@ -265,7 +277,8 @@ static void quantize_readout_slot_i8_range(
     const int32_t *rhs_sums,
     float output_scale,
     int lane,
-    int lanes) {
+    int lanes,
+    int aligned_rows) {
     const HVX_Vector *plane0 = (const HVX_Vector *)(
         readout_slot + 0 * ACC_PLANE_BYTES);
     const HVX_Vector *plane1 = (const HVX_Vector *)(
@@ -283,6 +296,13 @@ static void quantize_readout_slot_i8_range(
     const HVX_Vector scale = Q6_V_vsplat_R((int32_t)scale_bits.bits);
     const HVX_Vector positive_half = Q6_V_vsplat_R(0x3f000000);
     const HVX_Vector negative_half = Q6_V_vsplat_R((int32_t)0xbf000000u);
+    const int store_offset = column_start & 127;
+    HVX_VectorPred keep;
+    if (aligned_rows) {
+        const HVX_VectorPred before = Q6_Q_vsetq_R(store_offset);
+        const HVX_VectorPred through = Q6_Q_vsetq2_R(store_offset + HMX_I8_N_TILE);
+        keep = Q6_Q_or_QQn(before, through);
+    }
 
     for (int stripe = lane; stripe < 16; stripe += lanes) {
         HVX_Vector row0;
@@ -303,12 +323,46 @@ static void quantize_readout_slot_i8_range(
             row3, correction, scale, positive_half, negative_half);
 
         int8_t *base = output
-            + (size_t)(row_start + stripe * 4) * output_leading_dimension
-            + column_start;
-        store_vector_bytes(base + 0 * output_leading_dimension, 32, row0);
-        store_vector_bytes(base + 1 * output_leading_dimension, 32, row1);
-        store_vector_bytes(base + 2 * output_leading_dimension, 32, row2);
-        store_vector_bytes(base + 3 * output_leading_dimension, 32, row3);
+            + (size_t)(row_start + stripe * 4) * output_leading_dimension;
+        if (aligned_rows) {
+            /* Each tile starts on one of four 32-byte quarters. All four
+             * rows have the same quarter in their 128-byte destination. */
+            base += column_start - store_offset;
+            store_score_row32(base, store_offset, keep, row0);
+            store_score_row32(base + output_leading_dimension, store_offset, keep, row1);
+            store_score_row32(base + 2 * output_leading_dimension, store_offset, keep, row2);
+            store_score_row32(base + 3 * output_leading_dimension, store_offset, keep, row3);
+        } else {
+            base += column_start;
+            store_vector_bytes(base, HMX_I8_N_TILE, row0);
+            store_vector_bytes(base + output_leading_dimension, HMX_I8_N_TILE, row1);
+            store_vector_bytes(base + 2 * output_leading_dimension, HMX_I8_N_TILE, row2);
+            store_vector_bytes(base + 3 * output_leading_dimension, HMX_I8_N_TILE, row3);
+        }
+    }
+}
+
+static void quantize_readout_slot_i8_range(
+    int8_t *output,
+    int output_leading_dimension,
+    int row_start,
+    int column_start,
+    const uint8_t *readout_slot,
+    const int32_t *rhs_sums,
+    float output_scale,
+    int lane,
+    int lanes) {
+    const int aligned_rows = HMX_I8_HVX_ALIGNED_SCORE_STORES
+        && (((uintptr_t)output | (uintptr_t)output_leading_dimension) & 127u) == 0
+        && (column_start & (HMX_I8_N_TILE - 1)) == 0;
+    if (aligned_rows) {
+        quantize_readout_slot_i8_range_impl(
+            output, output_leading_dimension, row_start, column_start,
+            readout_slot, rhs_sums, output_scale, lane, lanes, 1);
+    } else {
+        quantize_readout_slot_i8_range_impl(
+            output, output_leading_dimension, row_start, column_start,
+            readout_slot, rhs_sums, output_scale, lane, lanes, 0);
     }
 }
 
