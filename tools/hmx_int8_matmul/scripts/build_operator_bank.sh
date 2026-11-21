@@ -47,6 +47,7 @@ long_rpc_ready_group_heads="${HMX_LONG_RPC_READY_GROUP_HEADS:-12}"
 vtcm_shared_key="${HMX_I8_VTCM_SHARED_KEY:-OFF}"
 vtcm_shared_key_wide_tail="${HMX_I8_SHARED_KEY_WIDE_TAIL:-OFF}"
 hvx_aligned_score_stores="${HMX_I8_HVX_ALIGNED_SCORE_STORES:-OFF}"
+hvx_pack4_score_rows="${HMX_I8_HVX_PACK4_SCORE_ROWS:-OFF}"
 hvx_q15_score_requant="${HMX_I8_HVX_Q15_SCORE_REQUANT:-OFF}"
 vtcm_early_score_publish="${HMX_I8_VTCM_EARLY_SCORE_PUBLISH:-OFF}"
 
@@ -436,6 +437,7 @@ build_shape_variants() {
                         HMX_I8_VTCM_SHARED_KEY="${vtcm_shared_key}" \
                         HMX_I8_SHARED_KEY_WIDE_TAIL="${vtcm_shared_key_wide_tail}" \
                         HMX_I8_HVX_ALIGNED_SCORE_STORES="${hvx_aligned_score_stores}" \
+                        HMX_I8_HVX_PACK4_SCORE_ROWS="${hvx_pack4_score_rows}" \
                         HMX_I8_HVX_Q15_SCORE_REQUANT="${hvx_q15_score_requant}" \
                         HMX_I8_VTCM_EARLY_SCORE_PUBLISH="${vtcm_early_score_publish}" \
                         HMX_RPC_SKEL_OUTPUT_NAME="${skel_output_name}"

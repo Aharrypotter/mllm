@@ -23,6 +23,9 @@
 #ifndef HMX_I8_HVX_ALIGNED_SCORE_STORES
 #define HMX_I8_HVX_ALIGNED_SCORE_STORES 0
 #endif
+#ifndef HMX_I8_HVX_PACK4_SCORE_ROWS
+#define HMX_I8_HVX_PACK4_SCORE_ROWS 0
+#endif
 #ifndef HMX_I8_HVX_Q15_SCORE_REQUANT
 #define HMX_I8_HVX_Q15_SCORE_REQUANT 0
 #endif
@@ -247,7 +250,7 @@ static inline __attribute__((always_inline)) void store_score_row32(
 } while (0)
 
 static inline __attribute__((always_inline)) HVX_Vector
-quantize_i32_vector_to_i8_low32(
+round_and_bias_scores_i32(
     HVX_Vector accumulator,
     HVX_Vector correction,
     HVX_Vector scale,
@@ -264,8 +267,12 @@ quantize_i32_vector_to_i8_low32(
         Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vw(corrected), scale));
     const HVX_Vector rounded = Q6_Vw_equals_Vsf(
         Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(scaled, rounding)));
-    const HVX_Vector int8_bias = Q6_V_vsplat_R(128);
-    const HVX_Vector biased = Q6_Vw_vadd_VwVw(rounded, int8_bias);
+    return Q6_Vw_vadd_VwVw(rounded, Q6_V_vsplat_R(128));
+}
+
+static inline __attribute__((always_inline)) HVX_Vector
+pack_biased_score_row(HVX_Vector biased) {
+    const HVX_Vector zero = Q6_V_vzero();
     const HVX_Vector half = Q6_Vh_vpack_VwVw_sat(zero, biased);
     const HVX_Vector packed = Q6_Vub_vpack_VhVh_sat(zero, half);
     return Q6_V_vxor_VV(packed, Q6_V_vsplat_R((int32_t)0x80808080u));
@@ -331,24 +338,45 @@ static inline __attribute__((always_inline)) void quantize_readout_slot_i8_range
             plane0[stripe], plane1[stripe],
             plane2[stripe], plane3[stripe],
             row0, row1, row2, row3);
+        int8_t *base = output
+            + (size_t)(row_start + stripe * 4) * output_leading_dimension;
         if (use_q15) {
             row0 = quantize_i32_pair_q15(row0, row1, correction);
             row1 = Q6_V_vror_VR(row0, 64);
             row2 = quantize_i32_pair_q15(row2, row3, correction);
             row3 = Q6_V_vror_VR(row2, 64);
         } else {
-            row0 = quantize_i32_vector_to_i8_low32(
+            row0 = round_and_bias_scores_i32(
                 row0, correction, scale, positive_half, negative_half);
-            row1 = quantize_i32_vector_to_i8_low32(
+            row1 = round_and_bias_scores_i32(
                 row1, correction, scale, positive_half, negative_half);
-            row2 = quantize_i32_vector_to_i8_low32(
+            row2 = round_and_bias_scores_i32(
                 row2, correction, scale, positive_half, negative_half);
-            row3 = quantize_i32_vector_to_i8_low32(
+            row3 = round_and_bias_scores_i32(
                 row3, correction, scale, positive_half, negative_half);
+            if (HMX_I8_HVX_PACK4_SCORE_ROWS && aligned_rows) {
+                const HVX_Vector rows01 = Q6_Vh_vpack_VwVw_sat(row1, row0);
+                const HVX_Vector rows23 = Q6_Vh_vpack_VwVw_sat(row3, row2);
+                const HVX_Vector packed = Q6_V_vxor_VV(
+                    Q6_Vub_vpack_VhVh_sat(rows23, rows01),
+                    Q6_V_vsplat_R((int32_t)0x80808080u));
+                /* Rotate the selected row quarter into the store predicate. */
+                base += column_start - store_offset;
+                store_score_row32(base, store_offset, keep, packed);
+                store_score_row32(base + output_leading_dimension,
+                                  (store_offset - 32) & 127, keep, packed);
+                store_score_row32(base + 2 * output_leading_dimension,
+                                  (store_offset - 64) & 127, keep, packed);
+                store_score_row32(base + 3 * output_leading_dimension,
+                                  (store_offset - 96) & 127, keep, packed);
+                continue;
+            }
+            row0 = pack_biased_score_row(row0);
+            row1 = pack_biased_score_row(row1);
+            row2 = pack_biased_score_row(row2);
+            row3 = pack_biased_score_row(row3);
         }
 
-        int8_t *base = output
-            + (size_t)(row_start + stripe * 4) * output_leading_dimension;
         if (aligned_rows) {
             /* Each tile starts on one of four 32-byte quarters. All four
              * rows have the same quarter in their 128-byte destination. */

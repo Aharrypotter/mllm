@@ -39,6 +39,8 @@ if(HMX_I8_VTCM_SHARED_KEY AND NOT "${HMX_HVX_EPILOGUE_LANES}" STREQUAL "1")
 endif()
 option(HMX_I8_HVX_ALIGNED_SCORE_STORES
     "Reuse one HVX store predicate when the INT8 QK score row stride is aligned" OFF)
+option(HMX_I8_HVX_PACK4_SCORE_ROWS
+    "Pack four rounded float score rows before aligned HVX stores" OFF)
 option(HMX_I8_HVX_Q15_SCORE_REQUANT
     "Approximate the calibrated Qwen2.5-1.5B INT8 QK scale with paired Q15" OFF)
 foreach(fixed_dimension HMX_FIXED_M HMX_FIXED_K HMX_FIXED_N HMX_FIXED_HEADS)
@@ -253,6 +255,7 @@ else()
         HMX_I8_VTCM_SHARED_KEY=$<BOOL:${HMX_I8_VTCM_SHARED_KEY}>
         HMX_I8_SHARED_KEY_WIDE_TAIL=$<BOOL:${HMX_I8_SHARED_KEY_WIDE_TAIL}>
         HMX_I8_HVX_ALIGNED_SCORE_STORES=$<BOOL:${HMX_I8_HVX_ALIGNED_SCORE_STORES}>
+        HMX_I8_HVX_PACK4_SCORE_ROWS=$<BOOL:${HMX_I8_HVX_PACK4_SCORE_ROWS}>
         HMX_I8_HVX_Q15_SCORE_REQUANT=$<BOOL:${HMX_I8_HVX_Q15_SCORE_REQUANT}>
         HMX_I8_VTCM_EARLY_SCORE_PUBLISH=$<BOOL:${HMX_I8_VTCM_EARLY_SCORE_PUBLISH}>
     )
