@@ -13,8 +13,11 @@
 #include <arm_neon.h>
 #endif
 
+#include "mllm/core/DataTypes.hpp"
+
 namespace mllm::models::qwen_npu {
 
+template <bool RoundThroughHalf = false>
 inline void quantizeShadowAttentionInt8(const float* input, int8_t* output, size_t count, float inverse_scale) {
 #if defined(__clang__)
 #pragma clang fp contract(off) reassociate(off)
@@ -23,7 +26,9 @@ inline void quantizeShadowAttentionInt8(const float* input, int8_t* output, size
 #if defined(__aarch64__)
   const auto half = vdupq_n_f32(0.5F);
   const auto rounded = [inverse_scale, half](const float* values) {
-    auto scaled = vmulq_n_f32(vld1q_f32(values), inverse_scale);
+    auto input_values = vld1q_f32(values);
+    if constexpr (RoundThroughHalf) { input_values = vcvt_f32_f16(vcvt_f16_f32(input_values)); }
+    auto scaled = vmulq_n_f32(input_values, inverse_scale);
     // The Android fast-math build can contract separate NEON intrinsics into FMLA.
     // Keep the intermediate FP32 rounding without a memory round trip.
     asm("" : "+w"(scaled));
@@ -47,7 +52,9 @@ inline void quantizeShadowAttentionInt8(const float* input, int8_t* output, size
       continue;
     }
     // Preserve the separate FP32 multiply and addition used by the tested encoder.
-    const volatile float scaled = input[i] * inverse_scale;
+    float value = input[i];
+    if constexpr (RoundThroughHalf) { value = static_cast<float>(static_cast<mllm_fp16_t>(value)); }
+    const volatile float scaled = value * inverse_scale;
     const float shifted = scaled + 0.5F;
     output[i] = static_cast<int8_t>(std::floor(std::clamp(shifted, -128.0F, 127.0F)));
   }

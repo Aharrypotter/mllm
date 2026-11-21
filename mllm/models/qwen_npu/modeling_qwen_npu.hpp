@@ -590,7 +590,19 @@ class QwenOutProjAndMLP final : public nn::Module {
     if (!Context::instance().thisThread()->trace_mode) {
       attention = attention.contiguous();
       input.alloc();
-      quantizeShadowAttentionInt8(attention.ptr<float>(), input.ptr<int8_t>(), attention.numel(), 1.0F / step);
+      static const bool round_through_half = [] {
+        const auto* option = std::getenv("MLLM_QNN_SHADOW_INT8_FP16_ROUNDTRIP");
+        return option && option[0] == '1' && option[1] == '\0';
+      }();
+      const auto* values = attention.ptr<float>();
+      auto* codes = input.ptr<int8_t>();
+      const float inverse_step = 1.0F / step;
+      if (round_through_half) {
+        // Match the captured QNN Cast codes by rounding the attention values through FP16.
+        quantizeShadowAttentionInt8<true>(values, codes, attention.numel(), inverse_step);
+      } else {
+        quantizeShadowAttentionInt8(values, codes, attention.numel(), inverse_step);
+      }
     }
     return input;
   }
