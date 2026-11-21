@@ -528,6 +528,7 @@ class QwenOutProjAndMLP final : public nn::Module {
   int hidden_size_, intermediate_size_;
   bool shadow_down_proj_ = false;
   bool shadow_activation_fp16_ = false;
+  bool shadow_spatial_outputs_ = false;
   bool spatial_down_proj_tokens_ = false;
   bool spatial_mlp_tokens_ = false;
 
@@ -538,6 +539,7 @@ class QwenOutProjAndMLP final : public nn::Module {
     intermediate_size_ = cfg.intermediate_size;
     shadow_down_proj_ = shadow_down_proj;
     shadow_activation_fp16_ = shadow_down_proj && cfg.qnn_shadow_activation_fp16;
+    shadow_spatial_outputs_ = shadow_down_proj && cfg.qnn_shadow_spatial_outputs;
     spatial_down_proj_tokens_ = cfg.qnn_down_proj_spatial_tiles;
     spatial_mlp_tokens_ = cfg.qnn_mlp_spatial_tiles && !shadow_down_proj_;
 
@@ -614,14 +616,20 @@ class QwenOutProjAndMLP final : public nn::Module {
     up = up.to(kFloat32);
 
     x = gate * up;
+    const int token_width = spatial_down_proj_tokens_ && use_spatial_tiles ? spatial_width : mlp_width;
+    const bool keep_spatial_outputs = shadow_spatial_outputs_ && token_width != 1;
+    if (keep_spatial_outputs && mlp_width != token_width) {
+      x = x.view({B, S / token_width, token_width, intermediate_size_});
+    }
     auto shadow_input = x;
     // QNN serializes graph outputs in producer order. Emit the shadow
     // activation before the quantized projection and the residual.
     if (shadow_activation_fp16_) { shadow_input = shadow_input.to(kFloat16); }
 
-    const int token_width = spatial_down_proj_tokens_ && use_spatial_tiles ? spatial_width : mlp_width;
     // The spatial MLP already produces a square activation for the down projection.
-    if (mlp_width == 1) { x = x.view({B, S / token_width, token_width, intermediate_size_}); }
+    if (mlp_width == 1 && !keep_spatial_outputs) {
+      x = x.view({B, S / token_width, token_width, intermediate_size_});
+    }
     if (token_width != 1) {
       MLLM_INFO("QNN_DOWN_PROJ_SPATIAL_LAYOUT module={} shape=[{},{},{},{}]",
                 getModuleName(), B, S / token_width, token_width, intermediate_size_);
@@ -629,8 +637,9 @@ class QwenOutProjAndMLP final : public nn::Module {
     x.attach("qnn_quant_scale", down_proj_quantize_scale_.weight().impl());
     x = x.to(kInt16);
     x = down_proj_(x);
-    x = x.view({B, S, 1, hidden_size_});
     auto quantized_down_proj = x;
+    x = x.view({B, S, 1, hidden_size_});
+    if (!keep_spatial_outputs) { quantized_down_proj = x; }
     x = x.to(kFloat32);
     x = x.view({B, S, hidden_size_});
 
