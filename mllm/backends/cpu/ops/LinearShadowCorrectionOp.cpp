@@ -7,7 +7,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
+#include <vector>
 
+#include "mllm/backends/cpu/kernels/arm/cast_types.hpp"
 #include "mllm/core/DataTypes.hpp"
 #include "mllm/utils/Common.hpp"
 
@@ -25,6 +28,14 @@ bool scalarFlag(const Tensor& tensor) {
     default: NYI("Unsupported clip flag dtype");
   }
   return false;
+}
+
+void widenRow(const mllm_fp16_t* source, float* destination, int32_t channels) {
+#if defined(MLLM_HOST_ARCH_ARM64) || defined(MLLM_HOST_ARCH_ARM)
+  arm::fp16_2_fp32(source, destination, channels, 1);
+#else
+  std::transform(source, source + channels, destination, [](mllm_fp16_t value) { return static_cast<float>(value); });
+#endif
 }
 
 }  // namespace
@@ -53,7 +64,6 @@ void CPULinearShadowCorrectionOp::forward(const std::vector<Tensor>& inputs, std
   MLLM_RT_ASSERT(std::isfinite(input_step) && input_step > 0.0F);
   MLLM_RT_ASSERT(std::isfinite(output_step) && output_step > 0.0F);
 
-  const auto* x = original_input.ptr<float>();
   const auto* q_output = quantized_output.ptr<int16_t>();
   const auto* base = baseline.ptr<float>();
   auto* output = corrected.ptr<float>();
@@ -62,41 +72,64 @@ void CPULinearShadowCorrectionOp::forward(const std::vector<Tensor>& inputs, std
   const int32_t out_channels = options_.out_channels;
   const int64_t tokens = baseline.numel() / out_channels;
 
-  for (int64_t token = 0; token < tokens; ++token) {
-    const auto* token_input = x + token * in_channels;
-    auto* token_output = output + token * out_channels;
-
-    if (!clip_input) {
-      for (int32_t input_channel = 0; input_channel < in_channels; ++input_channel) {
-        const float unbounded_q = std::round(token_input[input_channel] / input_step);
-        if (unbounded_q >= static_cast<float>(kQuantMin) && unbounded_q <= static_cast<float>(kQuantMax)) { continue; }
-        const float clipped_q = std::clamp(unbounded_q, static_cast<float>(kQuantMin), static_cast<float>(kQuantMax));
-        const float correction_scale = (unbounded_q - clipped_q) * input_step * weight_step;
-        const auto* weight_row = weight + static_cast<int64_t>(input_channel) * out_channels;
-        for (int32_t output_channel = 0; output_channel < out_channels; ++output_channel) {
-          token_output[output_channel] += correction_scale * static_cast<float>(weight_row[output_channel]);
+  const auto correct_rows = [&]<typename Activation>(const Activation* x) {
+    constexpr bool widen = !std::is_same_v<Activation, float>;
+    std::vector<float> scratch(widen ? in_channels : 0);
+    for (int64_t token = 0; token < tokens; ++token) {
+      const auto* input_row = x + token * in_channels;
+      auto* token_output = output + token * out_channels;
+      const float* token_input = nullptr;
+      const auto input = [&]() -> const float* {
+        if constexpr (widen) {
+          if (!token_input) {
+            widenRow(input_row, scratch.data(), in_channels);
+            token_input = scratch.data();
+          }
+          return token_input;
+        } else {
+          return input_row;
         }
-      }
-    }
+      };
 
-    if (!clip_output) {
-      const auto* token_q_output = q_output + token * out_channels;
-      const auto* token_baseline = base + token * out_channels;
-      for (int32_t output_channel = 0; output_channel < out_channels; ++output_channel) {
-        const int32_t q_value = token_q_output[output_channel];
-        if (q_value > kQuantMin && q_value < kQuantMax) { continue; }
-
-        float full_sum = 0.0F;
+      if (!clip_input) {
+        const auto* row = input();
         for (int32_t input_channel = 0; input_channel < in_channels; ++input_channel) {
-          const float unbounded_q = std::round(token_input[input_channel] / input_step);
-          const int8_t q_weight = weight[static_cast<int64_t>(input_channel) * out_channels + output_channel];
-          full_sum += unbounded_q * input_step * static_cast<float>(q_weight) * weight_step;
+          const float unbounded_q = std::round(row[input_channel] / input_step);
+          if (unbounded_q >= static_cast<float>(kQuantMin) && unbounded_q <= static_cast<float>(kQuantMax)) { continue; }
+          const float clipped_q = std::clamp(unbounded_q, static_cast<float>(kQuantMin), static_cast<float>(kQuantMax));
+          const float correction_scale = (unbounded_q - clipped_q) * input_step * weight_step;
+          const auto* weight_row = weight + static_cast<int64_t>(input_channel) * out_channels;
+          for (int32_t output_channel = 0; output_channel < out_channels; ++output_channel) {
+            token_output[output_channel] += correction_scale * static_cast<float>(weight_row[output_channel]);
+          }
         }
-        const float restored_q = std::round(full_sum / output_step);
-        token_output[output_channel] =
-            token_baseline[output_channel] - static_cast<float>(q_value) * output_step + restored_q * output_step;
+      }
+
+      if (!clip_output) {
+        const auto* token_q_output = q_output + token * out_channels;
+        const auto* token_baseline = base + token * out_channels;
+        for (int32_t output_channel = 0; output_channel < out_channels; ++output_channel) {
+          const int32_t q_value = token_q_output[output_channel];
+          if (q_value > kQuantMin && q_value < kQuantMax) { continue; }
+
+          const auto* row = input();
+          float full_sum = 0.0F;
+          for (int32_t input_channel = 0; input_channel < in_channels; ++input_channel) {
+            const float unbounded_q = std::round(row[input_channel] / input_step);
+            const int8_t q_weight = weight[static_cast<int64_t>(input_channel) * out_channels + output_channel];
+            full_sum += unbounded_q * input_step * static_cast<float>(q_weight) * weight_step;
+          }
+          const float restored_q = std::round(full_sum / output_step);
+          token_output[output_channel] =
+              token_baseline[output_channel] - static_cast<float>(q_value) * output_step + restored_q * output_step;
+        }
       }
     }
+  };
+  if (original_input.dtype() == kFloat16) {
+    correct_rows(original_input.ptr<mllm_fp16_t>());
+  } else {
+    correct_rows(original_input.ptr<float>());
   }
 }
 

@@ -684,13 +684,19 @@ class QwenDecoder final : public nn::Module {
         const auto* value = std::getenv("MLLM_QNN_SHADOW_CPU_PROFILE");
         return value && value[0] == '1' && value[1] == '\0';
       }();
+      static const bool row_correction_enabled = [] {
+        const auto* value = std::getenv("MLLM_QNN_SHADOW_FP16_ROW_CORRECTION");
+        return value && value[0] == '1' && value[1] == '\0';
+      }();
       using Clock = std::chrono::steady_clock;
       const auto timestamp = [] { return profile_cpu ? Clock::now() : Clock::time_point{}; };
       const auto transfer_start = timestamp();
       auto activation = out_mlp_states[0].to(kCPU).contiguous();
       const auto activation_ready = timestamp();
-      const bool widen_activation = activation.dtype() == kFloat16;
-      if (widen_activation) { activation = activation.to(kFloat32); }
+      const bool fp16_activation = activation.dtype() == kFloat16;
+      // Preserve the existing CPU IR during QNN tracing and change only the loaded-context execution.
+      const bool use_row_correction = fp16_activation && row_correction_enabled && !Context::instance().thisThread()->trace_mode;
+      if (fp16_activation && !use_row_correction) { activation = activation.to(kFloat32); }
       const auto activation_widened = timestamp();
       auto quantized_output = out_mlp_states[1].to(kCPU).contiguous();
       auto residual_output = out_mlp_states[2].to(kCPU).contiguous();
@@ -703,9 +709,10 @@ class QwenDecoder final : public nn::Module {
         };
         MLLM_INFO("SHADOWNPU_SHADOW_CPU_PHASES layer={} activation_dtype={} activation_bytes={} transfer_us={} "
                   "widen_us={} aux_transfer_us={} correction_us={}",
-                  getModuleName(), widen_activation ? "fp16" : "fp32", out_mlp_states[0].bytes(),
+                  getModuleName(), fp16_activation ? "fp16" : "fp32", out_mlp_states[0].bytes(),
                   elapsed_us(transfer_start, activation_ready), elapsed_us(activation_ready, activation_widened),
                   elapsed_us(activation_widened, inputs_ready), elapsed_us(inputs_ready, correction_done));
+        if (use_row_correction) { MLLM_INFO("SHADOWNPU_SHADOW_CPU_FP16_ROW layer={}", getModuleName()); }
       }
       return corrected;
     }

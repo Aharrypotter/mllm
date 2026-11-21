@@ -84,7 +84,7 @@ void LinearShadowCorrectionOp::reshape(const std::vector<Tensor>& inputs, std::v
   MLLM_RT_ASSERT_EQ(original_input.shape().back(), options_.in_channels);
   MLLM_RT_ASSERT_EQ(quantized_output.shape().back(), options_.out_channels);
   MLLM_RT_ASSERT_EQ(baseline.shape().back(), options_.out_channels);
-  MLLM_RT_ASSERT_EQ(original_input.dtype(), kFloat32);
+  MLLM_RT_ASSERT(original_input.dtype() == kFloat32 || original_input.dtype() == kFloat16);
   MLLM_RT_ASSERT_EQ(quantized_output.dtype(), kInt16);
   MLLM_RT_ASSERT_EQ(baseline.dtype(), kFloat32);
   MLLM_RT_ASSERT_EQ(original_input.device(), kCPU);

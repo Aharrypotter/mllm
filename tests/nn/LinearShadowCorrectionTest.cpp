@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <vector>
 
@@ -142,6 +143,35 @@ TEST_F(LinearShadowCorrectionTest, BothClipFlagsMakeAnExactCopy) {
   EXPECT_FLOAT_EQ(actual.ptr<float>()[0], baseline.ptr<float>()[0]);
   EXPECT_FLOAT_EQ(actual.ptr<float>()[1], baseline.ptr<float>()[1]);
   EXPECT_NE(actual.ptr<void>(), baseline.ptr<void>());
+}
+
+TEST_F(LinearShadowCorrectionTest, HalfRowsMatchPrematerializedFloatForEachClipMode) {
+  auto half_rows = Tensor::empty({1, 2, 2}, mllm::kFloat16, mllm::kCPU).alloc();
+  auto float_rows = Tensor::empty({1, 2, 2}, mllm::kFloat32, mllm::kCPU).alloc();
+  auto quantized = Tensor::empty({1, 2, 2}, mllm::kInt16, mllm::kCPU).alloc();
+  auto baseline = Tensor::empty({1, 2, 2}, mllm::kFloat32, mllm::kCPU).alloc();
+  const std::array<float, 4> values = {40000.0F, 2.0F, -40000.0F, -2.0F};
+  const std::array<int16_t, 4> saturated_first_row = {32767, -32768, 1000, -2000};
+  const std::array<float, 4> residual = {32777.0F, -32748.0F, 1010.0F, -1980.0F};
+  std::copy(saturated_first_row.begin(), saturated_first_row.end(), quantized.ptr<int16_t>());
+  std::copy(residual.begin(), residual.end(), baseline.ptr<float>());
+  for (size_t i = 0; i < values.size(); ++i) {
+    half_rows.ptr<mllm::mllm_fp16_t>()[i] = static_cast<mllm::mllm_fp16_t>(values[i]);
+    float_rows.ptr<float>()[i] = static_cast<float>(half_rows.ptr<mllm::mllm_fp16_t>()[i]);
+  }
+
+  for (bool clip_input : {false, true}) {
+    for (bool clip_output : {false, true}) {
+      ShadowCorrectionModule module;
+      module.load(parameters(clip_input, clip_output));
+      const auto expected = module(float_rows, quantized, baseline).front();
+      const auto actual = module(half_rows, quantized, baseline).front();
+      for (size_t i = 0; i < values.size(); ++i) {
+        EXPECT_EQ(std::bit_cast<uint32_t>(actual.ptr<float>()[i]), std::bit_cast<uint32_t>(expected.ptr<float>()[i]));
+        EXPECT_EQ(baseline.ptr<float>()[i], residual[i]);
+      }
+    }
+  }
 }
 
 TEST_F(LinearShadowCorrectionTest, TraceAndSerializationRoundTripPreserveContract) {
