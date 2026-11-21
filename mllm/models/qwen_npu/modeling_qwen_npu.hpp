@@ -617,17 +617,17 @@ class QwenOutProjAndMLP final : public nn::Module {
 
     x = gate * up;
     const int token_width = spatial_down_proj_tokens_ && use_spatial_tiles ? spatial_width : mlp_width;
-    const bool keep_spatial_outputs = shadow_spatial_outputs_ && token_width != 1;
-    if (keep_spatial_outputs && mlp_width != token_width) {
-      x = x.view({B, S / token_width, token_width, intermediate_size_});
-    }
+    const bool keep_spatial_outputs = shadow_spatial_outputs_ && use_spatial_tiles;
     auto shadow_input = x;
+    if (keep_spatial_outputs && mlp_width != spatial_width) {
+      shadow_input = shadow_input.view({B, S / spatial_width, spatial_width, intermediate_size_});
+    }
     // QNN serializes graph outputs in producer order. Emit the shadow
     // activation before the quantized projection and the residual.
     if (shadow_activation_fp16_) { shadow_input = shadow_input.to(kFloat16); }
 
     // The spatial MLP already produces a square activation for the down projection.
-    if (mlp_width == 1 && !keep_spatial_outputs) {
+    if (mlp_width == 1) {
       x = x.view({B, S / token_width, token_width, intermediate_size_});
     }
     if (token_width != 1) {
@@ -638,6 +638,9 @@ class QwenOutProjAndMLP final : public nn::Module {
     x = x.to(kInt16);
     x = down_proj_(x);
     auto quantized_down_proj = x;
+    if (keep_spatial_outputs && token_width != spatial_width) {
+      quantized_down_proj = quantized_down_proj.view({B, S / spatial_width, spatial_width, hidden_size_});
+    }
     x = x.view({B, S, 1, hidden_size_});
     if (!keep_spatial_outputs) { quantized_down_proj = x; }
     x = x.to(kFloat32);
