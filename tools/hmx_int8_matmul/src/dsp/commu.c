@@ -1386,30 +1386,59 @@ typedef struct {
     int32 valid_columns;
 } hmx_cpu_packed_score_publication;
 
+typedef struct {
+    hmx_cpu_packed_score_publication *publication;
+    unsigned end;
+    size_t offset_start;
+    size_t index_bytes[HMX_FIXED_HEADS];
+    int status[HMX_HVX_MAX_LANES];
+} hmx_native_topk_job;
+
+static void rank_cpu_packed_heads(void *opaque, int lane, int lanes) {
+    hmx_native_topk_job *job = opaque;
+    hmx_cpu_packed_score_publication *publication = job->publication;
+    for (unsigned head = (unsigned)publication->next_head + lane;
+         head < job->end; head += lanes) {
+        uint8_t *slab = publication->index_slabs + head * publication->index_stride;
+        const int32_t *offsets = (const int32_t *)(slab + job->offset_start);
+        const uint8_t *scores = (const uint8_t *)publication->output
+            + head * publication->output_stride;
+        qurt_mem_cache_clean((qurt_addr_t)offsets,
+            (HMX_FIXED_M_PADDED + 1) * sizeof(*offsets),
+            QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+        job->status[lane] = hmx_i8_hvx_topk_native(
+            scores, HMX_FIXED_M_PADDED, publication->padded_columns,
+            publication->valid_columns, offsets, (uint16_t *)slab,
+            job->offset_start / sizeof(uint16_t));
+        if (job->status[lane] != 0) return;
+        job->index_bytes[head] =
+            (size_t)offsets[HMX_FIXED_M_PADDED] * sizeof(uint16_t);
+    }
+}
+
 static int publish_cpu_packed_prefix(void *opaque, unsigned end) {
     hmx_cpu_packed_score_publication *publication = opaque;
     const uint64_t begin = HAP_perf_get_qtimer_count();
     if (publication->index_slabs != NULL) {
-        const size_t offset_start = hmx_i8_topk_offsets_start(
-            publication->index_stride, HMX_FIXED_M_PADDED);
+        hmx_native_topk_job job = {
+            .publication = publication,
+            .end = end,
+            .offset_start = hmx_i8_topk_offsets_start(
+                publication->index_stride, HMX_FIXED_M_PADDED),
+        };
+        int status = hmx_hvx_parallel_run(rank_cpu_packed_heads, &job);
+        for (int lane = 0; lane < HMX_HVX_MAX_LANES; ++lane) {
+            status |= job.status[lane];
+        }
+        if (status != 0) {
+            publication->elapsed_ticks += HAP_perf_get_qtimer_count() - begin;
+            return -1;
+        }
         for (unsigned head = (unsigned)publication->next_head; head < end; ++head) {
             uint8_t *slab = publication->index_slabs + head * publication->index_stride;
-            const int32_t *offsets = (const int32_t *)(slab + offset_start);
-            const uint8_t *scores = (const uint8_t *)publication->output
-                + head * publication->output_stride;
-            qurt_mem_cache_clean((qurt_addr_t)offsets,
-                (HMX_FIXED_M_PADDED + 1) * sizeof(*offsets),
-                QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
-            if (hmx_i8_hvx_topk_native(
-                    scores, HMX_FIXED_M_PADDED, publication->padded_columns,
-                    publication->valid_columns, offsets, (uint16_t *)slab,
-                    offset_start / sizeof(uint16_t)) != 0) {
-                publication->elapsed_ticks += HAP_perf_get_qtimer_count() - begin;
-                return -1;
-            }
             const uint64_t flush_begin = HAP_perf_get_qtimer_count();
             qurt_mem_cache_clean((qurt_addr_t)slab,
-                (size_t)offsets[HMX_FIXED_M_PADDED] * sizeof(uint16_t),
+                job.index_bytes[head],
                 QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
             publication->timing->output_flush_ticks +=
                 HAP_perf_get_qtimer_count() - flush_begin;
