@@ -321,6 +321,9 @@ int main(int argc, char** argv) {
   auto& debug_qnn_boundary_dir = Argparse::add<std::string>("--debug-qnn-boundary-dir")
                                       .help("Dump every QNN layer Q/K/V and CPU attention output as raw Float32");
 
+  auto& dump_qnn_prefill_logits = Argparse::add<std::string>("--dump-qnn-prefill-logits")
+                                     .help("Write the first QNN prefill logits vector as raw Float32");
+
   Argparse::parse(argc, argv);
 
   if (help.isSet()) {
@@ -806,6 +809,18 @@ int main(int argc, char** argv) {
       }
 
       printLogitSummary("qnn_prefill", logits_data, vocab_size);
+      if (dump_qnn_prefill_logits.isSet()) {
+        const auto& path = dump_qnn_prefill_logits.get();
+        std::ofstream dump(path, std::ios::binary);
+        dump.write(reinterpret_cast<const char*>(logits_data), static_cast<std::streamsize>(vocab_size * sizeof(float)));
+        dump.close();
+        if (!dump) {
+          fmt::print(stderr, "Error: could not write QNN prefill logits to {}.\n", path);
+          ::mllm::shutdownContext();
+          return 1;
+        }
+        fmt::print("SHADOWNPU_PREFILL_LOGITS_DUMP values={} path={}\n", vocab_size, path);
+      }
 
       past["sequence"] = mllm::Tensor::empty({1, 1}, mllm::kInt64, mllm::kCPU).alloc();
       past["sequence"].at<mllm::mllm_int64_t>({0, 0}) = static_cast<mllm::mllm_int64_t>(first_next_id);
