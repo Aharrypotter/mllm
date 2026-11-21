@@ -56,7 +56,10 @@ bool sequenceTileBufferPoolEnabled() {
 constexpr int32_t kSequenceBatchSize = 2;
 
 bool sequenceBatchRequested(std::string_view graph) {
-  static const char* selection = std::getenv("MLLM_QNN_SEQUENCE_BATCH2_SHADOW_GRAPHS");
+  static const char* selection = [] {
+    const auto* graphs = std::getenv("MLLM_QNN_SEQUENCE_BATCH2_GRAPHS");
+    return graphs ? graphs : std::getenv("MLLM_QNN_SEQUENCE_BATCH2_SHADOW_GRAPHS");
+  }();
   if (!selection) { return false; }
   for (std::string_view names(selection); !names.empty();) {
     const auto end = names.find(',');
@@ -67,12 +70,32 @@ bool sequenceBatchRequested(std::string_view graph) {
   return false;
 }
 
-bool canBatchContiguousTiles(const QNNSequenceTilePlan& plan) {
-  // Unit extents ahead of the sequence axis make two adjacent tiles already
-  // match the leading batch order required by QNN.
-  return plan.tile_count == kSequenceBatchSize && plan.axis > 0
-         && std::all_of(plan.compiled_shape.begin(), plan.compiled_shape.begin() + plan.axis,
-                        [](int32_t extent) { return extent == 1; });
+bool supportsSequenceBatch(const QNNSequenceTilePlan& plan) {
+  return plan.tile_count == kSequenceBatchSize && plan.axis > 0 && plan.compiled_shape[0] == 1;
+}
+
+template <bool Pack>
+void copyQnnSequenceBatch(Tensor& destination, const Tensor& source, const QNNSequenceTilePlan& plan) {
+  size_t groups = 1;
+  for (size_t axis = 1; axis < plan.axis; ++axis) { groups *= plan.compiled_shape[axis]; }
+  auto* destination_bytes = destination.ptr<uint8_t>();
+  const auto* source_bytes = source.ptr<uint8_t>();
+  if (groups == 1) {
+    std::memcpy(destination_bytes, source_bytes, source.bytes());
+    return;
+  }
+
+  // Logical Q/K/V keep both sequence tiles within each head. QNN's batch
+  // layout keeps all heads of one tile together.
+  const size_t span_bytes = source.bytes() / (kSequenceBatchSize * groups);
+  for (size_t tile = 0; tile < kSequenceBatchSize; ++tile) {
+    for (size_t group = 0; group < groups; ++group) {
+      const size_t logical_offset = (group * kSequenceBatchSize + tile) * span_bytes;
+      const size_t batch_offset = (tile * groups + group) * span_bytes;
+      std::memcpy(destination_bytes + (Pack ? batch_offset : logical_offset),
+                  source_bytes + (Pack ? logical_offset : batch_offset), span_bytes);
+    }
+  }
 }
 
 }  // namespace
@@ -955,8 +978,8 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
       const bool batched = batch_requested && !state.input_plans.empty() && !state.output_plans.empty()
                            && capability
                            && capability(QNN_PROPERTY_GRAPH_SUPPORT_BATCH_MULTIPLE) == QNN_PROPERTY_SUPPORTED
-                           && std::all_of(state.input_plans.begin(), state.input_plans.end(), canBatchContiguousTiles)
-                           && std::all_of(state.output_plans.begin(), state.output_plans.end(), canBatchContiguousTiles);
+                           && std::all_of(state.input_plans.begin(), state.input_plans.end(), supportsSequenceBatch)
+                           && std::all_of(state.output_plans.begin(), state.output_plans.end(), supportsSequenceBatch);
       allocate_scratch(state, batched);
       if (batch_requested) {
         MLLM_INFO("QNN_SHADOW_BATCH2_SETUP graph={} enabled={}", graphName, static_cast<int>(batched));
@@ -1012,7 +1035,7 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
 
       auto stage_start = clock::now();
       for (size_t index = 0; index < inputs.size(); ++index) {
-        std::memcpy(state.tile_inputs[index].ptr<void>(), inputs[index].ptr<void>(), inputs[index].bytes());
+        copyQnnSequenceBatch<true>(state.tile_inputs[index], inputs[index], state.input_plans[index]);
       }
       sequenceTileProfile_.input_copy_us += elapsed_us(stage_start, clock::now());
       stage_start = clock::now();
@@ -1025,7 +1048,7 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
       if (status == QNN_SUCCESS) {
         stage_start = clock::now();
         for (size_t index = 0; index < outputs.size(); ++index) {
-          std::memcpy(outputs[index].ptr<void>(), state.tile_outputs[index].ptr<void>(), outputs[index].bytes());
+          copyQnnSequenceBatch<false>(outputs[index], state.tile_outputs[index], state.output_plans[index]);
         }
         sequenceTileProfile_.output_copy_us += elapsed_us(stage_start, clock::now());
         static const char* trace = std::getenv("MLLM_QNN_SEQUENCE_BATCH2_TRACE");
