@@ -530,12 +530,14 @@ class QwenOutProjAndMLP final : public nn::Module {
   bool shadow_down_proj_ = false;
   bool shadow_activation_fp16_ = false;
   bool shadow_int8_input_ = false;
+  bool capture_shadow_projection_ = false;
   bool spatial_down_proj_tokens_ = false;
   bool spatial_mlp_tokens_ = false;
 
  public:
   QwenOutProjAndMLP() = default;
-  QwenOutProjAndMLP(const std::string& name, const QwenNPUConfig& cfg, bool shadow_down_proj) : nn::Module(name) {
+  QwenOutProjAndMLP(const std::string& name, const QwenNPUConfig& cfg, bool shadow_down_proj, bool capture_shadow_projection)
+      : nn::Module(name), capture_shadow_projection_(capture_shadow_projection) {
     hidden_size_ = cfg.hidden_size;
     intermediate_size_ = cfg.intermediate_size;
     shadow_down_proj_ = shadow_down_proj;
@@ -611,19 +613,19 @@ class QwenOutProjAndMLP final : public nn::Module {
       input.attach("qnn_quant_scale", o_proj_quantize_scale_.weight().impl());
       input = input.to(kInt8);
     }
-    auto x = o_proj_(input);
-    x = x.view({B, S, 1, hidden_size_});
+    auto projected = o_proj_(input);
+    auto x = projected.view({B, S, 1, hidden_size_});
     x = x.to(kFloat32);
     x = x.view({B, S, hidden_size_});
 
     auto tmp = x + res;
 
-    x = post_attention_layer_norm_(tmp);
+    auto normalized = post_attention_layer_norm_(tmp);
 
     constexpr int spatial_width = 16;
     const bool use_spatial_tiles = S % spatial_width == 0;
     const int mlp_width = spatial_mlp_tokens_ && use_spatial_tiles ? spatial_width : 1;
-    x = x.view({B, S / mlp_width, mlp_width, hidden_size_});
+    x = normalized.view({B, S / mlp_width, mlp_width, hidden_size_});
     if (mlp_width != 1) {
       MLLM_INFO("QNN_MLP_SPATIAL_LAYOUT module={} shape=[{},{},{},{}]",
                 getModuleName(), B, S / mlp_width, mlp_width, hidden_size_);
@@ -662,6 +664,10 @@ class QwenOutProjAndMLP final : public nn::Module {
 
     x = x + tmp;
     if (shadow_down_proj_) {
+      if (capture_shadow_projection_) {
+        // Match the producer order used for QNN graph output descriptors.
+        return {projected, tmp, normalized, shadow_input, quantized_down_proj, x};
+      }
       return {shadow_input, quantized_down_proj, x};
     }
     return {x};
@@ -671,6 +677,7 @@ class QwenOutProjAndMLP final : public nn::Module {
 class QwenDecoder final : public nn::Module {
   bool capture_debug_boundaries_ = false;
   bool capture_shadow_boundaries_ = false;
+  bool capture_shadow_projection_ = false;
   std::vector<Tensor> captured_debug_boundaries_;
   std::vector<Tensor> captured_shadow_boundaries_;
 
@@ -685,10 +692,13 @@ class QwenDecoder final : public nn::Module {
 
   QwenDecoder(const std::string& name, const QwenNPUConfig& cfg, int32_t layer_idx) : nn::Module(name) {
     shadow_down_proj_ = cfg.useShadowDownProjection(layer_idx);
+    static const auto* projection_dump = std::getenv("MLLM_QNN_DEBUG_SHADOW_OPROJ");
+    capture_shadow_projection_ = shadow_down_proj_ && layer_idx == 1 && projection_dump && projection_dump[0] == '1'
+                                 && projection_dump[1] == '\0';
     self_attn_proj_ = reg<QwenAttentionProjNPU>("", cfg);
     self_attn_proj_.to(kQNN);
     self_attn_matmul_ = reg<QwenAttentionMatmul>("self_attn", cfg, layer_idx);
-    self_attn_out_mlp_ = reg<QwenOutProjAndMLP>("", cfg, shadow_down_proj_);
+    self_attn_out_mlp_ = reg<QwenOutProjAndMLP>("", cfg, shadow_down_proj_, capture_shadow_projection_);
     self_attn_out_mlp_.to(kQNN);
     if (shadow_down_proj_) {
       down_proj_shadow_correction_ =
@@ -706,13 +716,17 @@ class QwenDecoder final : public nn::Module {
   Tensor finishMlp(const Tensor& attention, const Tensor& residual) {
     auto out_mlp_states = self_attn_out_mlp_(attention, residual);
     if (shadow_down_proj_) {
-      MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 3);
-      auto activation = out_mlp_states[0].to(kCPU).contiguous();
+      const size_t model_output = capture_shadow_projection_ ? 3 : 0;
+      MLLM_RT_ASSERT_EQ(out_mlp_states.size(), model_output + 3);
+      auto activation = out_mlp_states[model_output].to(kCPU).contiguous();
       if (activation.dtype() == kFloat16) { activation = activation.to(kFloat32); }
-      auto down_codes = out_mlp_states[1].to(kCPU).contiguous();
-      auto residual_before_correction = out_mlp_states[2].to(kCPU).contiguous();
+      auto down_codes = out_mlp_states[model_output + 1].to(kCPU).contiguous();
+      auto residual_before_correction = out_mlp_states[model_output + 2].to(kCPU).contiguous();
       if (capture_shadow_boundaries_) {
         captured_shadow_boundaries_ = {activation, down_codes, residual_before_correction};
+        for (size_t index = 0; index < model_output; ++index) {
+          captured_shadow_boundaries_.push_back(out_mlp_states[index].to(kCPU).contiguous());
+        }
       }
       return down_proj_shadow_correction_(activation, down_codes, residual_before_correction);
     }
