@@ -863,6 +863,15 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
   }
 
   if (sequenceTile_ > 0) {
+    using clock = std::chrono::steady_clock;
+    const auto elapsed_us = [](clock::time_point start, clock::time_point end) {
+      return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+    };
+    static const bool trace_submissions = [] {
+      const auto* value = std::getenv("MLLM_QNN_SEQUENCE_SUBMISSION_TRACE");
+      return value && std::string_view(value) == "1";
+    }();
+    const auto entry = trace_submissions ? clock::now() : clock::time_point{};
     const auto input_wrappers = model->getGraphInputTensorWrappers();
     const auto output_wrappers = model->getGraphOutputTensorWrappers();
     static const bool use_buffer_pool = [] {
@@ -874,6 +883,15 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
     static std::mutex buffer_pool_mutex;
     std::unique_lock pool_lock(buffer_pool_mutex, std::defer_lock);
     if (use_buffer_pool) { pool_lock.lock(); }
+    const auto previous = trace_submissions ? sequenceTileProfile_ : SequenceTileProfile{};
+    const auto trace_submission = [&] {
+      if (!trace_submissions) { return; }
+      MLLM_INFO(
+          "QNN_SEQUENCE_SUBMISSION_TIMES graph={} logical_call={} native_calls={} total_us={} input_us={} execute_us={} output_us={}",
+          graphName, sequenceTileProfile_.graph_calls, sequenceTileProfile_.tile_calls - previous.tile_calls,
+          elapsed_us(entry, clock::now()), sequenceTileProfile_.input_copy_us - previous.input_copy_us,
+          sequenceTileProfile_.execute_us - previous.execute_us, sequenceTileProfile_.output_copy_us - previous.output_copy_us);
+    };
 
     const auto allocate_scratch = [&](SequenceTileGraphState& state, bool batch) {
       const auto allocate = [&](const std::vector<Tensor>& logical,
@@ -993,10 +1011,6 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
       validate_boundary(outputs[index], state.output_plans[index], state.tile_outputs[index]);
     }
 
-    using clock = std::chrono::steady_clock;
-    const auto elapsed_us = [](clock::time_point start, clock::time_point end) {
-      return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
-    };
     ++sequenceTileProfile_.graph_calls;
     std::vector<Qnn_Tensor_t> qnn_inputs;
     std::vector<Qnn_Tensor_t> qnn_outputs;
@@ -1042,6 +1056,7 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
           copyQnnSequenceBatch<false>(outputs[index], state.tile_outputs[index], state.output_plans[index]);
         }
         sequenceTileProfile_.output_copy_us += elapsed_us(stage_start, clock::now());
+        trace_submission();
         static const char* trace = std::getenv("MLLM_QNN_SEQUENCE_BATCH2_TRACE");
         if (trace && std::string_view(trace) == "1") {
           MLLM_INFO("QNN_SEQUENCE_BATCH2_EXEC graph={} tiles={} native_calls=1 exec_us={}", graphName, state.tile_count,
@@ -1082,6 +1097,7 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
       sequenceTileProfile_.output_copy_us += elapsed_us(stage_start, clock::now());
       ++sequenceTileProfile_.tile_calls;
     }
+    trace_submission();
     if (ProfilingLevel::OFF != profilingLevel_) { extractBackendProfilingInfo(runtime_->profileHandle); }
     return;
   }
