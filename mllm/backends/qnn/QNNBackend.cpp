@@ -1054,11 +1054,17 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
       uint64_t output_copy_us;
     };
     std::vector<TileTimes> tile_times;
-    if (profile_tiles) { tile_times.reserve(state.tile_count); }
+    if (profile_tiles) { tile_times.resize(state.tile_count); }
     const size_t profile_count = shouldProfileTileBackend(graphName) ? state.tile_count : 0;
+    static const bool reverse_profiled_tiles = [] {
+      const char* value = std::getenv("MLLM_QNN_REVERSE_PROFILED_TILES");
+      return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    const bool reverse = reverse_profiled_tiles && profile_count == 2;
     ScopedTileBackendProfiles tile_profiles(runtime_->qnnInterface, runtime_->backendHandle, graphName, profile_count);
     ++sequenceTileProfile_.graph_calls;
-    for (int32_t tile_index = 0; tile_index < state.tile_count; ++tile_index) {
+    for (int32_t ordinal = 0; ordinal < state.tile_count; ++ordinal) {
+      const int32_t tile_index = reverse ? state.tile_count - 1 - ordinal : ordinal;
       auto stage_start = clock::now();
       for (size_t index = 0; index < inputs.size(); ++index) {
         const auto& plan = state.input_plans[index];
@@ -1082,7 +1088,7 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
       const auto output_copy_us = elapsed_us(stage_start, clock::now());
       sequenceTileProfile_.output_copy_us += output_copy_us;
       ++sequenceTileProfile_.tile_calls;
-      if (profile_tiles) { tile_times.push_back({input_copy_us, execute_us, output_copy_us}); }
+      if (profile_tiles) { tile_times[tile_index] = {input_copy_us, execute_us, output_copy_us}; }
     }
     // Emit records after the last tile so logging cannot delay the next tile within this call.
     for (size_t index = 0; index < tile_times.size(); ++index) {
@@ -1091,6 +1097,10 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
                 "execute_us={} output_copy_us={}",
                 graphName, sequenceTileProfile_.graph_calls, index, state.tile_count, times.input_copy_us,
                 times.execute_us, times.output_copy_us);
+    }
+    if (reverse) {
+      MLLM_INFO("QNN_SEQUENCE_TILE_REVERSED graph={} logical_call={} first_tile=1 second_tile=0", graphName,
+                sequenceTileProfile_.graph_calls);
     }
     tile_profiles.dump(sequenceTileProfile_.graph_calls);
     if (ProfilingLevel::OFF != profilingLevel_) { extractBackendProfilingInfo(runtime_->profileHandle); }
