@@ -46,12 +46,7 @@ namespace mllm::qnn {
 
 namespace {
 
-bool shouldProfileTileBackend(std::string_view graph) {
-  static const std::string_view selection = [] {
-    const char* value = std::getenv("MLLM_QNN_SEQUENCE_TILE_BACKEND_PROFILE_GRAPHS");
-    return value ? std::string_view(value) : std::string_view{};
-  }();
-  auto remaining = selection;
+bool containsGraph(std::string_view remaining, std::string_view graph) {
   while (!remaining.empty()) {
     const auto end = remaining.find(',');
     if (remaining.substr(0, end) == graph) { return true; }
@@ -1055,12 +1050,21 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
     };
     std::vector<TileTimes> tile_times;
     if (profile_tiles) { tile_times.resize(state.tile_count); }
-    const size_t profile_count = shouldProfileTileBackend(graphName) ? state.tile_count : 0;
+    static const std::string_view profiled_graphs = [] {
+      const auto* value = std::getenv("MLLM_QNN_SEQUENCE_TILE_BACKEND_PROFILE_GRAPHS");
+      return value ? std::string_view(value) : std::string_view{};
+    }();
+    static const std::string_view reverse_graphs = [] {
+      const auto* value = std::getenv("MLLM_QNN_SEQUENCE_TILE_REVERSE_GRAPHS");
+      return value ? std::string_view(value) : std::string_view{};
+    }();
+    const size_t profile_count = containsGraph(profiled_graphs, graphName) ? state.tile_count : 0;
     static const bool reverse_profiled_tiles = [] {
       const char* value = std::getenv("MLLM_QNN_REVERSE_PROFILED_TILES");
       return value != nullptr && std::strcmp(value, "1") == 0;
     }();
-    const bool reverse = reverse_profiled_tiles && profile_count == 2;
+    const bool reverse = state.tile_count == 2
+                         && (containsGraph(reverse_graphs, graphName) || (reverse_profiled_tiles && profile_count == 2));
     ScopedTileBackendProfiles tile_profiles(runtime_->qnnInterface, runtime_->backendHandle, graphName, profile_count);
     ++sequenceTileProfile_.graph_calls;
     for (int32_t ordinal = 0; ordinal < state.tile_count; ++ordinal) {
