@@ -615,6 +615,9 @@ class QwenOutProjAndMLP final : public nn::Module {
 
     x = gate * up;
     auto shadow_input = x;
+    // QNN serializes graph outputs in producer order. Emit the shadow
+    // activation before the quantized projection and the residual.
+    if (shadow_activation_fp16_) { shadow_input = shadow_input.to(kFloat16); }
 
     const int token_width = spatial_down_proj_tokens_ && use_spatial_tiles ? spatial_width : mlp_width;
     // The spatial MLP already produces a square activation for the down projection.
@@ -633,7 +636,6 @@ class QwenOutProjAndMLP final : public nn::Module {
 
     x = x + tmp;
     if (shadow_down_proj_) {
-      if (shadow_activation_fp16_) { shadow_input = shadow_input.to(kFloat16); }
       return {shadow_input, quantized_down_proj, x};
     }
     return {x};
