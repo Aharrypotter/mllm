@@ -932,21 +932,34 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
       // Compare a single batch-multiplied execution with the two ordinary tiles.
       // The diagnostic uses separate storage and never publishes its outputs.
       const auto& interface = runtime_->qnnInterface;
-      const auto batch_compatible = [](const std::vector<QNNSequenceTilePlan>& plans) {
-        return std::all_of(plans.begin(), plans.end(), [](const auto& plan) {
-          return plan.tile_count == 2 && plan.axis == 1 && plan.compiled_shape[0] == 1;
-        });
+      const auto batch_compatible = [&](const std::vector<QNNSequenceTilePlan>& plans, const char* direction) {
+        bool compatible = true;
+        for (size_t i = 0; i < plans.size(); ++i) {
+          const auto& plan = plans[i];
+          // Singleton dimensions ahead of the sequence axis do not create
+          // gaps between its two tiles when moved to the batch dimension.
+          const bool dense_tiling = plan.axis > 0 &&
+              std::all_of(plan.compiled_shape.begin(), plan.compiled_shape.begin() + plan.axis,
+                          [](int32_t dimension) { return dimension == 1; });
+          MLLM_INFO("QNN_SEQUENCE_BATCH2_LAYOUT graph={} direction={} index={} rank={} axis={} singleton_prefix={}",
+                    graphName, direction, i, plan.compiled_shape.size(), plan.axis, dense_tiling);
+          compatible &= plan.tile_count == 2 && dense_tiling;
+        }
+        return compatible;
       };
-      if (!interface.propertyHasCapability
-          || interface.propertyHasCapability(QNN_PROPERTY_GRAPH_SUPPORT_BATCH_MULTIPLE) != QNN_PROPERTY_SUPPORTED
-          || !batch_compatible(state.input_plans) || !batch_compatible(state.output_plans)) {
-        MLLM_INFO("QNN_SEQUENCE_BATCH2_PROBE graph={} skipped=unsupported_property_or_shape", graphName);
+      const bool property_supported = interface.propertyHasCapability &&
+          interface.propertyHasCapability(QNN_PROPERTY_GRAPH_SUPPORT_BATCH_MULTIPLE) == QNN_PROPERTY_SUPPORTED;
+      const bool compatible_inputs = batch_compatible(state.input_plans, "input");
+      const bool compatible_outputs = batch_compatible(state.output_plans, "output");
+      if (!property_supported || !compatible_inputs || !compatible_outputs) {
+        MLLM_INFO("QNN_SEQUENCE_BATCH2_PROBE graph={} skipped=unsupported_property_or_shape property={} inputs={} outputs={}",
+                  graphName, property_supported, compatible_inputs, compatible_outputs);
         return;
       }
 
       const auto shared_allocator = std::static_pointer_cast<QNNAllocator>(allocator());
-      std::vector<Tensor> storage;
       std::vector<std::vector<uint32_t>> dimensions;
+      std::vector<Tensor> storage;
       storage.reserve(inputs.size() + outputs.size());
       dimensions.reserve(inputs.size() + outputs.size());
       const auto prepare_batch = [&](const std::vector<Tensor>& logical, const std::vector<QNNSequenceTilePlan>& plans,
