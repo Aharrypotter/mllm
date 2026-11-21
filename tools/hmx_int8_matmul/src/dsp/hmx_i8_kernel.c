@@ -23,6 +23,9 @@
 #ifndef HMX_I8_HVX_ALIGNED_SCORE_STORES
 #define HMX_I8_HVX_ALIGNED_SCORE_STORES 0
 #endif
+#ifndef HMX_I8_HVX_Q15_SCORE_REQUANT
+#define HMX_I8_HVX_Q15_SCORE_REQUANT 0
+#endif
 
 #if HMX_HVX_EPILOGUE_LANES > 1
 #define HMX_I8_ACC_PIPELINE_SLOTS (2 * HMX_HVX_EPILOGUE_BATCH_TILES)
@@ -268,6 +271,20 @@ quantize_i32_vector_to_i8_low32(
     return Q6_V_vxor_VV(packed, Q6_V_vsplat_R((int32_t)0x80808080u));
 }
 
+static inline __attribute__((always_inline)) HVX_Vector quantize_i32_pair_q15(
+    HVX_Vector first, HVX_Vector second, HVX_Vector correction) {
+    first = Q6_Vw_vsub_VwVw(first, correction);
+    second = Q6_Vw_vsub_VwVw(second, correction);
+    /* With the calibrated scale, inputs clipped during narrowing already
+     * saturate in INT8. The effective scale after the first shift is 203/65536. */
+    const HVX_Vector narrowed = Q6_Vh_vasr_VwVwR_sat(second, first, 1);
+    const HVX_Vector multiplier = Q6_V_vsplat_R((203 << 16) | 203);
+    const HVX_Vector scores = Q6_Vh_vmpy_VhVh_s1_rnd_sat(narrowed, multiplier);
+    const HVX_Vector interleaved = Q6_Vb_vpack_VhVh_sat(Q6_V_vzero(), scores);
+    /* Each row starts in a separate 64-byte half of the vector after vdeal. */
+    return Q6_Vb_vdeal_Vb(interleaved);
+}
+
 static inline __attribute__((always_inline)) void quantize_readout_slot_i8_range_impl(
     int8_t *output,
     int output_leading_dimension,
@@ -278,7 +295,8 @@ static inline __attribute__((always_inline)) void quantize_readout_slot_i8_range
     float output_scale,
     int lane,
     int lanes,
-    int aligned_rows) {
+    int aligned_rows,
+    int use_q15) {
     const HVX_Vector *plane0 = (const HVX_Vector *)(
         readout_slot + 0 * ACC_PLANE_BYTES);
     const HVX_Vector *plane1 = (const HVX_Vector *)(
@@ -313,14 +331,21 @@ static inline __attribute__((always_inline)) void quantize_readout_slot_i8_range
             plane0[stripe], plane1[stripe],
             plane2[stripe], plane3[stripe],
             row0, row1, row2, row3);
-        row0 = quantize_i32_vector_to_i8_low32(
-            row0, correction, scale, positive_half, negative_half);
-        row1 = quantize_i32_vector_to_i8_low32(
-            row1, correction, scale, positive_half, negative_half);
-        row2 = quantize_i32_vector_to_i8_low32(
-            row2, correction, scale, positive_half, negative_half);
-        row3 = quantize_i32_vector_to_i8_low32(
-            row3, correction, scale, positive_half, negative_half);
+        if (use_q15) {
+            row0 = quantize_i32_pair_q15(row0, row1, correction);
+            row1 = Q6_V_vror_VR(row0, 64);
+            row2 = quantize_i32_pair_q15(row2, row3, correction);
+            row3 = Q6_V_vror_VR(row2, 64);
+        } else {
+            row0 = quantize_i32_vector_to_i8_low32(
+                row0, correction, scale, positive_half, negative_half);
+            row1 = quantize_i32_vector_to_i8_low32(
+                row1, correction, scale, positive_half, negative_half);
+            row2 = quantize_i32_vector_to_i8_low32(
+                row2, correction, scale, positive_half, negative_half);
+            row3 = quantize_i32_vector_to_i8_low32(
+                row3, correction, scale, positive_half, negative_half);
+        }
 
         int8_t *base = output
             + (size_t)(row_start + stripe * 4) * output_leading_dimension;
@@ -355,14 +380,28 @@ static void quantize_readout_slot_i8_range(
     const int aligned_rows = HMX_I8_HVX_ALIGNED_SCORE_STORES
         && (((uintptr_t)output | (uintptr_t)output_leading_dimension) & 127u) == 0
         && (column_start & (HMX_I8_N_TILE - 1)) == 0;
-    if (aligned_rows) {
+    /* All nine buckets of the qualified bank round to this same FP32 scale.
+     * Preserve the float epilogue for other banks and runtime scales. */
+    const int use_q15 = HMX_I8_HVX_Q15_SCORE_REQUANT
+        && output_scale == 0.0030974452383816242f;
+    if (use_q15) {
+        if (aligned_rows) {
+            quantize_readout_slot_i8_range_impl(
+                output, output_leading_dimension, row_start, column_start,
+                readout_slot, rhs_sums, output_scale, lane, lanes, 1, 1);
+        } else {
+            quantize_readout_slot_i8_range_impl(
+                output, output_leading_dimension, row_start, column_start,
+                readout_slot, rhs_sums, output_scale, lane, lanes, 0, 1);
+        }
+    } else if (aligned_rows) {
         quantize_readout_slot_i8_range_impl(
             output, output_leading_dimension, row_start, column_start,
-            readout_slot, rhs_sums, output_scale, lane, lanes, 1);
+            readout_slot, rhs_sums, output_scale, lane, lanes, 1, 0);
     } else {
         quantize_readout_slot_i8_range_impl(
             output, output_leading_dimension, row_start, column_start,
-            readout_slot, rhs_sums, output_scale, lane, lanes, 0);
+            readout_slot, rhs_sums, output_scale, lane, lanes, 0, 0);
     }
 }
 

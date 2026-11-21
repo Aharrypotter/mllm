@@ -37,6 +37,8 @@ if(HMX_I8_VTCM_SHARED_KEY AND NOT "${HMX_HVX_EPILOGUE_LANES}" STREQUAL "1")
 endif()
 option(HMX_I8_HVX_ALIGNED_SCORE_STORES
     "Reuse one HVX store predicate when the INT8 QK score row stride is aligned" OFF)
+option(HMX_I8_HVX_Q15_SCORE_REQUANT
+    "Approximate the calibrated Qwen2.5-1.5B INT8 QK scale with paired Q15" OFF)
 foreach(fixed_dimension HMX_FIXED_M HMX_FIXED_K HMX_FIXED_N HMX_FIXED_HEADS)
     if(NOT "${${fixed_dimension}}" MATCHES "^[1-9][0-9]*$")
         message(FATAL_ERROR "${fixed_dimension} must be a positive integer")
@@ -249,6 +251,7 @@ else()
         HMX_I8_VTCM_SHARED_KEY=$<BOOL:${HMX_I8_VTCM_SHARED_KEY}>
         HMX_I8_SHARED_KEY_WIDE_TAIL=$<BOOL:${HMX_I8_SHARED_KEY_WIDE_TAIL}>
         HMX_I8_HVX_ALIGNED_SCORE_STORES=$<BOOL:${HMX_I8_HVX_ALIGNED_SCORE_STORES}>
+        HMX_I8_HVX_Q15_SCORE_REQUANT=$<BOOL:${HMX_I8_HVX_Q15_SCORE_REQUANT}>
     )
     set_target_properties(hmx_int8_rpc_skel PROPERTIES
         OUTPUT_NAME ${HMX_RPC_SKEL_OUTPUT_NAME})
