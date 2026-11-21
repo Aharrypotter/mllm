@@ -10,6 +10,7 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 #if defined(__linux__)
@@ -804,6 +805,41 @@ void QNNBackend::setSequenceTile(int32_t sequence_tile) {
   sequenceTile_ = sequence_tile;
 }
 
+namespace {
+
+constexpr int32_t kSequenceBatchSize = 2;
+constexpr std::string_view kQkvGraphSuffix = ".qkv_post_dequant_bias";
+
+bool supportsSequenceBatch(const QNNSequenceTilePlan& plan) {
+  return plan.tile_count == kSequenceBatchSize && plan.axis > 0 && plan.compiled_shape[0] == 1;
+}
+
+template <bool Pack>
+void copyQnnSequenceBatch(Tensor& destination, const Tensor& source, const QNNSequenceTilePlan& plan) {
+  size_t groups = 1;
+  for (size_t axis = 1; axis < plan.axis; ++axis) { groups *= plan.compiled_shape[axis]; }
+  auto* destination_bytes = destination.ptr<uint8_t>();
+  const auto* source_bytes = source.ptr<uint8_t>();
+  if (groups == 1) {
+    std::memcpy(destination_bytes, source_bytes, source.bytes());
+    return;
+  }
+
+  const size_t span_bytes = source.bytes() / (kSequenceBatchSize * groups);
+  // The logical tensor groups both tiles by head. QNN groups all heads by
+  // batch slot, so a contiguous sequence span is the unit of the permutation.
+  for (size_t tile = 0; tile < kSequenceBatchSize; ++tile) {
+    for (size_t group = 0; group < groups; ++group) {
+      const size_t logical_offset = (group * kSequenceBatchSize + tile) * span_bytes;
+      const size_t batch_offset = (tile * groups + group) * span_bytes;
+      std::memcpy(destination_bytes + (Pack ? batch_offset : logical_offset),
+                  source_bytes + (Pack ? logical_offset : batch_offset), span_bytes);
+    }
+  }
+}
+
+}  // namespace
+
 void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>& inputs, std::vector<Tensor>& outputs) {
   auto it = qnnModelIndexMap_.find(graphName);
   if (it == qnnModelIndexMap_.end()) {
@@ -828,12 +864,37 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
   if (sequenceTile_ > 0) {
     const auto input_wrappers = model->getGraphInputTensorWrappers();
     const auto output_wrappers = model->getGraphOutputTensorWrappers();
+    const auto allocate_scratch = [&](SequenceTileGraphState& state, bool batch) {
+      const auto allocate = [&](const std::vector<Tensor>& logical,
+                                const std::vector<std::shared_ptr<QNNTensorWrapper>>& wrappers,
+                                const std::vector<QNNSequenceTilePlan>& plans, std::vector<Tensor>& scratch,
+                                const char* direction) {
+        for (const auto& tensor : scratch) { sequenceTileProfile_.scratch_bytes -= tensor.bytes(); }
+        scratch.clear();
+        scratch.reserve(plans.size());
+        for (size_t index = 0; index < plans.size(); ++index) {
+          auto shape = plans[index].compiled_shape;
+          if (batch) { shape[0] = kSequenceBatchSize; }
+          auto tile = Tensor::empty(shape, logical[index].dtype(), kQNN).alloc();
+          tile.setName("qnn_sequence_tile_" + graphName + "_" + direction + std::to_string(index));
+          if (!batch) {
+            wrappers[index]->__rebindDataContainerForExecution(tile);
+            wrappers[index]->alloc();
+          } else if (tile.bytes() != logical[index].bytes()) {
+            throw std::invalid_argument("QNN sequence batch storage differs from the logical tensor size");
+          }
+          sequenceTileProfile_.scratch_bytes += tile.bytes();
+          scratch.push_back(std::move(tile));
+        }
+      };
+      allocate(inputs, input_wrappers, state.input_plans, state.tile_inputs, "input");
+      allocate(outputs, output_wrappers, state.output_plans, state.tile_outputs, "output");
+    };
+
     auto state_it = sequenceTileGraphs_.find(graphName);
     if (state_it == sequenceTileGraphs_.end()) {
       SequenceTileGraphState state;
-      auto prepare_boundary = [&](Tensor& logical, const std::shared_ptr<QNNTensorWrapper>& wrapper,
-                                  std::vector<QNNSequenceTilePlan>& plans, std::vector<Tensor>& tiles, const char* direction,
-                                  size_t index) {
+      const auto plan_boundary = [&](Tensor& logical, const std::shared_ptr<QNNTensorWrapper>& wrapper) {
         if (logical.isNil() || logical.device() != kQNN || !logical.isContiguous()
             || logical.impl()->storage()->ptr_ == nullptr) {
           throw std::invalid_argument("QNN sequence tiling requires allocated contiguous QNN graph boundaries");
@@ -841,37 +902,44 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
         if (QNN_TENSOR_GET_DATA_TYPE(wrapper->getNativeTensor()) != mllmDataTypeToQnnDataType(logical.dtype())) {
           throw std::invalid_argument("QNN sequence-tile boundary dtype differs from the compiled graph");
         }
-        Tensor::shape_t compiled_shape;
-        compiled_shape.reserve(wrapper->getDimension()->size());
-        for (const uint32_t dimension : *wrapper->getDimension()) { compiled_shape.push_back(static_cast<int32_t>(dimension)); }
+        const auto& dimensions = *wrapper->getDimension();
+        Tensor::shape_t compiled_shape(dimensions.begin(), dimensions.end());
         auto plan = planQnnSequenceTiling(logical.shape(), compiled_shape, sequenceTile_);
         if (state.tile_count == 0) {
           state.tile_count = plan.tile_count;
         } else if (state.tile_count != plan.tile_count) {
           throw std::invalid_argument("QNN graph boundaries have inconsistent sequence-tile counts");
         }
-
-        auto tile = Tensor::empty(plan.compiled_shape, logical.dtype(), kQNN).alloc();
-        tile.setName("qnn_sequence_tile_" + graphName + "_" + direction + std::to_string(index));
-        sequenceTileProfile_.scratch_bytes += tile.bytes();
-        wrapper->__rebindDataContainerForExecution(tile);
-        wrapper->alloc();
-        plans.push_back(std::move(plan));
-        tiles.push_back(std::move(tile));
+        return plan;
       };
 
       for (size_t index = 0; index < inputs.size(); ++index) {
-        prepare_boundary(inputs[index], input_wrappers[index], state.input_plans, state.tile_inputs, "input", index);
+        state.input_plans.push_back(plan_boundary(inputs[index], input_wrappers[index]));
       }
       for (size_t index = 0; index < outputs.size(); ++index) {
         if (outputs[index].isNil()) {
           throw std::invalid_argument("QNN sequence tiling received a nil logical output boundary");
         }
         if (outputs[index].impl()->storage()->ptr_ == nullptr) { outputs[index].alloc(); }
-        prepare_boundary(outputs[index], output_wrappers[index], state.output_plans, state.tile_outputs, "output", index);
+        state.output_plans.push_back(plan_boundary(outputs[index], output_wrappers[index]));
       }
+
+      const char* batch_switch = std::getenv("MLLM_QNN_SEQUENCE_BATCH2_QKV");
+      const bool batch_requested = batch_switch && std::string_view(batch_switch) == "1"
+                                   && std::string_view(graphName).ends_with(kQkvGraphSuffix);
+      const auto& interface = runtime_->qnnInterface;
+      const bool batch = batch_requested && !state.input_plans.empty() && !state.output_plans.empty()
+                         && interface.propertyHasCapability
+                         && interface.propertyHasCapability(QNN_PROPERTY_GRAPH_SUPPORT_BATCH_MULTIPLE)
+                                == QNN_PROPERTY_SUPPORTED
+                         && std::all_of(state.input_plans.begin(), state.input_plans.end(), supportsSequenceBatch)
+                         && std::all_of(state.output_plans.begin(), state.output_plans.end(), supportsSequenceBatch);
+      allocate_scratch(state, batch);
       MLLM_INFO("QNN_SEQUENCE_TILE_SETUP graph={} tile_sequence={} tiles={} scratch_bytes={}", graphName, sequenceTile_,
                 state.tile_count, sequenceTileProfile_.scratch_bytes);
+      if (batch_requested) {
+        MLLM_INFO("QNN_SEQUENCE_BATCH2_SETUP graph={} enabled={}", graphName, static_cast<int>(batch));
+      }
       state_it = sequenceTileGraphs_.emplace(graphName, std::move(state)).first;
     }
 
@@ -892,18 +960,72 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
       validate_boundary(outputs[index], state.output_plans[index]);
     }
 
-    std::vector<Qnn_Tensor_t> qnn_inputs;
-    std::vector<Qnn_Tensor_t> qnn_outputs;
-    qnn_inputs.reserve(input_wrappers.size());
-    qnn_outputs.reserve(output_wrappers.size());
-    for (const auto& wrapper : input_wrappers) { qnn_inputs.push_back(*wrapper->getNativeTensor()); }
-    for (const auto& wrapper : output_wrappers) { qnn_outputs.push_back(*wrapper->getNativeTensor()); }
-
     using clock = std::chrono::steady_clock;
     const auto elapsed_us = [](clock::time_point start, clock::time_point end) {
       return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
     };
     ++sequenceTileProfile_.graph_calls;
+    std::vector<Qnn_Tensor_t> qnn_inputs;
+    std::vector<Qnn_Tensor_t> qnn_outputs;
+    qnn_inputs.reserve(input_wrappers.size());
+    qnn_outputs.reserve(output_wrappers.size());
+
+    // Only the experimental allocation uses a leading dimension different
+    // from the compiled boundary. A fallback installs ordinary tile storage.
+    if (!state.tile_inputs.empty() && state.tile_inputs.front().shape()[0] != state.input_plans.front().compiled_shape[0]) {
+      const auto shared_allocator = std::static_pointer_cast<QNNAllocator>(allocator());
+      std::vector<std::vector<uint32_t>> dimensions;
+      dimensions.reserve(inputs.size() + outputs.size());
+      const auto bind_batch = [&](std::vector<Tensor>& scratch, const auto& wrappers,
+                                 std::vector<Qnn_Tensor_t>& descriptors) {
+        for (size_t index = 0; index < scratch.size(); ++index) {
+          const auto& compiled_shape = *wrappers[index]->getDimension();
+          auto& shape = dimensions.emplace_back(compiled_shape);
+          shape[0] = kSequenceBatchSize;
+          auto& descriptor = descriptors.emplace_back(*wrappers[index]->getNativeTensor());
+          QNN_TENSOR_SET_DIMENSIONS(descriptor, shape.data());
+          QNN_TENSOR_SET_MEM_HANDLE(descriptor, nullptr);
+          shared_allocator->registerQnnTensorToSharedBuffer(scratch[index].ptr<void>(), descriptor);
+        }
+      };
+      bind_batch(state.tile_inputs, input_wrappers, qnn_inputs);
+      bind_batch(state.tile_outputs, output_wrappers, qnn_outputs);
+
+      auto stage_start = clock::now();
+      for (size_t index = 0; index < inputs.size(); ++index) {
+        copyQnnSequenceBatch<true>(state.tile_inputs[index], inputs[index], state.input_plans[index]);
+      }
+      sequenceTileProfile_.input_copy_us += elapsed_us(stage_start, clock::now());
+      stage_start = clock::now();
+      const auto status = runtime_->qnnInterface.graphExecute(model->getQnnGraph(), qnn_inputs.data(), qnn_inputs.size(),
+                                                               qnn_outputs.data(), qnn_outputs.size(),
+                                                               runtime_->profileHandle, nullptr);
+      const auto execute_us = elapsed_us(stage_start, clock::now());
+      sequenceTileProfile_.execute_us += execute_us;
+      ++sequenceTileProfile_.tile_calls;
+      if (status == QNN_SUCCESS) {
+        stage_start = clock::now();
+        for (size_t index = 0; index < outputs.size(); ++index) {
+          copyQnnSequenceBatch<false>(outputs[index], state.tile_outputs[index], state.output_plans[index]);
+        }
+        sequenceTileProfile_.output_copy_us += elapsed_us(stage_start, clock::now());
+        static const char* trace = std::getenv("MLLM_QNN_SEQUENCE_BATCH2_TRACE");
+        if (trace && std::string_view(trace) == "1") {
+          MLLM_INFO("QNN_SEQUENCE_BATCH2_EXEC graph={} tiles={} native_calls=1 exec_us={}", graphName, state.tile_count,
+                    execute_us);
+        }
+        if (ProfilingLevel::OFF != profilingLevel_) { extractBackendProfilingInfo(runtime_->profileHandle); }
+        return;
+      }
+
+      MLLM_WARN("QNN_SEQUENCE_BATCH2_FALLBACK graph={} status={}", graphName, status);
+      qnn_inputs.clear();
+      qnn_outputs.clear();
+      allocate_scratch(state, false);
+    }
+
+    for (const auto& wrapper : input_wrappers) { qnn_inputs.push_back(*wrapper->getNativeTensor()); }
+    for (const auto& wrapper : output_wrappers) { qnn_outputs.push_back(*wrapper->getNativeTensor()); }
     for (int32_t tile_index = 0; tile_index < state.tile_count; ++tile_index) {
       auto stage_start = clock::now();
       for (size_t index = 0; index < inputs.size(); ++index) {
@@ -926,96 +1048,6 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
       }
       sequenceTileProfile_.output_copy_us += elapsed_us(stage_start, clock::now());
       ++sequenceTileProfile_.tile_calls;
-    }
-    static const char* batch_probe_graph = std::getenv("MLLM_QNN_SEQUENCE_BATCH2_PROBE_GRAPH");
-    if (batch_probe_graph && graphName == batch_probe_graph) {
-      // Compare a single batch-multiplied execution with the two ordinary tiles.
-      // The diagnostic uses separate storage and never publishes its outputs.
-      const auto& interface = runtime_->qnnInterface;
-      const auto batch_compatible = [&](const std::vector<QNNSequenceTilePlan>& plans, const char* direction) {
-        bool compatible = true;
-        for (size_t i = 0; i < plans.size(); ++i) {
-          const auto& plan = plans[i];
-          const bool distinct_batch_axis = plan.axis > 0 && plan.compiled_shape[0] == 1;
-          MLLM_INFO("QNN_SEQUENCE_BATCH2_LAYOUT graph={} direction={} index={} rank={} axis={} distinct_batch_axis={}",
-                    graphName, direction, i, plan.compiled_shape.size(), plan.axis, distinct_batch_axis);
-          compatible &= plan.tile_count == 2 && distinct_batch_axis;
-        }
-        return compatible;
-      };
-      const bool property_supported = interface.propertyHasCapability &&
-          interface.propertyHasCapability(QNN_PROPERTY_GRAPH_SUPPORT_BATCH_MULTIPLE) == QNN_PROPERTY_SUPPORTED;
-      const bool compatible_inputs = batch_compatible(state.input_plans, "input");
-      const bool compatible_outputs = batch_compatible(state.output_plans, "output");
-      if (!property_supported || !compatible_inputs || !compatible_outputs) {
-        MLLM_INFO("QNN_SEQUENCE_BATCH2_PROBE graph={} skipped=unsupported_property_or_shape property={} inputs={} outputs={}",
-                  graphName, property_supported, compatible_inputs, compatible_outputs);
-        return;
-      }
-
-      const auto shared_allocator = std::static_pointer_cast<QNNAllocator>(allocator());
-      std::vector<std::vector<uint32_t>> dimensions;
-      std::vector<Tensor> storage;
-      storage.reserve(inputs.size() + outputs.size());
-      dimensions.reserve(inputs.size() + outputs.size());
-      const auto visit_batch_spans = [](const Tensor& logical, Tensor& scratch, const QNNSequenceTilePlan& plan,
-                                        const auto& visit) {
-        size_t groups = 1;
-        for (size_t axis = 1; axis < plan.axis; ++axis) { groups *= plan.compiled_shape[axis]; }
-        const size_t bytes = logical.bytes() / (2 * groups);
-        // Logical storage groups both tiles by head. Batched storage groups
-        // all heads by tile. Preserve each contiguous sequence span.
-        for (size_t tile = 0; tile < 2; ++tile) {
-          for (size_t group = 0; group < groups; ++group) {
-            visit(scratch.ptr<uint8_t>() + (tile * groups + group) * bytes,
-                  logical.ptr<uint8_t>() + (2 * group + tile) * bytes, bytes);
-          }
-        }
-      };
-      const auto prepare_batch = [&](const std::vector<Tensor>& logical, const std::vector<QNNSequenceTilePlan>& plans,
-                                     std::vector<Qnn_Tensor_t>& descriptors, bool copy_input) {
-        for (size_t i = 0; i < logical.size(); ++i) {
-          auto shape = plans[i].compiled_shape;
-          shape[0] = 2;
-          dimensions.emplace_back(shape.begin(), shape.end());
-          auto& scratch = storage.emplace_back(Tensor::empty(shape, logical[i].dtype(), kQNN).alloc());
-          if (scratch.bytes() != logical[i].bytes()) {
-            throw std::invalid_argument("QNN batch multiplier changed a graph boundary's total storage size");
-          }
-          QNN_TENSOR_SET_DIMENSIONS(descriptors[i], dimensions.back().data());
-          QNN_TENSOR_SET_MEM_HANDLE(descriptors[i], nullptr);
-          shared_allocator->registerQnnTensorToSharedBuffer(scratch.ptr<void>(), descriptors[i]);
-          if (copy_input) {
-            visit_batch_spans(logical[i], scratch, plans[i], [](auto* to, const auto* from, size_t bytes) {
-              std::memcpy(to, from, bytes);
-            });
-          } else {
-            std::memset(scratch.ptr<void>(), 0xA5, scratch.bytes());
-          }
-        }
-      };
-      prepare_batch(inputs, state.input_plans, qnn_inputs, true);
-      prepare_batch(outputs, state.output_plans, qnn_outputs, false);
-      const auto begin = clock::now();
-      const auto status = interface.graphExecute(model->getQnnGraph(), qnn_inputs.data(), qnn_inputs.size(),
-                                                 qnn_outputs.data(), qnn_outputs.size(), nullptr, nullptr);
-      const auto duration = elapsed_us(begin, clock::now());
-      size_t checked_bytes = 0;
-      size_t mismatched_outputs = 0;
-      if (status == QNN_SUCCESS) {
-        for (size_t i = 0; i < outputs.size(); ++i) {
-          const size_t bytes = outputs[i].bytes();
-          checked_bytes += bytes;
-          bool matches = true;
-          visit_batch_spans(outputs[i], storage[inputs.size() + i], state.output_plans[i],
-                            [&](const auto* actual, const auto* expected, size_t span_bytes) {
-            matches &= std::memcmp(actual, expected, span_bytes) == 0;
-          });
-          mismatched_outputs += !matches;
-        }
-      }
-      MLLM_INFO("QNN_SEQUENCE_BATCH2_PROBE graph={} status={} outputs={} checked_bytes={} mismatched_outputs={} exec_us={}",
-                graphName, status, outputs.size(), checked_bytes, mismatched_outputs, duration);
     }
     if (ProfilingLevel::OFF != profilingLevel_) { extractBackendProfilingInfo(runtime_->profileHandle); }
     return;
