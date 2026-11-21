@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 #if defined(__linux__)
@@ -22,6 +23,7 @@
 
 #include "QnnLog.h"
 #include "HTP/QnnHtpContext.h"
+#include "HTP/QnnHtpProfile.h"
 
 #include "mllm/backends/qnn/QNNBackend.hpp"
 #include "mllm/backends/qnn/QNNTypeMacros.hpp"
@@ -43,6 +45,113 @@
 namespace mllm::qnn {
 
 namespace {
+
+bool shouldProfileTileBackend(std::string_view graph) {
+  static const std::string_view selection = [] {
+    const char* value = std::getenv("MLLM_QNN_SEQUENCE_TILE_BACKEND_PROFILE_GRAPHS");
+    return value ? std::string_view(value) : std::string_view{};
+  }();
+  auto remaining = selection;
+  while (!remaining.empty()) {
+    const auto end = remaining.find(',');
+    if (remaining.substr(0, end) == graph) { return true; }
+    if (end == std::string_view::npos) { break; }
+    remaining.remove_prefix(end + 1);
+  }
+  return false;
+}
+
+class ScopedTileBackendProfiles {
+ public:
+  ScopedTileBackendProfiles(const QNN_INTERFACE_VER_TYPE& api, Qnn_BackendHandle_t backend, const std::string& graph,
+                            size_t count)
+      : api_(api), graph_(graph) {
+    if (count == 0) { return; }
+    if (!api_.profileCreate || !api_.profileFree || !api_.profileGetEvents || !api_.profileGetEventData ||
+        !api_.profileGetSubEvents) {
+      MLLM_WARN("QNN_SEQUENCE_TILE_BACKEND_PROFILE_ERROR graph={} stage=missing_api", graph_);
+      return;
+    }
+    handles_.assign(count, nullptr);
+    for (auto& handle : handles_) {
+      const auto rc = api_.profileCreate(backend, QNN_PROFILE_LEVEL_DETAILED, &handle);
+      if (rc != QNN_PROFILE_NO_ERROR || !handle) {
+        MLLM_WARN("QNN_SEQUENCE_TILE_BACKEND_PROFILE_ERROR graph={} stage=create status={}", graph_, rc);
+        release();
+        return;
+      }
+    }
+  }
+
+  ~ScopedTileBackendProfiles() { release(); }
+  ScopedTileBackendProfiles(const ScopedTileBackendProfiles&) = delete;
+  ScopedTileBackendProfiles& operator=(const ScopedTileBackendProfiles&) = delete;
+
+  Qnn_ProfileHandle_t handle(size_t tile, Qnn_ProfileHandle_t fallback) const {
+    return handles_.empty() ? fallback : handles_[tile];
+  }
+
+  void dump(uint64_t logical_call) const {
+    for (size_t tile = 0; tile < handles_.size(); ++tile) {
+      const QnnProfile_EventId_t* roots = nullptr;
+      uint32_t count = 0;
+      const auto rc = api_.profileGetEvents(handles_[tile], &roots, &count);
+      if (rc != QNN_PROFILE_NO_ERROR || (count != 0 && !roots)) {
+        MLLM_WARN("QNN_SEQUENCE_TILE_BACKEND_PROFILE_ERROR graph={} logical_call={} tile_index={} stage=roots status={}",
+                  graph_, logical_call, tile, rc);
+        continue;
+      }
+      MLLM_INFO("QNN_SEQUENCE_TILE_BACKEND_PROFILE_ROOTS graph={} logical_call={} tile_index={} root_count={}", graph_,
+                logical_call, tile, count);
+      for (uint32_t index = 0; index < count; ++index) {
+        dumpEvent(roots[index], logical_call, tile, false);
+      }
+    }
+  }
+
+ private:
+  void release() {
+    for (auto handle : handles_) {
+      if (handle) { api_.profileFree(handle); }
+    }
+    handles_.clear();
+  }
+
+  void dumpEvent(QnnProfile_EventId_t id, uint64_t logical_call, size_t tile, bool child) const {
+    QnnProfile_EventData_t data = QNN_PROFILE_EVENT_DATA_INIT;
+    const auto rc = api_.profileGetEventData(id, &data);
+    if (rc != QNN_PROFILE_NO_ERROR) {
+      MLLM_WARN("QNN_SEQUENCE_TILE_BACKEND_PROFILE_ERROR graph={} logical_call={} tile_index={} stage=event status={}",
+                graph_, logical_call, tile, rc);
+      return;
+    }
+    const bool generic = data.type == QNN_PROFILE_EVENTTYPE_EXECUTE;
+    const bool htp = data.type >= QNN_HTP_PROFILE_EVENTTYPE_GRAPH_EXECUTE_HOST_RPC_TIME_MICROSEC &&
+                     data.type <= QNN_HTP_PROFILE_EVENTTYPE_GRAPH_EXECUTE_ACCEL_EXCL_WAIT_TIME_MICROSEC;
+    const bool host_detail = data.type >= QNN_PROFILE_EVENTTYPE_EXECUTE_QUEUE_WAIT &&
+                             data.type <= QNN_PROFILE_EVENTTYPE_EXECUTE_POSTPROCESS;
+    if (generic || htp || host_detail) {
+      MLLM_INFO("QNN_SEQUENCE_TILE_BACKEND_PROFILE_EVENT graph={} logical_call={} tile_index={} child={} type={} unit={} value={}",
+                graph_, logical_call, tile, static_cast<int>(child), data.type, data.unit, data.value);
+    }
+    if (child || !generic) { return; }
+    const QnnProfile_EventId_t* children = nullptr;
+    uint32_t count = 0;
+    const auto status = api_.profileGetSubEvents(id, &children, &count);
+    if (status != QNN_PROFILE_NO_ERROR || (count != 0 && !children)) {
+      MLLM_WARN("QNN_SEQUENCE_TILE_BACKEND_PROFILE_ERROR graph={} logical_call={} tile_index={} stage=children status={}",
+                graph_, logical_call, tile, status);
+      return;
+    }
+    for (uint32_t index = 0; index < count; ++index) {
+      dumpEvent(children[index], logical_call, tile, true);
+    }
+  }
+
+  const QNN_INTERFACE_VER_TYPE& api_;
+  const std::string& graph_;
+  std::vector<Qnn_ProfileHandle_t> handles_;
+};
 
 bool sequenceTileBufferPoolEnabled() {
   static const bool enabled = [] {
@@ -935,6 +1044,19 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
     const auto elapsed_us = [](clock::time_point start, clock::time_point end) {
       return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
     };
+    static const bool profile_tiles = [] {
+      const char* value = std::getenv("MLLM_QNN_SEQUENCE_TILE_PROFILE");
+      return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    struct TileTimes {
+      uint64_t input_copy_us;
+      uint64_t execute_us;
+      uint64_t output_copy_us;
+    };
+    std::vector<TileTimes> tile_times;
+    if (profile_tiles) { tile_times.reserve(state.tile_count); }
+    const size_t profile_count = shouldProfileTileBackend(graphName) ? state.tile_count : 0;
+    ScopedTileBackendProfiles tile_profiles(runtime_->qnnInterface, runtime_->backendHandle, graphName, profile_count);
     ++sequenceTileProfile_.graph_calls;
     for (int32_t tile_index = 0; tile_index < state.tile_count; ++tile_index) {
       auto stage_start = clock::now();
@@ -942,21 +1064,35 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
         const auto& plan = state.input_plans[index];
         copyQnnSequenceTile(state.tile_inputs[index], 0, inputs[index], tile_index * sequenceTile_, sequenceTile_, plan.axis);
       }
-      sequenceTileProfile_.input_copy_us += elapsed_us(stage_start, clock::now());
+      const auto input_copy_us = elapsed_us(stage_start, clock::now());
+      sequenceTileProfile_.input_copy_us += input_copy_us;
 
       stage_start = clock::now();
       CALL_QNN(runtime_->qnnInterface.graphExecute(model->getQnnGraph(), qnn_inputs.data(), qnn_inputs.size(),
-                                                   qnn_outputs.data(), qnn_outputs.size(), runtime_->profileHandle, nullptr));
-      sequenceTileProfile_.execute_us += elapsed_us(stage_start, clock::now());
+                                                   qnn_outputs.data(), qnn_outputs.size(),
+                                                   tile_profiles.handle(tile_index, runtime_->profileHandle), nullptr));
+      const auto execute_us = elapsed_us(stage_start, clock::now());
+      sequenceTileProfile_.execute_us += execute_us;
 
       stage_start = clock::now();
       for (size_t index = 0; index < outputs.size(); ++index) {
         const auto& plan = state.output_plans[index];
         copyQnnSequenceTile(outputs[index], tile_index * sequenceTile_, state.tile_outputs[index], 0, sequenceTile_, plan.axis);
       }
-      sequenceTileProfile_.output_copy_us += elapsed_us(stage_start, clock::now());
+      const auto output_copy_us = elapsed_us(stage_start, clock::now());
+      sequenceTileProfile_.output_copy_us += output_copy_us;
       ++sequenceTileProfile_.tile_calls;
+      if (profile_tiles) { tile_times.push_back({input_copy_us, execute_us, output_copy_us}); }
     }
+    // Emit records after the last tile so logging cannot delay the next tile within this call.
+    for (size_t index = 0; index < tile_times.size(); ++index) {
+      const auto& times = tile_times[index];
+      MLLM_INFO("QNN_SEQUENCE_TILE_CALL_TIMES graph={} logical_call={} tile_index={} tiles={} input_copy_us={} "
+                "execute_us={} output_copy_us={}",
+                graphName, sequenceTileProfile_.graph_calls, index, state.tile_count, times.input_copy_us,
+                times.execute_us, times.output_copy_us);
+    }
+    tile_profiles.dump(sequenceTileProfile_.graph_calls);
     if (ProfilingLevel::OFF != profilingLevel_) { extractBackendProfilingInfo(runtime_->profileHandle); }
     return;
   }
