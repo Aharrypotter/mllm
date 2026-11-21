@@ -350,8 +350,17 @@ void QNNPerf::setRpcLatencyAndPolling() {
 }
 
 void QNNPerf::setPowerConfigBurst() {
-  const QnnHtpPerfInfrastructure_PowerConfig_t* powerConfigs[] = {&powerConfigBurst_, nullptr};
-  CALL_QNN(perfInfra_.setPowerConfig(powerConfigId_, powerConfigs));
+  const auto* option = std::getenv("MLLM_QNN_HTP_BURST_KEEP_AWAKE");
+  const bool keep_awake = option && std::strcmp(option, "1") == 0;
+  auto config = powerConfigBurst_;
+  if (keep_awake) {
+    config.dcvsV3Config.setSleepDisable = 1;
+    config.dcvsV3Config.sleepDisable = 1;
+  }
+  const QnnHtpPerfInfrastructure_PowerConfig_t* powerConfigs[] = {&config, nullptr};
+  const auto status = perfInfra_.setPowerConfig(powerConfigId_, powerConfigs);
+  CALL_QNN(status);
+  MLLM_INFO("QNN_HTP_BURST_POWER keep_awake={} status={}", static_cast<int>(keep_awake), status & 0xFFFFu);
 }
 
 void QNNPerf::setPowerConfigBalanced() {
