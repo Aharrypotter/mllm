@@ -9,6 +9,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -864,31 +865,60 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
   if (sequenceTile_ > 0) {
     const auto input_wrappers = model->getGraphInputTensorWrappers();
     const auto output_wrappers = model->getGraphOutputTensorWrappers();
+    static const bool use_buffer_pool = [] {
+      const char* enabled = std::getenv("MLLM_QNN_SEQUENCE_TILE_BUFFER_POOL");
+      return enabled && std::string_view(enabled) == "1";
+    }();
+    // A shared buffer is exclusive through staging, synchronous execution,
+    // and publication of all outputs back to the logical tensor.
+    static std::mutex buffer_pool_mutex;
+    std::unique_lock pool_lock(buffer_pool_mutex, std::defer_lock);
+    if (use_buffer_pool) { pool_lock.lock(); }
+
     const auto allocate_scratch = [&](SequenceTileGraphState& state, bool batch) {
       const auto allocate = [&](const std::vector<Tensor>& logical,
                                 const std::vector<std::shared_ptr<QNNTensorWrapper>>& wrappers,
                                 const std::vector<QNNSequenceTilePlan>& plans, std::vector<Tensor>& scratch,
-                                const char* direction) {
-        for (const auto& tensor : scratch) { sequenceTileProfile_.scratch_bytes -= tensor.bytes(); }
+                                bool is_input) {
+        const auto find_peer = [&](size_t index, const auto& matches) -> Tensor {
+          if (use_buffer_pool) {
+            for (const auto& [_, peer] : sequenceTileGraphs_) {
+              if (&peer == &state) { continue; }
+              const auto& peer_scratch = is_input ? peer.tile_inputs : peer.tile_outputs;
+              if (index < peer_scratch.size() && matches(peer_scratch[index])) { return peer_scratch[index]; }
+            }
+          }
+          return {};
+        };
+
+        for (size_t index = 0; index < scratch.size(); ++index) {
+          const auto* released = scratch[index].ptr<void>();
+          const auto peer = find_peer(index, [&](const Tensor& other) { return released == other.ptr<void>(); });
+          if (peer.isNil()) { sequenceTileProfile_.scratch_bytes -= scratch[index].bytes(); }
+        }
         scratch.clear();
         scratch.reserve(plans.size());
         for (size_t index = 0; index < plans.size(); ++index) {
           auto shape = plans[index].compiled_shape;
           if (batch) { shape[0] = kSequenceBatchSize; }
-          auto tile = Tensor::empty(shape, logical[index].dtype(), kQNN).alloc();
-          tile.setName("qnn_sequence_tile_" + graphName + "_" + direction + std::to_string(index));
+          const auto dtype = logical[index].dtype();
+          auto tile = find_peer(index, [&](const Tensor& other) { return other.dtype() == dtype && other.shape() == shape; });
+          if (tile.isNil()) {
+            tile = Tensor::empty(shape, dtype, kQNN).alloc();
+            tile.setName("qnn_sequence_tile_" + graphName + (is_input ? "_input" : "_output") + std::to_string(index));
+            sequenceTileProfile_.scratch_bytes += tile.bytes();
+          }
           if (!batch) {
             wrappers[index]->__rebindDataContainerForExecution(tile);
             wrappers[index]->alloc();
           } else if (tile.bytes() != logical[index].bytes()) {
             throw std::invalid_argument("QNN sequence batch storage differs from the logical tensor size");
           }
-          sequenceTileProfile_.scratch_bytes += tile.bytes();
           scratch.push_back(std::move(tile));
         }
       };
-      allocate(inputs, input_wrappers, state.input_plans, state.tile_inputs, "input");
-      allocate(outputs, output_wrappers, state.output_plans, state.tile_outputs, "output");
+      allocate(inputs, input_wrappers, state.input_plans, state.tile_inputs, true);
+      allocate(outputs, output_wrappers, state.output_plans, state.tile_outputs, false);
     };
 
     auto state_it = sequenceTileGraphs_.find(graphName);
@@ -899,8 +929,9 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
             || logical.impl()->storage()->ptr_ == nullptr) {
           throw std::invalid_argument("QNN sequence tiling requires allocated contiguous QNN graph boundaries");
         }
-        if (QNN_TENSOR_GET_DATA_TYPE(wrapper->getNativeTensor()) != mllmDataTypeToQnnDataType(logical.dtype())) {
-          throw std::invalid_argument("QNN sequence-tile boundary dtype differs from the compiled graph");
+        if (lanesOfType(logical.dtype()) != 1
+            || QNN_TENSOR_GET_DATA_TYPE(wrapper->getNativeTensor()) != mllmDataTypeToQnnDataType(logical.dtype())) {
+          throw std::invalid_argument("QNN sequence tiling requires the compiled scalar boundary dtype");
         }
         const auto& dimensions = *wrapper->getDimension();
         Tensor::shape_t compiled_shape(dimensions.begin(), dimensions.end());
@@ -944,20 +975,22 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
     }
 
     auto& state = state_it->second;
-    auto validate_boundary = [&](const Tensor& logical, const QNNSequenceTilePlan& expected) {
+    const auto validate_boundary = [&](const Tensor& logical, const QNNSequenceTilePlan& expected, const Tensor& scratch) {
       if (logical.isNil() || logical.device() != kQNN || !logical.isContiguous()
           || logical.impl()->storage()->ptr_ == nullptr) {
         throw std::invalid_argument("QNN sequence-tile graph boundary is not allocated contiguous QNN memory");
       }
       const auto actual = planQnnSequenceTiling(logical.shape(), expected.compiled_shape, sequenceTile_);
-      if (actual.axis != expected.axis || actual.tile_count != expected.tile_count) {
+      if (actual.axis != expected.axis || actual.tile_count != expected.tile_count || logical.dtype() != scratch.dtype()) {
         throw std::invalid_argument("QNN sequence-tile graph boundary changed after setup");
       }
     };
-    for (size_t index = 0; index < inputs.size(); ++index) { validate_boundary(inputs[index], state.input_plans[index]); }
+    for (size_t index = 0; index < inputs.size(); ++index) {
+      validate_boundary(inputs[index], state.input_plans[index], state.tile_inputs[index]);
+    }
     for (size_t index = 0; index < outputs.size(); ++index) {
-      if (outputs[index].impl()->storage()->ptr_ == nullptr) { outputs[index].alloc(); }
-      validate_boundary(outputs[index], state.output_plans[index]);
+      if (!outputs[index].isNil() && outputs[index].impl()->storage()->ptr_ == nullptr) { outputs[index].alloc(); }
+      validate_boundary(outputs[index], state.output_plans[index], state.tile_outputs[index]);
     }
 
     using clock = std::chrono::steady_clock;
