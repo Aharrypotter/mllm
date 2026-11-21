@@ -670,7 +670,9 @@ class QwenOutProjAndMLP final : public nn::Module {
 
 class QwenDecoder final : public nn::Module {
   bool capture_debug_boundaries_ = false;
+  bool capture_shadow_boundaries_ = false;
   std::vector<Tensor> captured_debug_boundaries_;
+  std::vector<Tensor> captured_shadow_boundaries_;
 
  public:
   QwenAttentionProjNPU self_attn_proj_;
@@ -707,8 +709,12 @@ class QwenDecoder final : public nn::Module {
       MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 3);
       auto activation = out_mlp_states[0].to(kCPU).contiguous();
       if (activation.dtype() == kFloat16) { activation = activation.to(kFloat32); }
-      return down_proj_shadow_correction_(activation, out_mlp_states[1].to(kCPU).contiguous(),
-                                          out_mlp_states[2].to(kCPU).contiguous());
+      auto down_codes = out_mlp_states[1].to(kCPU).contiguous();
+      auto residual_before_correction = out_mlp_states[2].to(kCPU).contiguous();
+      if (capture_shadow_boundaries_) {
+        captured_shadow_boundaries_ = {activation, down_codes, residual_before_correction};
+      }
+      return down_proj_shadow_correction_(activation, down_codes, residual_before_correction);
     }
     MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 1);
     return out_mlp_states[0];
@@ -716,6 +722,7 @@ class QwenDecoder final : public nn::Module {
 
   Tensor attentionFromProjection(std::vector<Tensor> states, const Tensor& sin, const Tensor& cos) {
     captured_debug_boundaries_.clear();
+    captured_shadow_boundaries_.clear();
     auto query_states = states[0].to(kCPU);
     auto key_states = states[1].to(kCPU);
     auto value_states = states[2].to(kCPU);
@@ -733,7 +740,9 @@ class QwenDecoder final : public nn::Module {
 
   nn::KVCache& getKVCache() { return self_attn_matmul_.getKVCache(); }
   void setCaptureDebugBoundaries(bool capture) { capture_debug_boundaries_ = capture; }
+  void setCaptureShadowBoundaries(bool capture) { capture_shadow_boundaries_ = capture; }
   const std::vector<Tensor>& capturedDebugBoundaries() const { return captured_debug_boundaries_; }
+  const std::vector<Tensor>& capturedShadowBoundaries() const { return captured_shadow_boundaries_; }
 };
 
 class QwenMlpAndNextQkv final : public nn::Module {
@@ -845,10 +854,13 @@ class QwenText final : public nn::Module {
   nn::Embedding embedding_;
 
   nn::ModuleListWithIdx<QwenDecoder>& decode_blocks() { return decode_blocks_; }
-  void setCaptureLayerOutputs(bool capture) {
+  void setCaptureLayerOutputs(bool capture, bool capture_shadow_boundaries) {
     capture_layer_outputs_ = capture;
     auto& blocks = decode_blocks_.list();
-    for (auto& block : blocks) { block.setCaptureDebugBoundaries(capture); }
+    for (auto& block : blocks) {
+      block.setCaptureDebugBoundaries(capture);
+      block.setCaptureShadowBoundaries(capture_shadow_boundaries);
+    }
   }
   const std::vector<Tensor>& capturedLayerOutputs() const { return captured_layer_outputs_; }
   size_t capturedBoundaryLayerCount() { return decode_blocks_.list().size(); }
@@ -858,6 +870,9 @@ class QwenText final : public nn::Module {
     return blocks[layer_index].capturedDebugBoundaries();
   }
   const std::vector<Tensor>& capturedLayerZeroBoundaries() { return capturedLayerBoundaries(0); }
+  const std::vector<Tensor>& capturedLayerShadowBoundaries(size_t layer_index) {
+    return decode_blocks_.list().at(layer_index).capturedShadowBoundaries();
+  }
 
   void clearKVCache() {
     for (auto& block : decode_blocks_.list()) { block.getKVCache().clearCache(); }
@@ -918,7 +933,9 @@ class QwenForCausalLM : public nn::Module, public ARGeneration {
     auto input_embeddings = model.embedding_(sequence);
 
     const bool capture_layer_outputs = args.count("debug_layer_outputs") && args.at("debug_layer_outputs").get<bool>();
-    model.setCaptureLayerOutputs(capture_layer_outputs);
+    const bool capture_shadow_boundaries =
+        args.count("debug_shadow_boundaries") && args.at("debug_shadow_boundaries").get<bool>();
+    model.setCaptureLayerOutputs(capture_layer_outputs, capture_shadow_boundaries);
     auto hidden_states = model(input_embeddings, llm_embedding_sin, llm_embedding_cos)[0];
 
     // clip hidden_states to one seq length
@@ -950,6 +967,9 @@ class QwenForCausalLM : public nn::Module, public ARGeneration {
   size_t capturedBoundaryLayerCount() { return model.capturedBoundaryLayerCount(); }
   const std::vector<Tensor>& capturedLayerBoundaries(size_t layer_index) { return model.capturedLayerBoundaries(layer_index); }
   const std::vector<Tensor>& capturedLayerZeroBoundaries() { return model.capturedLayerZeroBoundaries(); }
+  const std::vector<Tensor>& capturedLayerShadowBoundaries(size_t layer_index) {
+    return model.capturedLayerShadowBoundaries(layer_index);
+  }
 
   IROutput trace(const ARGenerationOutputPast& input, const ARGenerationArgs& args) override {
     // Things we need to return
