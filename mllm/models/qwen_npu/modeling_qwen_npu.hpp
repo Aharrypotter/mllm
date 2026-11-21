@@ -580,12 +580,14 @@ class QwenOutProjAndMLP final : public nn::Module {
     if (!shadow_int8_input_) { return attention.to(kQNN); }
     MLLM_RT_ASSERT_EQ(attention.device(), kCPU);
     MLLM_RT_ASSERT_EQ(attention.dtype(), kFloat32);
-    const auto& scale = o_proj_quantize_scale_.weight();
+    // Match QNNCastTypeOp's range-to-step conversion before exposing codes to QNN.
+    const float step = static_cast<float>(o_proj_quantize_scale_.weight().ptr<float>()[0] / 127.0);
+    MLLM_RT_ASSERT(std::isfinite(step) && step > 0.0F);
+    auto scale = Tensor::empty({1}, kFloat32, kCPU).alloc();
+    scale.ptr<float>()[0] = step;
     auto input = Tensor::empty(attention.shape(), kInt8, kQNN);
     input.attach("qnn_quant_scale", scale.impl());
     if (!Context::instance().thisThread()->trace_mode) {
-      const float step = scale.ptr<float>()[0];
-      MLLM_RT_ASSERT(std::isfinite(step) && step > 0.0F);
       attention = attention.contiguous();
       input.alloc();
       quantizeShadowAttentionInt8(attention.ptr<float>(), input.ptr<int8_t>(), attention.numel(), 1.0F / step);
@@ -603,8 +605,12 @@ class QwenOutProjAndMLP final : public nn::Module {
     // [B, S, H * D] ->  [B * S, H * D]
     auto input = inputs[0];
     input = input.view({B, S, 1, hidden_size_});
-    input.attach("qnn_quant_scale", o_proj_quantize_scale_.weight().impl());
-    input = input.to(kInt8);
+    if (shadow_int8_input_) {
+      MLLM_RT_ASSERT_EQ(input.dtype(), kInt8);
+    } else {
+      input.attach("qnn_quant_scale", o_proj_quantize_scale_.weight().impl());
+      input = input.to(kInt8);
+    }
     auto x = o_proj_(input);
     x = x.view({B, S, 1, hidden_size_});
     x = x.to(kFloat32);
