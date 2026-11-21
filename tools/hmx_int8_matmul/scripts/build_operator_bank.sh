@@ -46,6 +46,8 @@ hvx_epilogue_batch_tiles="${HMX_HVX_EPILOGUE_BATCH_TILES:-8}"
 long_rpc_ready_group_heads="${HMX_LONG_RPC_READY_GROUP_HEADS:-12}"
 vtcm_shared_key="${HMX_I8_VTCM_SHARED_KEY:-OFF}"
 vtcm_shared_key_wide_tail="${HMX_I8_SHARED_KEY_WIDE_TAIL:-OFF}"
+hvx_aligned_score_stores="${HMX_I8_HVX_ALIGNED_SCORE_STORES:-OFF}"
+hvx_q15_score_requant="${HMX_I8_HVX_Q15_SCORE_REQUANT:-OFF}"
 
 default_models="qwen2_1p5b"
 model_spec="${HMX_OPERATOR_MODELS:-${default_models}}"
@@ -432,6 +434,8 @@ build_shape_variants() {
                         HMX_LONG_RPC_READY_GROUP_HEADS="${long_rpc_ready_group_heads}" \
                         HMX_I8_VTCM_SHARED_KEY="${vtcm_shared_key}" \
                         HMX_I8_SHARED_KEY_WIDE_TAIL="${vtcm_shared_key_wide_tail}" \
+                        HMX_I8_HVX_ALIGNED_SCORE_STORES="${hvx_aligned_score_stores}" \
+                        HMX_I8_HVX_Q15_SCORE_REQUANT="${hvx_q15_score_requant}" \
                         HMX_RPC_SKEL_OUTPUT_NAME="${skel_output_name}"
                     copy_artifact "${dsp_ship}/${skel_file}" "${output_dir}/${skel_file}"
                     built_dispatch_skels[${skel_output_name}]=1
