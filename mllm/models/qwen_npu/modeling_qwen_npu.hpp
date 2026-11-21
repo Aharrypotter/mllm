@@ -53,6 +53,14 @@ inline bool supportsDirectHmxKVStage(const Tensor& states) {
          && head_elements <= std::numeric_limits<int>::max();
 }
 
+inline void reportHmxDirectKVStage(int32_t head_stride, int64_t live_head_elements, int64_t query_heads) {
+  static std::once_flag log_first_cast;
+  std::call_once(log_first_cast, [&] {
+    MLLM_INFO("SHADOWNPU_HMX_DIRECT_KV_CAST head_stride={} live_head_elements={} heads={}", head_stride,
+              live_head_elements, query_heads);
+  });
+}
+
 // The shared CPU-decode cache remains Float32. This staging buffer keeps only
 // the native KV heads in Float16, with a stable head stride across prefill chunks.
 class IncrementalHmxKVStage {
@@ -83,6 +91,7 @@ class IncrementalHmxKVStage {
       cpu::arm::fp32_2_fp16(input + head * head_group_size * stride[1] + element_offset,
                            output + head * head_capacity * head_dim + element_offset, elements, 1);
     }
+    reportHmxDirectKVStage(stride[1], static_cast<int64_t>(live_tokens) * head_dim, states.shape()[1]);
     if (append) {
       static std::once_flag log_first_append;
       std::call_once(log_first_append, [&] {
@@ -126,11 +135,7 @@ inline auto stageHmxPrefillKV(Tensor states, int head_group_size = 1) -> Tensor 
       cpu::arm::fp32_2_fp16(input + source_head * stride[1], output + head * head_elements,
                            static_cast<int>(head_elements), 1);
     }
-    static std::once_flag log_first_cast;
-    std::call_once(log_first_cast, [&] {
-      MLLM_INFO("SHADOWNPU_HMX_DIRECT_KV_CAST head_stride={} live_head_elements={} heads={}", stride[1], head_elements,
-                repeated_heads);
-    });
+    reportHmxDirectKVStage(stride[1], head_elements, repeated_heads);
     if (head_group_size > 1) {
       static std::once_flag log_first_compact_cast;
       std::call_once(log_first_compact_cast, [&] {
