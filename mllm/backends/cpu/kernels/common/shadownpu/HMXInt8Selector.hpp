@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -4282,15 +4283,6 @@ private:
         }
     }
 
-    static void cpuPackKeyHead(
-        const Request &request, std::size_t matrix, int key_begin,
-        int padded_n, float k_scale, std::int8_t *destination,
-        std::int32_t *sums, int k) noexcept {
-        cpuPackKeyTokenRange(
-            request, matrix, (key_begin / 32) * 32, padded_n, k_scale,
-            destination, sums, k);
-    }
-
     static void publishCpuPackProgress(
         volatile std::int32_t *ready, int query_tiles,
         int key_tiles) noexcept {
@@ -4325,7 +4317,61 @@ private:
         const std::size_t key_stride =
             static_cast<std::size_t>(padded_n) * k;
         const bool intra_head = cpuPackIntraHeadEnabled();
+        static const bool share_packed_key = [] {
+            const char *value = std::getenv("MLLM_HMX_INT8_SHARE_PACKED_K");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        static const bool trace_key_groups = [] {
+            const char *value = std::getenv("MLLM_HMX_INT8_PACKED_K_REUSE_TRACE");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        const int first_key_token = (key_begin / 32) * 32;
+        std::size_t distinct_sources = 0;
+        std::size_t distinct_packs = 0;
+        std::size_t copied_heads = 0;
         for (std::size_t local = 0; local < count; ++local) {
+            const std::size_t matrix = matrix_indices[local];
+            std::size_t representative = local;
+            if (share_packed_key || trace_key_groups) {
+                bool seen_source = false;
+                for (std::size_t peer = 0; peer < local; ++peer) {
+                    if (request.key_heads[matrix]
+                        != request.key_heads[matrix_indices[peer]]) {
+                        continue;
+                    }
+                    seen_source = true;
+                    if (std::memcmp(&k_scales[local], &k_scales[peer],
+                                    sizeof(float)) == 0) {
+                        representative = peer;
+                        break;
+                    }
+                }
+                distinct_sources += !seen_source;
+                distinct_packs += representative == local;
+            }
+
+            auto *key_destination = direct_key + local * key_stride;
+            const std::size_t sum_stride = static_cast<std::size_t>(padded_n);
+            auto *sum_destination = direct_sums + local * sum_stride;
+            const bool copy_key = share_packed_key && representative != local;
+            if (copy_key && first_key_token < padded_n) ++copied_heads;
+            const auto write_key_range = [&](int begin, int end) noexcept {
+                if (!copy_key) {
+                    cpuPackKeyTokenRange(
+                        request, matrix, begin, end, k_scales[local],
+                        key_destination, sum_destination, k);
+                    return;
+                }
+                // A full 32-token tile and its sums occupy contiguous spans.
+                // The preceding head finished writing its slot before this head.
+                const std::size_t first_byte = static_cast<std::size_t>(begin) * k;
+                const std::size_t bytes = static_cast<std::size_t>(end - begin) * k;
+                std::memcpy(key_destination + first_byte,
+                            direct_key + representative * key_stride + first_byte, bytes);
+                std::memcpy(sum_destination + begin,
+                            direct_sums + representative * sum_stride + begin,
+                            static_cast<std::size_t>(end - begin) * sizeof(std::int32_t));
+            };
             if (intra_head) {
                 const int query_tiles = padded_m / 64;
                 const int key_tiles = padded_n / 32;
@@ -4335,10 +4381,6 @@ private:
                 std::uint64_t key_ns = 0;
                 std::int8_t *query_destination =
                     direct_query + local * query_stride;
-                std::int8_t *key_destination =
-                    direct_key + local * key_stride;
-                std::int32_t *sum_destination = direct_sums
-                    + local * static_cast<std::size_t>(padded_n);
 
                 if (query_tiles > 0) {
                     const std::uint64_t begin = profile_enabled
@@ -4361,10 +4403,7 @@ private:
                 if (ready_key_tiles < first_chunk_end) {
                     const std::uint64_t begin = profile_enabled
                         ? CPUAttentionProfiler::nowNs() : 0;
-                    cpuPackKeyTokenRange(
-                        request, matrix_indices[local],
-                        ready_key_tiles * 32, first_chunk_end * 32,
-                        k_scales[local], key_destination, sum_destination, k);
+                    write_key_range(ready_key_tiles * 32, first_chunk_end * 32);
                     if (profile_enabled) {
                         key_ns += CPUAttentionProfiler::nowNs() - begin;
                     }
@@ -4395,10 +4434,7 @@ private:
                         key_tiles, ready_key_tiles + 8);
                     const std::uint64_t begin = profile_enabled
                         ? CPUAttentionProfiler::nowNs() : 0;
-                    cpuPackKeyTokenRange(
-                        request, matrix_indices[local],
-                        ready_key_tiles * 32, chunk_end * 32,
-                        k_scales[local], key_destination, sum_destination, k);
+                    write_key_range(ready_key_tiles * 32, chunk_end * 32);
                     if (profile_enabled) {
                         key_ns += CPUAttentionProfiler::nowNs() - begin;
                     }
@@ -4417,10 +4453,7 @@ private:
             }
             const std::uint64_t key_start = profile_enabled
                 ? CPUAttentionProfiler::nowNs() : 0;
-            cpuPackKeyHead(
-                request, matrix_indices[local], key_begin, padded_n,
-                k_scales[local], direct_key + local * key_stride,
-                direct_sums + local * static_cast<std::size_t>(padded_n), k);
+            write_key_range(first_key_token, padded_n);
             if (profile_enabled) {
                 CPUAttentionProfiler::add(
                     AttentionProfileStage::HMX_K_LAYOUT,
@@ -4440,6 +4473,15 @@ private:
             std::atomic_thread_fence(std::memory_order_release);
             __atomic_store_n(
                 ready + local * ready_stride, 1, __ATOMIC_RELEASE);
+        }
+        if (trace_key_groups) {
+            std::fprintf(stderr,
+                         "[HMX_INT8_PACKED_K_GROUP] layer=%d key_len=%d heads=%zu "
+                         "distinct_sources=%zu distinct_packs=%zu copied_heads=%zu "
+                         "first_key_token=%d padded_n=%d head_dim=%d enabled=%d\n",
+                         request.layer_id, request.key_len, count, distinct_sources,
+                         distinct_packs, copied_heads, first_key_token, padded_n, k,
+                         static_cast<int>(share_packed_key));
         }
         return true;
     }
