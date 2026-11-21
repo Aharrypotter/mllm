@@ -44,6 +44,7 @@ hvx_lanes="${HMX_HVX_LANES:-4}"
 hvx_epilogue_lanes="${HMX_HVX_EPILOGUE_LANES:-1}"
 hvx_epilogue_batch_tiles="${HMX_HVX_EPILOGUE_BATCH_TILES:-8}"
 long_rpc_ready_group_heads="${HMX_LONG_RPC_READY_GROUP_HEADS:-12}"
+vtcm_shared_key="${HMX_I8_VTCM_SHARED_KEY:-OFF}"
 
 default_models="qwen2_1p5b"
 model_spec="${HMX_OPERATOR_MODELS:-${default_models}}"
@@ -428,6 +429,7 @@ build_shape_variants() {
                         HMX_HVX_EPILOGUE_LANES="${hvx_epilogue_lanes}" \
                         HMX_HVX_EPILOGUE_BATCH_TILES="${hvx_epilogue_batch_tiles}" \
                         HMX_LONG_RPC_READY_GROUP_HEADS="${long_rpc_ready_group_heads}" \
+                        HMX_I8_VTCM_SHARED_KEY="${vtcm_shared_key}" \
                         HMX_RPC_SKEL_OUTPUT_NAME="${skel_output_name}"
                     copy_artifact "${dsp_ship}/${skel_file}" "${output_dir}/${skel_file}"
                     built_dispatch_skels[${skel_output_name}]=1

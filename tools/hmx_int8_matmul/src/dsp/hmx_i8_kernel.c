@@ -3,6 +3,7 @@
 #include "dsp/hmx_raw.h"
 #include "dsp/dma_utils.h"
 #include "dsp/hvx_worker_pool.h"
+#include "hmx_i8_common.h"
 
 #include <float.h>
 #include <HAP_perf.h>
@@ -1382,6 +1383,158 @@ static int hmx_i8_kernel_qk_packed_impl(
     }
     return 0;
 }
+
+#if HMX_I8_VTCM_SHARED_KEY
+static void hmx_stage_packed_input(
+    hmx_dma_desc_1d *dma, const void *source, void *destination,
+    uint32_t bytes, int invalidate) {
+    if (invalidate) {
+        qurt_mem_cache_clean(
+            (qurt_addr_t)source, bytes,
+            QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+    }
+    hmx_dma_prepare_copy(dma, source, destination, bytes);
+    hmx_dma_start(dma);
+}
+
+int hmx_i8_kernel_qk_i8_packed_shared_key(
+    int8_t *output,
+    const uint8_t *packed_query,
+    const int8_t *packed_key,
+    const int32_t *key_sums,
+    const float *output_scales,
+    int m,
+    int k,
+    int n,
+    unsigned heads,
+    uint64_t key_sources,
+    volatile int32_t *producer_progress,
+    uint8_t *vtcm,
+    uint32_t vtcm_size) {
+    const uint32_t required = hmx_i8_qk_packed_vtcm_bytes(m, k, n);
+    if (required == 0 || required > vtcm_size) return -1;
+
+    const int m_tiles = m / HMX_I8_M_TILE;
+    const int k_tiles = k / HMX_I8_K_TILE;
+    const uint32_t query_tile_bytes = (uint32_t)HMX_I8_M_TILE * (uint32_t)k;
+    const size_t query_stride = (size_t)m * (size_t)k;
+    const size_t key_stride = (size_t)n * (size_t)k;
+    const size_t output_stride = (size_t)m * (size_t)n;
+    const int chunk_n = HMX_I8_DMA_N_TILES * HMX_I8_N_TILE;
+
+    uintptr_t cursor = align_up_uintptr((uintptr_t)vtcm, 2048u);
+    uint8_t *config = (uint8_t *)cursor;
+    cursor = align_up_uintptr(cursor + ACC_BIAS_CONFIG_BYTES, 2048u);
+    uint8_t *readout = (uint8_t *)cursor;
+    cursor = align_up_uintptr(cursor + 2 * ACC_READOUT_SLOT_BYTES, 2048u);
+    uint8_t *query_buffers[2];
+    for (int slot = 0; slot < 2; ++slot) {
+        query_buffers[slot] = (uint8_t *)cursor;
+        cursor = align_up_uintptr(cursor + query_tile_bytes, 2048u);
+    }
+    int8_t *key_buffer = (int8_t *)cursor;
+    const size_t maximum_key_bytes = (size_t)(n < chunk_n ? n : chunk_n) * k;
+    if (cursor + maximum_key_bytes > (uintptr_t)vtcm + vtcm_size) return -1;
+
+    hmx_dma_desc_1d dma __attribute__((aligned(64)));
+    if (!hmx_dma_wait_idle()) return -1;
+    setup_accumulator_read_config(config);
+    for (unsigned owner = 0; owner < heads; ++owner) {
+        if (hmx_packed_key_source(key_sources, owner) != owner) continue;
+        const int8_t *owner_key = packed_key + owner * key_stride;
+        const int32_t *owner_sums = key_sums + (size_t)owner * n;
+        volatile int32_t *owner_progress = producer_progress
+            + (size_t)owner * HMX_I8_CPU_PACK_READY_STRIDE;
+        for (int first_col = 0; first_col < n; first_col += chunk_n) {
+            const int remaining_cols = n - first_col;
+            const int cols = remaining_cols < chunk_n ? remaining_cols : chunk_n;
+            if (hmx_i8_cpu_pack_progress(
+                    owner_progress, 0, (first_col + cols) / HMX_I8_N_TILE,
+                    1) <= 0) {
+                return -1;
+            }
+            qurt_mem_cache_clean(
+                (qurt_addr_t)(owner_sums + first_col),
+                (size_t)cols * sizeof(*owner_sums),
+                QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+            hmx_stage_packed_input(
+                &dma, owner_key + (size_t)first_col * k, key_buffer,
+                (uint32_t)cols * (uint32_t)k, 1);
+            if (!hmx_dma_wait_idle()) return -1;
+
+            /* A packed K chunk stays resident while all associated query
+             * tiles run. Each Q tile is immutable after its first use. */
+            for (unsigned head = owner; head < heads; ++head) {
+                if (hmx_packed_key_source(key_sources, head) != owner) continue;
+                int8_t *head_output = output + head * output_stride;
+                const uint8_t *head_query = packed_query + head * query_stride;
+                const float scale = output_scales[head];
+                volatile int32_t *head_progress = producer_progress
+                    + (size_t)head * HMX_I8_CPU_PACK_READY_STRIDE;
+                int query_slot = 0;
+                int prefetched = 0;
+                for (int row = 0; row < m_tiles; ++row) {
+                    if (prefetched) {
+                        query_slot ^= 1;
+                    } else {
+                        if (first_col == 0 && hmx_i8_cpu_pack_progress(
+                                head_progress, row + 1, 0, 1) <= 0) {
+                            return -1;
+                        }
+                        hmx_stage_packed_input(
+                            &dma, head_query + (size_t)row * query_tile_bytes,
+                            query_buffers[query_slot], query_tile_bytes,
+                            first_col == 0);
+                    }
+                    if (!hmx_dma_wait_idle()) return -1;
+                    prefetched = 0;
+                    if (row + 1 < m_tiles) {
+                        const int next_ready = first_col != 0 ? 1
+                            : hmx_i8_cpu_pack_progress(
+                                head_progress, row + 2, 0, 0);
+                        if (next_ready < 0) return -1;
+                        if (next_ready > 0) {
+                            hmx_stage_packed_input(
+                                &dma, head_query
+                                    + (size_t)(row + 1) * query_tile_bytes,
+                                query_buffers[query_slot ^ 1], query_tile_bytes,
+                                first_col == 0);
+                            prefetched = 1;
+                        }
+                    }
+
+                    const int row_start = row * HMX_I8_M_TILE;
+                    int slot = 0;
+                    for (int col = 0; col < cols; col += HMX_I8_N_TILE) {
+                        hmx_raw_clear_i32();
+                        hmx_raw_mac_u8i8_deep(
+                            query_buffers[query_slot],
+                            key_buffer + (size_t)col * k, k_tiles);
+                        if (col > 0) {
+                            quantize_readout_slot_i8(
+                                head_output, n, row_start,
+                                first_col + col - HMX_I8_N_TILE,
+                                readout + (size_t)(slot ^ 1)
+                                    * ACC_READOUT_SLOT_BYTES,
+                                owner_sums, scale);
+                        }
+                        read_accumulator_planes(
+                            config, readout + (size_t)slot
+                                * ACC_READOUT_SLOT_BYTES);
+                        slot ^= 1;
+                    }
+                    quantize_readout_slot_i8(
+                        head_output, n, row_start,
+                        first_col + cols - HMX_I8_N_TILE,
+                        readout + (size_t)(slot ^ 1) * ACC_READOUT_SLOT_BYTES,
+                        owner_sums, scale);
+                }
+            }
+        }
+    }
+    return 0;
+}
+#endif
 
 int hmx_i8_kernel_qk_i8_packed(
     int8_t *output,

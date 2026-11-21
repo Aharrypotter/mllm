@@ -28,6 +28,11 @@ set(HMX_HVX_EPILOGUE_BATCH_TILES "8" CACHE STRING
     "Accumulator tiles in one coarse HVX epilogue dispatch")
 set(HMX_LONG_RPC_READY_GROUP_HEADS "1" CACHE STRING
     "Heads published by one long-RPC output flush/ready event")
+option(HMX_I8_VTCM_SHARED_KEY
+    "Keep one packed K chunk in VTCM across its query heads" OFF)
+if(HMX_I8_VTCM_SHARED_KEY AND NOT "${HMX_HVX_EPILOGUE_LANES}" STREQUAL "1")
+    message(FATAL_ERROR "HMX_I8_VTCM_SHARED_KEY requires one HVX epilogue lane")
+endif()
 foreach(fixed_dimension HMX_FIXED_M HMX_FIXED_K HMX_FIXED_N HMX_FIXED_HEADS)
     if(NOT "${${fixed_dimension}}" MATCHES "^[1-9][0-9]*$")
         message(FATAL_ERROR "${fixed_dimension} must be a positive integer")
@@ -237,6 +242,7 @@ else()
         HMX_HVX_EPILOGUE_LANES=${HMX_HVX_EPILOGUE_LANES}
         HMX_HVX_EPILOGUE_BATCH_TILES=${HMX_HVX_EPILOGUE_BATCH_TILES}
         HMX_LONG_RPC_READY_GROUP_HEADS=${HMX_LONG_RPC_READY_GROUP_HEADS}
+        HMX_I8_VTCM_SHARED_KEY=$<BOOL:${HMX_I8_VTCM_SHARED_KEY}>
     )
     set_target_properties(hmx_int8_rpc_skel PROPERTIES
         OUTPUT_NAME ${HMX_RPC_SKEL_OUTPUT_NAME})

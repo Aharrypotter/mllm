@@ -1322,6 +1322,48 @@ AEEResult hmx_int8_rpc_execute_qk_i8_packed(
     return kernel_status == 0 ? AEE_SUCCESS : AEE_EFAILED;
 }
 
+static void publish_cpu_packed_scores(
+    int8_t *output,
+    size_t output_stride,
+    volatile int32_t *ready,
+    int32 publish_begin,
+    int32 publish_end,
+    hmx_i8_dsp_timing *timing) {
+    /* RpcMem is uncached on ARM but cached on the DSP. Publish one
+     * contiguous macro-group only after every score block in it has
+     * reached DDR. Keeping the HMX loop H12-fused while reducing
+     * cache-maintenance and host notification frequency avoids the
+     * per-head long-RPC protocol overhead. */
+    const int32 publish_count = publish_end - publish_begin;
+    const uint64_t output_flush = HAP_perf_get_qtimer_count();
+    qurt_mem_cache_clean(
+        (qurt_addr_t)(output
+                      + (size_t)publish_begin * output_stride),
+        (size_t)publish_count * output_stride,
+        QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+    timing->output_flush_ticks +=
+        HAP_perf_get_qtimer_count() - output_flush;
+    __asm__ __volatile__("barrier" : : : "memory");
+    for (int32 published = publish_begin;
+         published < publish_end; ++published) {
+        volatile int32_t *published_ready = ready
+            + (size_t)published * HMX_I8_CPU_PACK_READY_STRIDE;
+        __atomic_store_n(
+            published_ready, HMX_I8_CPU_PACK_OUTPUT_READY,
+            __ATOMIC_RELEASE);
+    }
+    volatile int32_t *first_ready = ready
+        + (size_t)publish_begin * HMX_I8_CPU_PACK_READY_STRIDE;
+    const size_t ready_bytes =
+        ((size_t)(publish_count - 1)
+             * HMX_I8_CPU_PACK_READY_STRIDE
+         + 1U)
+        * sizeof(*first_ready);
+    qurt_mem_cache_clean(
+        (qurt_addr_t)first_ready, ready_bytes,
+        QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+}
+
 static AEEResult execute_qk_i8_cpu_packed(
     int32 buffer_fd,
     int32 query_offset,
@@ -1398,7 +1440,28 @@ static AEEResult execute_qk_i8_cpu_packed(
 
     const uint64_t pipeline_begin = HAP_perf_get_qtimer_count();
     int32 publish_begin = 0;
-    for (int32 head = 0; head < heads && status == 0; ++head) {
+#if HMX_I8_VTCM_SHARED_KEY
+    int has_key_aliases = 0;
+    if (status == 0 && shared_key && heads == HMX_LONG_RPC_READY_GROUP_HEADS) {
+        for (unsigned head = 1; head < (unsigned)heads; ++head) {
+            has_key_aliases |= hmx_packed_key_source(key_sources, head) != head;
+        }
+    }
+    if (has_key_aliases) {
+        const uint64_t hmx_begin = HAP_perf_get_qtimer_count();
+        status = hmx_i8_kernel_qk_i8_packed_shared_key(
+            output, query, key, key_sums, head_requant,
+            HMX_FIXED_M_PADDED, HMX_FIXED_K_PADDED, n, (unsigned)heads,
+            key_sources, ready, session->vtcm_base, session->vtcm_size);
+        timing.hmx_kernel_ticks += HAP_perf_get_qtimer_count() - hmx_begin;
+        if (status == 0) {
+            publish_cpu_packed_scores(
+                output, output_stride, ready, 0, heads, &timing);
+            publish_begin = heads;
+        }
+    }
+#endif
+    for (int32 head = publish_begin; head < heads && status == 0; ++head) {
         volatile int32_t *head_ready = ready
             + (size_t)head * HMX_I8_CPU_PACK_READY_STRIDE;
         const uint64_t wait_begin = HAP_perf_get_qtimer_count();
@@ -1467,39 +1530,8 @@ static AEEResult execute_qk_i8_cpu_packed(
             && (head + 1 == heads
                 || head + 1 - publish_begin
                     == HMX_LONG_RPC_READY_GROUP_HEADS)) {
-            /* RpcMem is uncached on ARM but cached on the DSP. Publish one
-             * contiguous macro-group only after every score block in it has
-             * reached DDR. Keeping the HMX loop H12-fused while reducing
-             * cache-maintenance and host notification frequency avoids the
-             * per-head long-RPC protocol overhead. */
-            const int32 publish_count = head + 1 - publish_begin;
-            const uint64_t output_flush = HAP_perf_get_qtimer_count();
-            qurt_mem_cache_clean(
-                (qurt_addr_t)(output
-                              + (size_t)publish_begin * output_stride),
-                (size_t)publish_count * output_stride,
-                QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
-            timing.output_flush_ticks +=
-                HAP_perf_get_qtimer_count() - output_flush;
-            __asm__ __volatile__("barrier" : : : "memory");
-            for (int32 published = publish_begin;
-                 published <= head; ++published) {
-                volatile int32_t *published_ready = ready
-                    + (size_t)published * HMX_I8_CPU_PACK_READY_STRIDE;
-                __atomic_store_n(
-                    published_ready, HMX_I8_CPU_PACK_OUTPUT_READY,
-                    __ATOMIC_RELEASE);
-            }
-            volatile int32_t *first_ready = ready
-                + (size_t)publish_begin * HMX_I8_CPU_PACK_READY_STRIDE;
-            const size_t ready_bytes =
-                ((size_t)(publish_count - 1)
-                     * HMX_I8_CPU_PACK_READY_STRIDE
-                 + 1U)
-                * sizeof(*first_ready);
-            qurt_mem_cache_clean(
-                (qurt_addr_t)first_ready, ready_bytes,
-                QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+            publish_cpu_packed_scores(
+                output, output_stride, ready, publish_begin, head + 1, &timing);
             publish_begin = head + 1;
         }
     }

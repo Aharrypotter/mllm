@@ -117,6 +117,26 @@ int hmx_i8_kernel_qk_i8_packed_streamed(
     uint8_t *vtcm,
     uint32_t vtcm_size);
 
+#if HMX_I8_VTCM_SHARED_KEY
+/* Each K chunk is staged once per source in the validated packed-head map.
+ * Callers publish the whole score group only after this function returns. */
+__attribute__((visibility("hidden")))
+int hmx_i8_kernel_qk_i8_packed_shared_key(
+    int8_t *output,
+    const uint8_t *packed_query,
+    const int8_t *packed_key,
+    const int32_t *key_sums,
+    const float *output_scales,
+    int m,
+    int k,
+    int n,
+    unsigned heads,
+    uint64_t key_sources,
+    volatile int32_t *producer_progress,
+    uint8_t *vtcm,
+    uint32_t vtcm_size);
+#endif
+
 /* Packed INT8 QK using an already-running external worker scheduler for the
  * accumulator epilogue. The scheduler must remain alive until this function
  * returns; every submitted task is joined before its VTCM slot is reused. */
