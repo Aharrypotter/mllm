@@ -33,6 +33,31 @@ inline auto makeRoPEInvFreq(int output_dim, float rope_theta) -> Tensor {
   return inv_freq;
 }
 
+inline Tensor qwenQnnProjectionCpuInput(Tensor projection, bool use_host_view, size_t& aliased_bytes) {
+  if (!use_host_view || projection.device() != kQNN || projection.dtype() != kFloat32 || !projection.isContiguous()
+      || projection.impl()->storageOffset() != 0) {
+    return projection.to(kCPU);
+  }
+  auto source = projection.impl()->storage();
+  const auto bytes = projection.bytes();
+  if (source->mem_type_ != kNormal || !source->ptr_ || source->size_ < bytes) { return projection.to(kCPU); }
+
+  // graphExecute has completed before the decoder receives these logical QKV outputs.
+  // Both storage objects must outlive any derived CPU views, which share this control block.
+  struct HostViewStorage {
+    TensorViewImpl::storage_t source;
+    TensorViewImpl::storage_t host;
+  };
+  const auto shape = projection.shape();
+  auto host = TensorStorage::create(shape, kFloat32, kCPU);
+  host->mem_type_ = kManual;
+  host->ptr_ = source->ptr_;
+  auto owners = std::make_shared<HostViewStorage>(HostViewStorage{std::move(source), host});
+  TensorViewImpl::storage_t retained(std::move(owners), host.get());
+  aliased_bytes += bytes;
+  return Tensor(TensorViewImpl::create(shape, retained));
+}
+
 #if defined(MLLM_HOST_ARCH_ARM64)
 inline bool hmxDirectKVCastEnabled() {
   static const bool enabled = [] {
@@ -728,9 +753,23 @@ class QwenDecoder final : public nn::Module {
 
   Tensor attentionFromProjection(std::vector<Tensor> states, const Tensor& sin, const Tensor& cos) {
     captured_debug_boundaries_.clear();
-    auto query_states = states[0].to(kCPU);
-    auto key_states = states[1].to(kCPU);
-    auto value_states = states[2].to(kCPU);
+    static const bool host_view_enabled = [] {
+      const auto* value = std::getenv("MLLM_QNN_QKV_HOST_ALIAS");
+      return value && value[0] == '1' && value[1] == '\0';
+    }();
+    static const bool trace_host_view = [] {
+      const auto* value = std::getenv("MLLM_QNN_QKV_HOST_ALIAS_TRACE");
+      return value && value[0] == '1' && value[1] == '\0';
+    }();
+    const bool use_host_view = host_view_enabled && !Context::instance().thisThread()->trace_mode;
+    size_t aliased_bytes = 0;
+    auto query_states = qwenQnnProjectionCpuInput(states[0], use_host_view, aliased_bytes);
+    auto key_states = qwenQnnProjectionCpuInput(states[1], use_host_view, aliased_bytes);
+    auto value_states = qwenQnnProjectionCpuInput(states[2], use_host_view, aliased_bytes);
+    if (trace_host_view && use_host_view) {
+      MLLM_INFO("QNN_QKV_HOST_ALIAS layer={} bytes={} expected_bytes={}", getModuleName(), aliased_bytes,
+                query_states.bytes() + key_states.bytes() + value_states.bytes());
+    }
 
     if (capture_debug_boundaries_) {
       captured_debug_boundaries_.push_back(query_states.transpose(1, 2).contiguous());
