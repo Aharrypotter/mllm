@@ -936,14 +936,10 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
         bool compatible = true;
         for (size_t i = 0; i < plans.size(); ++i) {
           const auto& plan = plans[i];
-          // Singleton dimensions ahead of the sequence axis do not create
-          // gaps between its two tiles when moved to the batch dimension.
-          const bool dense_tiling = plan.axis > 0 &&
-              std::all_of(plan.compiled_shape.begin(), plan.compiled_shape.begin() + plan.axis,
-                          [](int32_t dimension) { return dimension == 1; });
-          MLLM_INFO("QNN_SEQUENCE_BATCH2_LAYOUT graph={} direction={} index={} rank={} axis={} singleton_prefix={}",
-                    graphName, direction, i, plan.compiled_shape.size(), plan.axis, dense_tiling);
-          compatible &= plan.tile_count == 2 && dense_tiling;
+          const bool distinct_batch_axis = plan.axis > 0 && plan.compiled_shape[0] == 1;
+          MLLM_INFO("QNN_SEQUENCE_BATCH2_LAYOUT graph={} direction={} index={} rank={} axis={} distinct_batch_axis={}",
+                    graphName, direction, i, plan.compiled_shape.size(), plan.axis, distinct_batch_axis);
+          compatible &= plan.tile_count == 2 && distinct_batch_axis;
         }
         return compatible;
       };
@@ -962,6 +958,20 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
       std::vector<Tensor> storage;
       storage.reserve(inputs.size() + outputs.size());
       dimensions.reserve(inputs.size() + outputs.size());
+      const auto visit_batch_spans = [](const Tensor& logical, Tensor& scratch, const QNNSequenceTilePlan& plan,
+                                        const auto& visit) {
+        size_t groups = 1;
+        for (size_t axis = 1; axis < plan.axis; ++axis) { groups *= plan.compiled_shape[axis]; }
+        const size_t bytes = logical.bytes() / (2 * groups);
+        // Logical storage groups both tiles by head. Batched storage groups
+        // all heads by tile. Preserve each contiguous sequence span.
+        for (size_t tile = 0; tile < 2; ++tile) {
+          for (size_t group = 0; group < groups; ++group) {
+            visit(scratch.ptr<uint8_t>() + (tile * groups + group) * bytes,
+                  logical.ptr<uint8_t>() + (2 * group + tile) * bytes, bytes);
+          }
+        }
+      };
       const auto prepare_batch = [&](const std::vector<Tensor>& logical, const std::vector<QNNSequenceTilePlan>& plans,
                                      std::vector<Qnn_Tensor_t>& descriptors, bool copy_input) {
         for (size_t i = 0; i < logical.size(); ++i) {
@@ -976,7 +986,9 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
           QNN_TENSOR_SET_MEM_HANDLE(descriptors[i], nullptr);
           shared_allocator->registerQnnTensorToSharedBuffer(scratch.ptr<void>(), descriptors[i]);
           if (copy_input) {
-            std::memcpy(scratch.ptr<void>(), logical[i].ptr<void>(), scratch.bytes());
+            visit_batch_spans(logical[i], scratch, plans[i], [](auto* to, const auto* from, size_t bytes) {
+              std::memcpy(to, from, bytes);
+            });
           } else {
             std::memset(scratch.ptr<void>(), 0xA5, scratch.bytes());
           }
@@ -994,7 +1006,12 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
         for (size_t i = 0; i < outputs.size(); ++i) {
           const size_t bytes = outputs[i].bytes();
           checked_bytes += bytes;
-          mismatched_outputs += std::memcmp(outputs[i].ptr<void>(), storage[inputs.size() + i].ptr<void>(), bytes) != 0;
+          bool matches = true;
+          visit_batch_spans(outputs[i], storage[inputs.size() + i], state.output_plans[i],
+                            [&](const auto* actual, const auto* expected, size_t span_bytes) {
+            matches &= std::memcmp(actual, expected, span_bytes) == 0;
+          });
+          mismatched_outputs += !matches;
         }
       }
       MLLM_INFO("QNN_SEQUENCE_BATCH2_PROBE graph={} status={} outputs={} checked_bytes={} mismatched_outputs={} exec_us={}",
