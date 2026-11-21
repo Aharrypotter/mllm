@@ -71,6 +71,9 @@ volatile int32_t *hmx_i8_qk_cpu_pack_ready_data(hmx_i8_context *context);
 int hmx_i8_execute_qk_i8_cpu_packed_per_head(
     hmx_i8_context *context, int32_t heads, int32_t n,
     const float *requant_scales);
+int hmx_i8_execute_qk_i8_cpu_packed_shared_key(
+    hmx_i8_context *context, int32_t heads, int32_t n,
+    const float *requant_scales, uint64_t key_sources);
 int hmx_i8_begin_qk_i8_packed(hmx_i8_context *context, int32_t n);
 int hmx_i8_end_qk_i8_packed(hmx_i8_context *context);
 int hmx_i8_matmul_qk_i8_direct(
@@ -248,6 +251,13 @@ int hmx_qk_i8_operator_execute_cpu_packed_per_head_hn(
     const float *requant_scales) {
     return hmx_i8_execute_qk_i8_cpu_packed_per_head(
         context, heads, n, requant_scales);
+}
+
+int hmx_qk_i8_operator_execute_cpu_packed_shared_key_hn(
+    hmx_i8_context *context, int32_t heads, int32_t n,
+    const float *requant_scales, uint64_t key_sources) {
+    return hmx_i8_execute_qk_i8_cpu_packed_shared_key(
+        context, heads, n, requant_scales, key_sources);
 }
 
 int hmx_qk_i8_operator_begin(hmx_i8_context *context, int32_t n) {

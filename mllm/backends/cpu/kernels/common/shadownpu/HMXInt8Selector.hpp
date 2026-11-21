@@ -26,6 +26,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -546,6 +547,7 @@ private:
         int padded_n = 0;
         const float *q_scales = nullptr;
         const float *k_scales = nullptr;
+        std::optional<std::uint64_t> key_sources;
         std::int8_t *direct_query = nullptr;
         std::int8_t *direct_key = nullptr;
         std::int32_t *direct_sums = nullptr;
@@ -658,6 +660,8 @@ private:
     using CpuPackReadyDataFn = volatile std::int32_t *(*)(void *);
     using ExecuteCpuPackedPerHeadHnFn = int (*)(
         void *, std::int32_t, std::int32_t, const float *);
+    using ExecuteCpuPackedSharedKeyHnFn = int (*)(
+        void *, std::int32_t, std::int32_t, const float *, std::uint64_t);
     using PrepareRawKeyFn = int (*)(void *, std::int32_t, std::int32_t,
                                     std::int32_t);
     using PrepareRawKeyScaledFn = int (*)(void *, std::int32_t,
@@ -724,6 +728,7 @@ private:
         ExecuteHnFn execute_hn = nullptr;
         CpuPackReadyDataFn cpu_pack_ready_data = nullptr;
         ExecuteCpuPackedPerHeadHnFn execute_cpu_packed_per_head_hn = nullptr;
+        ExecuteCpuPackedSharedKeyHnFn execute_cpu_packed_shared_key_hn = nullptr;
         PrepareRawKeyFn prepare_raw_key = nullptr;
         PrepareRawKeyScaledFn prepare_raw_key_scaled = nullptr;
         ExecuteRawHnFn execute_raw_hn = nullptr;
@@ -1586,7 +1591,7 @@ private:
                             cpu_job->direct_key, cpu_job->direct_sums,
                             cpu_job->ready, cpu_job->ready_stride,
                             cpu_job->padded_m, cpu_job->k,
-                            cpu_job->profile_enabled);
+                            cpu_job->profile_enabled, cpu_job->key_sources);
                         cpu_job->phase.store(
                             CpuScalePackJob::DONE, std::memory_order_release);
                     } catch (...) {
@@ -3012,6 +3017,15 @@ private:
                             std::atomic<bool> pack_ok{false};
                             const int cpu_key_begin = query_begin == 0
                                 ? key_begin : actual_n;
+                            // Partial K and multi-slice Q can keep arena data
+                            // from a previous call with a different head map.
+                            const auto key_sources =
+                                bucket.execute_cpu_packed_shared_key_hn != nullptr
+                                && !use_layer_key_cache && cpu_key_begin == 0
+                                && request.query_len <= bucket.info.m
+                                ? packedKeySources(request, group, count,
+                                                   per_head_k_scales.data())
+                                : std::nullopt;
                             const bool combined_cpu_stage =
                                 scale_staging.cpu_job != nullptr;
                             std::future<void> pack_future;
@@ -3036,6 +3050,7 @@ private:
                                 job->padded_n = actual_n;
                                 job->q_scales = per_head_q_scales.data();
                                 job->k_scales = per_head_k_scales.data();
+                                job->key_sources = key_sources;
                                 job->direct_query = direct_query;
                                 job->direct_key = direct_key;
                                 job->direct_sums = direct_key_sums;
@@ -3049,7 +3064,7 @@ private:
                                     std::memory_order_release);
                             } else {
                                 pack_future = cpuPackTaskExecutor().submit(
-                                    [&, cpu_key_begin]() noexcept {
+                                    [&, cpu_key_begin, key_sources]() noexcept {
                                         pack_ok.store(
                                             cpuPackPerHeadGroup(
                                                 request, count, group,
@@ -3061,7 +3076,7 @@ private:
                                                 direct_key_sums, ready,
                                                 ready_stride,
                                                 bucket.info.m, bucket.info.k,
-                                                profile_enabled),
+                                                profile_enabled, key_sources),
                                             std::memory_order_release);
                                     });
                             }
@@ -3096,18 +3111,24 @@ private:
                             }
                             int cpu_status = 0;
                             std::string long_rpc_error;
+                            const auto execute_cpu_packed = [&]() {
+                                const auto heads = static_cast<std::int32_t>(count);
+                                if (key_sources) {
+                                    return bucket.execute_cpu_packed_shared_key_hn(
+                                        context, heads, actual_n,
+                                        per_head_requant_scales.data(), *key_sources);
+                                }
+                                return bucket.execute_cpu_packed_per_head_hn(
+                                    context, heads, actual_n,
+                                    per_head_requant_scales.data());
+                            };
                             {
                                 ScopedAttentionProfile fused_profile(
                                     AttentionProfileStage::
                                         HMX_FUSED_PREPARE_EXECUTE,
                                     profile_enabled && !on_direct_stream);
                                 if (!long_rpc_pipeline) {
-                                    cpu_status =
-                                        bucket.execute_cpu_packed_per_head_hn(
-                                            context,
-                                            static_cast<std::int32_t>(count),
-                                            actual_n,
-                                            per_head_requant_scales.data());
+                                    cpu_status = execute_cpu_packed();
                                 } else {
                                     std::atomic<std::uint64_t>
                                         direct_rpc_elapsed_ns{0};
@@ -3120,14 +3141,7 @@ private:
                                                 && on_direct_stream
                                                 ? CPUAttentionProfiler::nowNs()
                                                 : 0;
-                                            cpu_status = bucket
-                                                .execute_cpu_packed_per_head_hn(
-                                                    context,
-                                                    static_cast<std::int32_t>(
-                                                    count),
-                                                    actual_n,
-                                                    per_head_requant_scales
-                                                        .data());
+                                            cpu_status = execute_cpu_packed();
                                             if (rpc_begin_ns != 0) {
                                                 direct_rpc_elapsed_ns.store(
                                                     CPUAttentionProfiler::
@@ -4297,6 +4311,45 @@ private:
         __atomic_store_n(ready, value, __ATOMIC_RELEASE);
     }
 
+    static std::size_t packedKeyRepresentative(
+        const Request &request, const std::size_t *indices,
+        const float *scales, std::size_t local, bool &seen_source) noexcept {
+        for (std::size_t peer = 0; peer < local; ++peer) {
+            if (request.key_heads[indices[local]]
+                != request.key_heads[indices[peer]]) {
+                continue;
+            }
+            seen_source = true;
+            if (std::memcmp(&scales[local], &scales[peer], sizeof(float)) == 0) {
+                return peer;
+            }
+        }
+        return local;
+    }
+
+    static std::optional<std::uint64_t> packedKeySources(
+        const Request &request, const std::size_t *indices,
+        std::size_t count, const float *scales) noexcept {
+        static const bool enabled = [] {
+            const char *value = std::getenv("MLLM_HMX_INT8_ALIAS_PACKED_K");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        if (!enabled || count > 16 || indices == nullptr || scales == nullptr) {
+            return std::nullopt;
+        }
+        std::uint64_t sources = 0;
+        bool aliases = false;
+        for (std::size_t local = 0; local < count; ++local) {
+            bool seen_source = false;
+            const auto source = packedKeyRepresentative(
+                request, indices, scales, local, seen_source);
+            sources |= static_cast<std::uint64_t>(source) << (local * 4);
+            aliases |= source != local;
+        }
+        if (aliases) return sources;
+        return std::nullopt;
+    }
+
     static bool cpuPackPerHeadGroup(
         const Request &request, std::size_t count,
         const std::size_t *matrix_indices, int query_begin, int query_count,
@@ -4305,11 +4358,13 @@ private:
         std::int8_t *direct_key, std::int32_t *direct_sums,
         volatile std::int32_t *ready, std::size_t ready_stride,
         int padded_m, int k,
-        bool profile_enabled) noexcept {
+        bool profile_enabled,
+        std::optional<std::uint64_t> key_sources = std::nullopt) noexcept {
         if (matrix_indices == nullptr || q_scales == nullptr
             || k_scales == nullptr || direct_query == nullptr
             || direct_key == nullptr || direct_sums == nullptr
-            || ready == nullptr || ready_stride == 0) {
+            || ready == nullptr || ready_stride == 0
+            || (key_sources && count > 16)) {
             return false;
         }
         const std::size_t query_stride =
@@ -4329,23 +4384,14 @@ private:
         std::size_t distinct_sources = 0;
         std::size_t distinct_packs = 0;
         std::size_t copied_heads = 0;
+        std::size_t aliased_heads = 0;
         for (std::size_t local = 0; local < count; ++local) {
             const std::size_t matrix = matrix_indices[local];
             std::size_t representative = local;
             if (share_packed_key || trace_key_groups) {
                 bool seen_source = false;
-                for (std::size_t peer = 0; peer < local; ++peer) {
-                    if (request.key_heads[matrix]
-                        != request.key_heads[matrix_indices[peer]]) {
-                        continue;
-                    }
-                    seen_source = true;
-                    if (std::memcmp(&k_scales[local], &k_scales[peer],
-                                    sizeof(float)) == 0) {
-                        representative = peer;
-                        break;
-                    }
-                }
+                representative = packedKeyRepresentative(
+                    request, matrix_indices, k_scales, local, seen_source);
                 distinct_sources += !seen_source;
                 distinct_packs += representative == local;
             }
@@ -4353,9 +4399,14 @@ private:
             auto *key_destination = direct_key + local * key_stride;
             const std::size_t sum_stride = static_cast<std::size_t>(padded_n);
             auto *sum_destination = direct_sums + local * sum_stride;
-            const bool copy_key = share_packed_key && representative != local;
+            const bool alias_key = key_sources
+                && ((*key_sources >> (local * 4)) & 15u) != local;
+            const bool copy_key = !key_sources && share_packed_key
+                && representative != local;
+            aliased_heads += alias_key;
             if (copy_key && first_key_token < padded_n) ++copied_heads;
             const auto write_key_range = [&](int begin, int end) noexcept {
+                if (alias_key) return;
                 if (!copy_key) {
                     cpuPackKeyTokenRange(
                         request, matrix, begin, end, k_scales[local],
@@ -4376,7 +4427,9 @@ private:
                 const int query_tiles = padded_m / 64;
                 const int key_tiles = padded_n / 32;
                 int ready_query_tiles = 0;
-                int ready_key_tiles = (key_begin / 32);
+                // The ARM producer completed the earlier slot before
+                // starting this head. Publish K readiness with the first Q tile.
+                int ready_key_tiles = alias_key ? key_tiles : key_begin / 32;
                 std::uint64_t query_ns = 0;
                 std::uint64_t key_ns = 0;
                 std::int8_t *query_destination =
@@ -4478,10 +4531,11 @@ private:
             std::fprintf(stderr,
                          "[HMX_INT8_PACKED_K_GROUP] layer=%d key_len=%d heads=%zu "
                          "distinct_sources=%zu distinct_packs=%zu copied_heads=%zu "
-                         "first_key_token=%d padded_n=%d head_dim=%d enabled=%d\n",
+                         "first_key_token=%d padded_n=%d head_dim=%d enabled=%d "
+                         "aliased_heads=%zu\n",
                          request.layer_id, request.key_len, count, distinct_sources,
                          distinct_packs, copied_heads, first_key_token, padded_n, k,
-                         static_cast<int>(share_packed_key));
+                         static_cast<int>(share_packed_key), aliased_heads);
         }
         return true;
     }
@@ -6230,6 +6284,10 @@ private:
                     bucket.library,
                     "hmx_qk_i8_operator_execute_cpu_packed_per_head_hn",
                     bucket.execute_cpu_packed_per_head_hn);
+                (void)loadOptionalSymbolFrom(
+                    bucket.library,
+                    "hmx_qk_i8_operator_execute_cpu_packed_shared_key_hn",
+                    bucket.execute_cpu_packed_shared_key_hn);
                 (void)loadOptionalSymbolFrom(
                     bucket.library,
                     "hmx_qk_i8_operator_prepare_raw_key_scaled_hn",

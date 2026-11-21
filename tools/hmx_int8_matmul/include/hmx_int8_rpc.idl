@@ -202,6 +202,21 @@ interface hmx_int8_rpc : remote_handle64 {
         in int32 n,
         in int32 profile_query,
         in int32 profile_key);
+
+    /* Four bits per local query head select an earlier packed K/sums slot
+     * or the head's own slot. Q, scores and ready words stay per query head. */
+    AEEResult execute_qk_i8_cpu_packed_shared_key(
+        in int32 buffer_fd,
+        in int32 query_offset,
+        in int32 key_offset,
+        in int32 key_sums_offset,
+        in int32 output_offset,
+        in int32 scales_offset,
+        in int32 ready_offset,
+        in int32 heads,
+        in int32 n,
+        in uint32 key_sources_low,
+        in uint32 key_sources_high);
 };
 
 #endif /* HMX_INT8_RPC_IDL */

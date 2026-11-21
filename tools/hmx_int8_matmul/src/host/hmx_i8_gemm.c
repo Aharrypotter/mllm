@@ -1046,13 +1046,14 @@ volatile int32_t *hmx_i8_qk_cpu_pack_ready_data(hmx_i8_context *context) {
         : NULL;
 }
 
-int hmx_i8_execute_qk_i8_cpu_packed_per_head(
+static int execute_qk_i8_cpu_packed(
     hmx_i8_context *context, int32_t heads, int32_t n,
-    const float *requant_scales) {
+    const float *requant_scales, int shared_key, uint64_t key_sources) {
     if (!context || !context->is_open || !context->shared ||
         !context->is_mapped || !context->arena_registered ||
         !requant_scales || heads <= 0 || heads > HMX_FIXED_HEADS ||
-        n <= 0 || n > HMX_FIXED_N_PADDED || (n % HMX_N_TILE) != 0) {
+        n <= 0 || n > HMX_FIXED_N_PADDED || (n % HMX_N_TILE) != 0 ||
+        (shared_key && !hmx_packed_key_map_valid(key_sources, heads))) {
         return HMX_I8_INVALID_ARGUMENT;
     }
     float *scales = (float *)(context->shared + context->layout.scales_offset);
@@ -1063,13 +1064,32 @@ int hmx_i8_execute_qk_i8_cpu_packed_per_head(
         }
         requant[head] = requant_scales[head];
     }
-    const int rpc_status = hmx_int8_rpc_execute_qk_i8_cpu_packed_per_head(
-        context->handle, context->buffer_fd,
-        context->layout.lhs_offset, context->layout.rhs_offset,
-        context->layout.rhs_sums_offset, context->layout.output_offset,
-        context->layout.scales_offset, context->layout.raw_query_offset,
-        heads, n);
+    const int rpc_status = shared_key
+        ? hmx_int8_rpc_execute_qk_i8_cpu_packed_shared_key(
+            context->handle, context->buffer_fd,
+            context->layout.lhs_offset, context->layout.rhs_offset,
+            context->layout.rhs_sums_offset, context->layout.output_offset,
+            context->layout.scales_offset, context->layout.raw_query_offset,
+            heads, n, (uint32_t)key_sources, (uint32_t)(key_sources >> 32))
+        : hmx_int8_rpc_execute_qk_i8_cpu_packed_per_head(
+            context->handle, context->buffer_fd,
+            context->layout.lhs_offset, context->layout.rhs_offset,
+            context->layout.rhs_sums_offset, context->layout.output_offset,
+            context->layout.scales_offset, context->layout.raw_query_offset,
+            heads, n);
     return rpc_status == 0 ? HMX_I8_OK : HMX_I8_DSP_ERROR;
+}
+
+int hmx_i8_execute_qk_i8_cpu_packed_per_head(
+    hmx_i8_context *context, int32_t heads, int32_t n,
+    const float *requant_scales) {
+    return execute_qk_i8_cpu_packed(context, heads, n, requant_scales, 0, 0);
+}
+
+int hmx_i8_execute_qk_i8_cpu_packed_shared_key(
+    hmx_i8_context *context, int32_t heads, int32_t n,
+    const float *requant_scales, uint64_t key_sources) {
+    return execute_qk_i8_cpu_packed(context, heads, n, requant_scales, 1, key_sources);
 }
 
 int hmx_i8_begin_qk_i8_packed(hmx_i8_context *context, int32_t n) {

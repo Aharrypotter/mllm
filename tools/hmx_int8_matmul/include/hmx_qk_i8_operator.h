@@ -197,6 +197,12 @@ HMX_I8_API int hmx_qk_i8_operator_execute_cpu_packed_per_head_hn(
     int32_t heads,
     int32_t n,
     const float *requant_scales);
+
+/* Optional ABI. Each four-bit entry selects the local head whose WH K tiles
+ * and K sums are used. Aliases must point to an earlier, self-mapped head. */
+HMX_I8_API int hmx_qk_i8_operator_execute_cpu_packed_shared_key_hn(
+    hmx_i8_context *context, int32_t heads, int32_t padded_n,
+    const float *requant_scales, uint64_t key_sources);
 HMX_I8_API int hmx_qk_i8_operator_begin(
     hmx_i8_context *context,
     int32_t n);

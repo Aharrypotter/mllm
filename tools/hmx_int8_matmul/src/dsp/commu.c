@@ -11,6 +11,7 @@
 #include "dsp/hmx_i8_kernel.h"
 #include "dsp/hvx_worker_pool.h"
 #include "dsp/runtime.h"
+#include "hmx_i8_common.h"
 #include "hmx_i8_dsp_timing.h"
 #include "hmx_int8_rpc.h"
 
@@ -1321,8 +1322,7 @@ AEEResult hmx_int8_rpc_execute_qk_i8_packed(
     return kernel_status == 0 ? AEE_SUCCESS : AEE_EFAILED;
 }
 
-AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_per_head(
-    remote_handle64 handle,
+static AEEResult execute_qk_i8_cpu_packed(
     int32 buffer_fd,
     int32 query_offset,
     int32 key_offset,
@@ -1331,12 +1331,14 @@ AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_per_head(
     int32 scales_offset,
     int32 ready_offset,
     int32 heads,
-    int32 n) {
-    (void)handle;
+    int32 n,
+    int shared_key,
+    uint64_t key_sources) {
     if (buffer_fd < 0 || query_offset < 0 || key_offset < 0 ||
         key_sums_offset < 0 || output_offset < 0 || scales_offset < 0 ||
         ready_offset < 0 || heads <= 0 || heads > HMX_FIXED_HEADS ||
-        n <= 0 || n > HMX_FIXED_N_PADDED || (n % 32) != 0) {
+        n <= 0 || n > HMX_FIXED_N_PADDED || (n % 32) != 0 ||
+        (shared_key && !hmx_packed_key_map_valid(key_sources, heads))) {
         return AEE_EBADPARM;
     }
 
@@ -1423,6 +1425,12 @@ AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_per_head(
             break;
         }
 
+        const size_t key_head = shared_key
+            ? hmx_packed_key_source(key_sources, (unsigned)head)
+            : (size_t)head;
+        const int8_t *head_key = key + key_head * key_stride;
+        const int32_t *head_key_sums = (const int32_t *)(
+            (const uint8_t *)key_sums + key_head * sums_stride);
         const int streamed =
             (producer_state & HMX_I8_CPU_PACK_STREAM_FLAG) != 0;
         if (!streamed) {
@@ -1430,11 +1438,10 @@ AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_per_head(
                 (qurt_addr_t)(query + (size_t)head * query_stride),
                 query_stride, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
             qurt_mem_cache_clean(
-                (qurt_addr_t)(key + (size_t)head * key_stride),
+                (qurt_addr_t)head_key,
                 key_stride, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
             qurt_mem_cache_clean(
-                (qurt_addr_t)((uint8_t *)key_sums
-                              + (size_t)head * sums_stride),
+                (qurt_addr_t)head_key_sums,
                 sums_stride, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
         }
         const uint64_t hmx_begin = HAP_perf_get_qtimer_count();
@@ -1442,9 +1449,7 @@ AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_per_head(
             status = hmx_i8_kernel_qk_i8_packed_streamed(
                 output + (size_t)head * output_stride,
                 query + (size_t)head * query_stride,
-                key + (size_t)head * key_stride,
-                (const int32_t *)((const uint8_t *)key_sums
-                                  + (size_t)head * sums_stride),
+                head_key, head_key_sums,
                 HMX_FIXED_M_PADDED, HMX_FIXED_K_PADDED, n,
                 head_requant[head], head_ready,
                 session->vtcm_base, session->vtcm_size);
@@ -1452,9 +1457,7 @@ AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_per_head(
             status = hmx_i8_kernel_qk_i8_packed(
                 output + (size_t)head * output_stride,
                 query + (size_t)head * query_stride,
-                key + (size_t)head * key_stride,
-                (const int32_t *)((const uint8_t *)key_sums
-                                  + (size_t)head * sums_stride),
+                head_key, head_key_sums,
                 HMX_FIXED_M_PADDED, HMX_FIXED_K_PADDED, n,
                 head_requant[head], session->vtcm_base, session->vtcm_size);
         }
@@ -1541,6 +1544,29 @@ AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_per_head(
         QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
     release_arena(buffer_fd, temporary_mapping);
     return status == 0 ? AEE_SUCCESS : AEE_EFAILED;
+}
+
+AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_per_head(
+    remote_handle64 handle, int32 buffer_fd, int32 query_offset,
+    int32 key_offset, int32 key_sums_offset, int32 output_offset,
+    int32 scales_offset, int32 ready_offset, int32 heads, int32 n) {
+    (void)handle;
+    return execute_qk_i8_cpu_packed(
+        buffer_fd, query_offset, key_offset, key_sums_offset, output_offset,
+        scales_offset, ready_offset, heads, n, 0, 0);
+}
+
+AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_shared_key(
+    remote_handle64 handle, int32 buffer_fd, int32 query_offset,
+    int32 key_offset, int32 key_sums_offset, int32 output_offset,
+    int32 scales_offset, int32 ready_offset, int32 heads, int32 n,
+    uint32 key_sources_low, uint32 key_sources_high) {
+    (void)handle;
+    const uint64_t key_sources = (uint64_t)key_sources_low
+        | ((uint64_t)key_sources_high << 32);
+    return execute_qk_i8_cpu_packed(
+        buffer_fd, query_offset, key_offset, key_sums_offset, output_offset,
+        scales_offset, ready_offset, heads, n, 1, key_sources);
 }
 
 AEEResult hmx_int8_rpc_prepare_qk_i8_raw_key(

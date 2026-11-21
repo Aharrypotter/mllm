@@ -13,6 +13,23 @@
 
 typedef struct hmx_i8_context hmx_i8_context;
 
+enum { HMX_PACKED_KEY_MAP_HEADS = 16 };
+
+static inline unsigned hmx_packed_key_source(uint64_t sources, unsigned head) {
+    return (unsigned)((sources >> (head * 4u)) & 15u);
+}
+
+static inline int hmx_packed_key_map_valid(uint64_t sources, int heads) {
+    if (heads <= 0 || heads > HMX_PACKED_KEY_MAP_HEADS) return 0;
+    for (unsigned head = 0; head < (unsigned)heads; ++head) {
+        const unsigned source = hmx_packed_key_source(sources, head);
+        if (source > head || hmx_packed_key_source(sources, source) != source) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 enum hmx_i8_status {
     HMX_I8_OK = 0,
     HMX_I8_INVALID_ARGUMENT = -1,
