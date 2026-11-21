@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -51,6 +52,60 @@ inline bool supportsDirectHmxKVStage(const Tensor& states) {
   return stride[3] == 1 && stride[2] == shape[3] && stride[1] >= head_elements
          && head_elements <= std::numeric_limits<int>::max();
 }
+
+// The shared CPU-decode cache remains Float32. This staging buffer keeps only
+// the native KV heads in Float16, with a stable head stride across prefill chunks.
+class IncrementalHmxKVStage {
+ public:
+  Tensor stage(const Tensor& states, int head_group_size, int new_tokens) {
+    auto shape = states.shape();
+    const auto stride = states.stride();
+    const int32_t live_tokens = shape[2];
+    const int32_t head_dim = shape[3];
+    const int32_t head_capacity = stride[1] / head_dim;
+    shape[1] /= head_group_size;
+    shape[2] = head_capacity;
+
+    if (staged_.isNil() || staged_.shape() != shape) {
+      staged_ = Tensor::empty(shape, kFloat16, kCPU).alloc();
+      staged_tokens_ = 0;
+    }
+    const auto source = states.impl()->storage();
+    const auto* input = states.ptr<mllm_fp32_t>();
+    const int32_t append_at = live_tokens - new_tokens;
+    const bool append = append_at > 0 && staged_tokens_ == append_at && source_.lock() == source
+                        && source_data_ == input && source_head_stride_ == stride[1];
+    const int32_t begin = append ? append_at : 0;
+    const int64_t element_offset = static_cast<int64_t>(begin) * head_dim;
+    const int elements = (live_tokens - begin) * head_dim;
+    auto* output = staged_.ptr<mllm_fp16_t>();
+    for (int64_t head = 0; head < shape[1]; ++head) {
+      cpu::arm::fp32_2_fp16(input + head * head_group_size * stride[1] + element_offset,
+                           output + head * head_capacity * head_dim + element_offset, elements, 1);
+    }
+    if (append) {
+      static std::once_flag log_first_append;
+      std::call_once(log_first_append, [&] {
+        MLLM_INFO("SHADOWNPU_HMX_INCREMENTAL_KV_STAGE kv_heads={} capacity={} prefix={} appended={}", shape[1],
+                  head_capacity, append_at, new_tokens);
+      });
+    }
+    staged_tokens_ = live_tokens;
+    source_ = source;
+    source_data_ = input;
+    source_head_stride_ = stride[1];
+    return staged_[{kAll, kAll, {kAll, live_tokens}, kAll}];
+  }
+
+  void invalidate() { staged_tokens_ = 0; }
+
+ private:
+  Tensor staged_;
+  std::weak_ptr<TensorStorage> source_;
+  const mllm_fp32_t* source_data_ = nullptr;
+  int32_t source_head_stride_ = 0;
+  int32_t staged_tokens_ = 0;
+};
 #endif
 
 inline auto stageHmxPrefillKV(Tensor states, int head_group_size = 1) -> Tensor {
@@ -299,6 +354,10 @@ class QwenAttentionMatmul final : public nn::Module {
   bool use_sparse_prefill_attention_ = false;
   bool use_pattern_sparse_prefill_attention_ = false;
   bool use_hmx_key_staging_ = false;
+#if defined(MLLM_HOST_ARCH_ARM64)
+  IncrementalHmxKVStage hmx_prefill_keys_;
+  IncrementalHmxKVStage hmx_prefill_values_;
+#endif
 
  public:
   QwenAttentionMatmul() = default;
@@ -359,6 +418,12 @@ class QwenAttentionMatmul final : public nn::Module {
 
     int B = inputs[0].shape()[0];
     int S = inputs[0].shape()[2];
+#if defined(MLLM_HOST_ARCH_ARM64)
+    if (S <= 1) {
+      hmx_prefill_keys_.invalidate();
+      hmx_prefill_values_.invalidate();
+    }
+#endif
 
     query_states = q_rope_(query_states, llm_embedding_sin, llm_embedding_cos);
     key_states = k_rope_(key_states, llm_embedding_sin, llm_embedding_cos);
@@ -373,6 +438,7 @@ class QwenAttentionMatmul final : public nn::Module {
       if (use_pattern_sparse_prefill_attention_) {
         if (use_hmx_key_staging_) {
           int kv_head_group_size = 1;
+          Tensor sparse_key_states, sparse_value_states;
 #if defined(MLLM_HOST_ARCH_ARM64)
           static const bool compact_kv_stage = [] {
             const char* value = std::getenv("MLLM_HMX_COMPACT_KV_STAGE");
@@ -386,9 +452,23 @@ class QwenAttentionMatmul final : public nn::Module {
               && value_states.shape()[1] == num_attention_heads_) {
             kv_head_group_size = num_key_value_groups_;
           }
+          static const bool incremental_kv_stage = [] {
+            const char* value = std::getenv("MLLM_HMX_INCREMENTAL_KV_STAGE");
+            return value && value[0] == '1' && value[1] == '\0';
+          }();
+          if (incremental_kv_stage && kv_head_group_size > 1 && kv_cache_.getStaticCache() != nullptr) {
+            sparse_key_states = hmx_prefill_keys_.stage(key_states, kv_head_group_size, S);
+            sparse_value_states = hmx_prefill_values_.stage(value_states, kv_head_group_size, S);
+          } else
 #endif
-          const auto sparse_key_states = stageHmxPrefillKV(key_states, kv_head_group_size);
-          const auto sparse_value_states = stageHmxPrefillKV(value_states, kv_head_group_size);
+          {
+#if defined(MLLM_HOST_ARCH_ARM64)
+            hmx_prefill_keys_.invalidate();
+            hmx_prefill_values_.invalidate();
+#endif
+            sparse_key_states = stageHmxPrefillKV(key_states, kv_head_group_size);
+            sparse_value_states = stageHmxPrefillKV(value_states, kv_head_group_size);
+          }
           output =
               pattern_sparse_attention_(query_states.to(kFloat32), sparse_key_states, sparse_value_states, sparse_key_states);
         } else {
