@@ -1,6 +1,7 @@
 // Copyright (c) MLLM Team.
 // Licensed under the MIT License.
 
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -679,10 +680,34 @@ class QwenDecoder final : public nn::Module {
     auto out_mlp_states = self_attn_out_mlp_(attention, residual);
     if (shadow_down_proj_) {
       MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 3);
+      static const bool profile_cpu = [] {
+        const auto* value = std::getenv("MLLM_QNN_SHADOW_CPU_PROFILE");
+        return value && value[0] == '1' && value[1] == '\0';
+      }();
+      using Clock = std::chrono::steady_clock;
+      const auto timestamp = [] { return profile_cpu ? Clock::now() : Clock::time_point{}; };
+      const auto transfer_start = timestamp();
       auto activation = out_mlp_states[0].to(kCPU).contiguous();
-      if (activation.dtype() == kFloat16) { activation = activation.to(kFloat32); }
-      return down_proj_shadow_correction_(activation, out_mlp_states[1].to(kCPU).contiguous(),
-                                          out_mlp_states[2].to(kCPU).contiguous());
+      const auto activation_ready = timestamp();
+      const bool widen_activation = activation.dtype() == kFloat16;
+      if (widen_activation) { activation = activation.to(kFloat32); }
+      const auto activation_widened = timestamp();
+      auto quantized_output = out_mlp_states[1].to(kCPU).contiguous();
+      auto residual_output = out_mlp_states[2].to(kCPU).contiguous();
+      const auto inputs_ready = timestamp();
+      auto corrected = down_proj_shadow_correction_(activation, quantized_output, residual_output);
+      if (profile_cpu) {
+        const auto correction_done = Clock::now();
+        const auto elapsed_us = [](Clock::time_point from, Clock::time_point to) {
+          return std::chrono::duration_cast<std::chrono::microseconds>(to - from).count();
+        };
+        MLLM_INFO("SHADOWNPU_SHADOW_CPU_PHASES layer={} activation_dtype={} activation_bytes={} transfer_us={} "
+                  "widen_us={} aux_transfer_us={} correction_us={}",
+                  getModuleName(), widen_activation ? "fp16" : "fp32", out_mlp_states[0].bytes(),
+                  elapsed_us(transfer_start, activation_ready), elapsed_us(activation_ready, activation_widened),
+                  elapsed_us(activation_widened, inputs_ready), elapsed_us(inputs_ready, correction_done));
+      }
+      return corrected;
     }
     MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 1);
     return out_mlp_states[0];
