@@ -118,8 +118,11 @@ int hmx_i8_kernel_qk_i8_packed_streamed(
     uint32_t vtcm_size);
 
 #if HMX_I8_VTCM_SHARED_KEY
+typedef void (*hmx_i8_score_prefix_ready_fn)(void *context, unsigned end);
+
 /* Each K chunk is staged once per source in the validated packed-head map.
- * Callers publish the whole score group only after this function returns. */
+ * An optional callback receives completed prefixes of query heads. The caller
+ * publishes the remainder after successful return. */
 __attribute__((visibility("hidden")))
 int hmx_i8_kernel_qk_i8_packed_shared_key(
     int8_t *output,
@@ -134,7 +137,9 @@ int hmx_i8_kernel_qk_i8_packed_shared_key(
     uint64_t key_sources,
     volatile int32_t *producer_progress,
     uint8_t *vtcm,
-    uint32_t vtcm_size);
+    uint32_t vtcm_size,
+    hmx_i8_score_prefix_ready_fn prefix_ready,
+    void *ready_context);
 #endif
 
 /* Packed INT8 QK using an already-running external worker scheduler for the

@@ -32,6 +32,8 @@ option(HMX_I8_VTCM_SHARED_KEY
     "Keep one packed K chunk in VTCM across its query heads" OFF)
 option(HMX_I8_SHARED_KEY_WIDE_TAIL
     "Use the reserved second K buffer to widen later shared K chunks" OFF)
+option(HMX_I8_VTCM_EARLY_SCORE_PUBLISH
+    "Publish completed shared-K query heads while the next K source runs" OFF)
 if(HMX_I8_VTCM_SHARED_KEY AND NOT "${HMX_HVX_EPILOGUE_LANES}" STREQUAL "1")
     message(FATAL_ERROR "HMX_I8_VTCM_SHARED_KEY requires one HVX epilogue lane")
 endif()
@@ -252,6 +254,7 @@ else()
         HMX_I8_SHARED_KEY_WIDE_TAIL=$<BOOL:${HMX_I8_SHARED_KEY_WIDE_TAIL}>
         HMX_I8_HVX_ALIGNED_SCORE_STORES=$<BOOL:${HMX_I8_HVX_ALIGNED_SCORE_STORES}>
         HMX_I8_HVX_Q15_SCORE_REQUANT=$<BOOL:${HMX_I8_HVX_Q15_SCORE_REQUANT}>
+        HMX_I8_VTCM_EARLY_SCORE_PUBLISH=$<BOOL:${HMX_I8_VTCM_EARLY_SCORE_PUBLISH}>
     )
     set_target_properties(hmx_int8_rpc_skel PROPERTIES
         OUTPUT_NAME ${HMX_RPC_SKEL_OUTPUT_NAME})

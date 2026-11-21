@@ -48,6 +48,7 @@ vtcm_shared_key="${HMX_I8_VTCM_SHARED_KEY:-OFF}"
 vtcm_shared_key_wide_tail="${HMX_I8_SHARED_KEY_WIDE_TAIL:-OFF}"
 hvx_aligned_score_stores="${HMX_I8_HVX_ALIGNED_SCORE_STORES:-OFF}"
 hvx_q15_score_requant="${HMX_I8_HVX_Q15_SCORE_REQUANT:-OFF}"
+vtcm_early_score_publish="${HMX_I8_VTCM_EARLY_SCORE_PUBLISH:-OFF}"
 
 default_models="qwen2_1p5b"
 model_spec="${HMX_OPERATOR_MODELS:-${default_models}}"
@@ -436,6 +437,7 @@ build_shape_variants() {
                         HMX_I8_SHARED_KEY_WIDE_TAIL="${vtcm_shared_key_wide_tail}" \
                         HMX_I8_HVX_ALIGNED_SCORE_STORES="${hvx_aligned_score_stores}" \
                         HMX_I8_HVX_Q15_SCORE_REQUANT="${hvx_q15_score_requant}" \
+                        HMX_I8_VTCM_EARLY_SCORE_PUBLISH="${vtcm_early_score_publish}" \
                         HMX_RPC_SKEL_OUTPUT_NAME="${skel_output_name}"
                     copy_artifact "${dsp_ship}/${skel_file}" "${output_dir}/${skel_file}"
                     built_dispatch_skels[${skel_output_name}]=1

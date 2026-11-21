@@ -1503,7 +1503,9 @@ int hmx_i8_kernel_qk_i8_packed_shared_key(
     uint64_t key_sources,
     volatile int32_t *producer_progress,
     uint8_t *vtcm,
-    uint32_t vtcm_size) {
+    uint32_t vtcm_size,
+    hmx_i8_score_prefix_ready_fn prefix_ready,
+    void *ready_context) {
     const uint32_t required = hmx_i8_qk_packed_vtcm_bytes(m, k, n);
     if (required == 0 || required > vtcm_size) return -1;
 
@@ -1540,6 +1542,7 @@ int hmx_i8_kernel_qk_i8_packed_shared_key(
     hmx_dma_desc_1d dma __attribute__((aligned(64)));
     if (!hmx_dma_wait_idle()) return -1;
     setup_accumulator_read_config(config);
+    unsigned published = 0;
     for (unsigned owner = 0; owner < heads; ++owner) {
         if (hmx_packed_key_source(key_sources, owner) != owner) continue;
         const int8_t *owner_key = packed_key + owner * key_stride;
@@ -1633,6 +1636,19 @@ int hmx_i8_kernel_qk_i8_packed_shared_key(
                 }
             }
             first_col += cols;
+        }
+        if (prefix_ready != NULL) {
+            unsigned end = published;
+            /* Owners run in ascending order. A head is ready only when its
+             * owner has completed all columns. Readers consume heads in order. */
+            while (end < heads
+                   && hmx_packed_key_source(key_sources, end) <= owner) {
+                ++end;
+            }
+            if (end > published && end != heads) {
+                prefix_ready(ready_context, end);
+                published = end;
+            }
         }
     }
     return 0;

@@ -1364,6 +1364,27 @@ static void publish_cpu_packed_scores(
         QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
 }
 
+#if HMX_I8_VTCM_SHARED_KEY
+typedef struct {
+    int8_t *output;
+    size_t output_stride;
+    volatile int32_t *ready;
+    hmx_i8_dsp_timing *timing;
+    int32 next_head;
+    uint64_t elapsed_ticks;
+} hmx_cpu_packed_score_publication;
+
+static void publish_cpu_packed_prefix(void *opaque, unsigned end) {
+    hmx_cpu_packed_score_publication *publication = opaque;
+    const uint64_t begin = HAP_perf_get_qtimer_count();
+    publish_cpu_packed_scores(
+        publication->output, publication->output_stride, publication->ready,
+        publication->next_head, (int32)end, publication->timing);
+    publication->next_head = (int32)end;
+    publication->elapsed_ticks += HAP_perf_get_qtimer_count() - begin;
+}
+#endif
+
 static AEEResult execute_qk_i8_cpu_packed(
     int32 buffer_fd,
     int32 query_offset,
@@ -1448,15 +1469,23 @@ static AEEResult execute_qk_i8_cpu_packed(
         }
     }
     if (has_key_aliases) {
+        hmx_cpu_packed_score_publication publication = {
+            .output = output, .output_stride = output_stride,
+            .ready = ready, .timing = &timing,
+        };
         const uint64_t hmx_begin = HAP_perf_get_qtimer_count();
         status = hmx_i8_kernel_qk_i8_packed_shared_key(
             output, query, key, key_sums, head_requant,
             HMX_FIXED_M_PADDED, HMX_FIXED_K_PADDED, n, (unsigned)heads,
-            key_sources, ready, session->vtcm_base, session->vtcm_size);
-        timing.hmx_kernel_ticks += HAP_perf_get_qtimer_count() - hmx_begin;
+            key_sources, ready, session->vtcm_base, session->vtcm_size,
+            HMX_I8_VTCM_EARLY_SCORE_PUBLISH ? publish_cpu_packed_prefix : NULL,
+            &publication);
+        timing.hmx_kernel_ticks += HAP_perf_get_qtimer_count() - hmx_begin
+            - publication.elapsed_ticks;
         if (status == 0) {
             publish_cpu_packed_scores(
-                output, output_stride, ready, 0, heads, &timing);
+                output, output_stride, ready,
+                publication.next_head, heads, &timing);
             publish_begin = heads;
         }
     }
