@@ -247,7 +247,8 @@ void dumpQNNBoundaryTensors(const std::filesystem::path& root,
 
   const std::vector<std::string> boundary_names = {"q_proj", "k_proj", "v_proj", "attention_output"};
   const std::vector<std::string> shadow_names = {"shadow_activation", "shadow_down_codes", "shadow_pre_correction",
-                                                 "shadow_oproj_codes", "shadow_post_attention", "shadow_rms_output"};
+                                                 "shadow_oproj_codes", "shadow_post_attention", "shadow_rms_output",
+                                                 "shadow_oproj_input_codes"};
   for (size_t layer_index = 0; layer_index < model.capturedBoundaryLayerCount(); ++layer_index) {
     const auto& boundaries = model.capturedLayerBoundaries(layer_index);
     MLLM_RT_ASSERT(boundaries.size() == boundary_names.size());
@@ -256,7 +257,7 @@ void dumpQNNBoundaryTensors(const std::filesystem::path& root,
       dump_tensor(std::to_string(layer_index), boundary_names[boundary_index], filename, boundaries[boundary_index]);
     }
     const auto& shadow_boundaries = model.capturedLayerShadowBoundaries(layer_index);
-    MLLM_RT_ASSERT(shadow_boundaries.empty() || shadow_boundaries.size() == 3 ||
+    MLLM_RT_ASSERT(shadow_boundaries.empty() || shadow_boundaries.size() == 3 || shadow_boundaries.size() == 6 ||
                    shadow_boundaries.size() == shadow_names.size());
     for (size_t index = 0; index < shadow_boundaries.size(); ++index) {
       const auto filename = fmt::format("layer-{:02d}-{}.f32", layer_index, shadow_names[index]);
