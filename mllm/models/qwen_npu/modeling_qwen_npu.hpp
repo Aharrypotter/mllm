@@ -734,7 +734,8 @@ class QwenDecoder final : public nn::Module {
       const auto& shape = attention.shape();
       MLLM_RT_ASSERT_EQ(shape.size(), 3);
       // Snapshot the host-encoded codes at the graph hand-off.
-      input_codes = attention.to(kCPU).contiguous().view({shape[0], shape[1], 1, shape[2]});
+      auto staged_input = attention;
+      input_codes = staged_input.to(kCPU).contiguous().view({shape[0], shape[1], 1, shape[2]});
     }
     auto out_mlp_states = self_attn_out_mlp_(attention, residual);
     if (shadow_down_proj_) {
