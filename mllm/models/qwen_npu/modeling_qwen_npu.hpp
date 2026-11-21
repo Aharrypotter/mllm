@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -21,6 +22,7 @@
 #include "mllm/nn/layers/Param.hpp"
 #include "mllm/utils/Common.hpp"
 #include "mllm/models/ARGeneration.hpp"
+#include "mllm/models/qwen_npu/QnnAttentionLayout.hpp"
 #include "mllm/models/qwen_npu/ShadowNPUAttentionQuantization.hpp"
 #include "configuration_qwen_npu.hpp"
 
@@ -529,6 +531,10 @@ class QwenAttentionMatmul final : public nn::Module {
       output = nn::functional::matmul(attn, value_states.to(attn.dtype()));
     }
     // [B, H, S, D] -> [B, S, H, D] -> [B, S, H * D]
+    if (!args.empty() && args[0].get<bool>() && output.device() == kCPU && output.dtype() == kFloat32
+        && output.isContiguous()) {
+      return {output};
+    }
     output = output.transpose(1, 2).view({B, S, num_attention_heads_ * head_dim_});
 
     return {output};
@@ -602,18 +608,44 @@ class QwenOutProjAndMLP final : public nn::Module {
   }
 
   Tensor prepareAttentionInput(Tensor attention) {
-    if (!shadow_int8_input_) { return attention.to(kQNN); }
+    const auto shape = attention.shape();
+    const bool head_major = shape.size() == 4;
+    if (!head_major && !shadow_int8_input_) { return attention.to(kQNN); }
+
     MLLM_RT_ASSERT_EQ(attention.device(), kCPU);
     MLLM_RT_ASSERT_EQ(attention.dtype(), kFloat32);
+    auto input_shape = shape;
+    if (head_major) {
+      MLLM_RT_ASSERT(attention.isContiguous());
+      MLLM_RT_ASSERT_EQ(shape[1] * shape[3], hidden_size_);
+      input_shape = {shape[0], shape[2], hidden_size_};
+      static const bool trace_direct_output = [] {
+        const auto* option = std::getenv("MLLM_QNN_ATTENTION_OUTPUT_DIRECT_TRACE");
+        return option && option[0] == '1' && option[1] == '\0';
+      }();
+      if (trace_direct_output) {
+        MLLM_INFO("QNN_ATTENTION_OUTPUT_DIRECT layer={} int8={} removed_bytes={}", getModuleName(),
+                  static_cast<int>(shadow_int8_input_), attention.bytes() * (shadow_int8_input_ ? 2 : 1));
+      }
+    }
+    if (!shadow_int8_input_) {
+      auto input = Tensor::empty(input_shape, kFloat32, kQNN).alloc();
+      writeQnnAttentionRows(attention.ptr<float>(), input.ptr<float>(), shape[0], shape[1], shape[2], shape[3],
+                            [](const float* source, float* destination, size_t count) {
+                              std::memcpy(destination, source, count * sizeof(float));
+                            });
+      return input;
+    }
+
     // Match QNNCastTypeOp's range-to-step conversion before exposing codes to QNN.
     const float step = static_cast<float>(o_proj_quantize_scale_.weight().ptr<float>()[0] / 127.0);
     MLLM_RT_ASSERT(std::isfinite(step) && step > 0.0F);
     auto scale = Tensor::empty({1}, kFloat32, kCPU).alloc();
     scale.ptr<float>()[0] = step;
-    auto input = Tensor::empty(attention.shape(), kInt8, kQNN);
+    auto input = Tensor::empty(input_shape, kInt8, kQNN);
     input.attach("qnn_quant_scale", scale.impl());
     if (!Context::instance().thisThread()->trace_mode) {
-      attention = attention.contiguous();
+      if (!head_major) { attention = attention.contiguous(); }
       input.alloc();
       static const bool round_through_half = [] {
         const auto* option = std::getenv("MLLM_QNN_SHADOW_INT8_FP16_ROUNDTRIP");
@@ -622,11 +654,21 @@ class QwenOutProjAndMLP final : public nn::Module {
       const auto* values = attention.ptr<float>();
       auto* codes = input.ptr<int8_t>();
       const float inverse_step = 1.0F / step;
+      const auto write_codes = [&]<bool RoundThroughHalf>() {
+        const auto write_row = [inverse_step](const float* source, int8_t* destination, size_t count) {
+          quantizeShadowAttentionInt8<RoundThroughHalf>(source, destination, count, inverse_step);
+        };
+        if (head_major) {
+          writeQnnAttentionRows(values, codes, shape[0], shape[1], shape[2], shape[3], write_row);
+        } else {
+          write_row(values, codes, attention.numel());
+        }
+      };
+      // Match the captured QNN Cast codes by rounding the attention values through FP16 when requested.
       if (round_through_half) {
-        // Match the captured QNN Cast codes by rounding the attention values through FP16.
-        quantizeShadowAttentionInt8<true>(values, codes, attention.numel(), inverse_step);
+        write_codes.template operator()<true>();
       } else {
-        quantizeShadowAttentionInt8(values, codes, attention.numel(), inverse_step);
+        write_codes.template operator()<false>();
       }
     }
     return input;
@@ -777,7 +819,14 @@ class QwenDecoder final : public nn::Module {
       captured_debug_boundaries_.push_back(value_states.transpose(1, 2).contiguous());
     }
 
-    auto x = self_attn_matmul_(query_states, key_states, value_states, sin, cos)[0];
+    static const bool direct_output_enabled = [] {
+      const auto* option = std::getenv("MLLM_QNN_ATTENTION_OUTPUT_DIRECT");
+      return option && option[0] == '1' && option[1] == '\0';
+    }();
+    const bool keep_head_major = direct_output_enabled && !capture_debug_boundaries_
+                                 && !Context::instance().thisThread()->trace_mode && query_states.shape()[2] > 1;
+    auto x = keep_head_major ? self_attn_matmul_(query_states, key_states, value_states, sin, cos, AnyValue(true))[0]
+                             : self_attn_matmul_(query_states, key_states, value_states, sin, cos)[0];
     if (capture_debug_boundaries_) { captured_debug_boundaries_.push_back(x.contiguous()); }
     return self_attn_out_mlp_.prepareAttentionInput(x);
   }
