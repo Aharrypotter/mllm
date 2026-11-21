@@ -927,6 +927,66 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
       sequenceTileProfile_.output_copy_us += elapsed_us(stage_start, clock::now());
       ++sequenceTileProfile_.tile_calls;
     }
+    static const char* batch_probe_graph = std::getenv("MLLM_QNN_SEQUENCE_BATCH2_PROBE_GRAPH");
+    if (batch_probe_graph && graphName == batch_probe_graph) {
+      // Compare a single batch-multiplied execution with the two ordinary tiles.
+      // The diagnostic uses separate storage and never publishes its outputs.
+      const auto& interface = runtime_->qnnInterface;
+      const auto batch_compatible = [](const std::vector<QNNSequenceTilePlan>& plans) {
+        return std::all_of(plans.begin(), plans.end(), [](const auto& plan) {
+          return plan.tile_count == 2 && plan.axis == 1 && plan.compiled_shape[0] == 1;
+        });
+      };
+      if (!interface.propertyHasCapability
+          || interface.propertyHasCapability(QNN_PROPERTY_GRAPH_SUPPORT_BATCH_MULTIPLE) != QNN_PROPERTY_SUPPORTED
+          || !batch_compatible(state.input_plans) || !batch_compatible(state.output_plans)) {
+        MLLM_INFO("QNN_SEQUENCE_BATCH2_PROBE graph={} skipped=unsupported_property_or_shape", graphName);
+        return;
+      }
+
+      const auto shared_allocator = std::static_pointer_cast<QNNAllocator>(allocator());
+      std::vector<Tensor> storage;
+      std::vector<std::vector<uint32_t>> dimensions;
+      storage.reserve(inputs.size() + outputs.size());
+      dimensions.reserve(inputs.size() + outputs.size());
+      const auto prepare_batch = [&](const std::vector<Tensor>& logical, const std::vector<QNNSequenceTilePlan>& plans,
+                                     std::vector<Qnn_Tensor_t>& descriptors, bool copy_input) {
+        for (size_t i = 0; i < logical.size(); ++i) {
+          auto shape = plans[i].compiled_shape;
+          shape[0] = 2;
+          dimensions.emplace_back(shape.begin(), shape.end());
+          auto& scratch = storage.emplace_back(Tensor::empty(shape, logical[i].dtype(), kQNN).alloc());
+          if (scratch.bytes() != logical[i].bytes()) {
+            throw std::invalid_argument("QNN batch multiplier changed a graph boundary's total storage size");
+          }
+          QNN_TENSOR_SET_DIMENSIONS(descriptors[i], dimensions.back().data());
+          QNN_TENSOR_SET_MEM_HANDLE(descriptors[i], nullptr);
+          shared_allocator->registerQnnTensorToSharedBuffer(scratch.ptr<void>(), descriptors[i]);
+          if (copy_input) {
+            std::memcpy(scratch.ptr<void>(), logical[i].ptr<void>(), scratch.bytes());
+          } else {
+            std::memset(scratch.ptr<void>(), 0xA5, scratch.bytes());
+          }
+        }
+      };
+      prepare_batch(inputs, state.input_plans, qnn_inputs, true);
+      prepare_batch(outputs, state.output_plans, qnn_outputs, false);
+      const auto begin = clock::now();
+      const auto status = interface.graphExecute(model->getQnnGraph(), qnn_inputs.data(), qnn_inputs.size(),
+                                                 qnn_outputs.data(), qnn_outputs.size(), nullptr, nullptr);
+      const auto duration = elapsed_us(begin, clock::now());
+      size_t checked_bytes = 0;
+      size_t mismatched_outputs = 0;
+      if (status == QNN_SUCCESS) {
+        for (size_t i = 0; i < outputs.size(); ++i) {
+          const size_t bytes = outputs[i].bytes();
+          checked_bytes += bytes;
+          mismatched_outputs += std::memcmp(outputs[i].ptr<void>(), storage[inputs.size() + i].ptr<void>(), bytes) != 0;
+        }
+      }
+      MLLM_INFO("QNN_SEQUENCE_BATCH2_PROBE graph={} status={} outputs={} checked_bytes={} mismatched_outputs={} exec_us={}",
+                graphName, status, outputs.size(), checked_bytes, mismatched_outputs, duration);
+    }
     if (ProfilingLevel::OFF != profilingLevel_) { extractBackendProfilingInfo(runtime_->profileHandle); }
     return;
   }
