@@ -5,6 +5,7 @@
 #include "AttentionPipelineExecutor.hpp"
 #include "HMXPipelineScheduler.hpp"
 #include "HMXPipelineLatencyRecorder.hpp"
+#include "HmxTopKBitmap.hpp"
 #include "INT8TopK.hpp"
 #include "PipelineTaskExecutor.hpp"
 
@@ -148,6 +149,8 @@ public:
         std::function<void(std::size_t, std::size_t)> topk_group_ready;
         std::function<void(std::size_t, std::size_t, int, int)>
             topk_group_rows_ready;
+        std::function<void(std::size_t, int, int, HmxTopKBitmapView)>
+            topk_bitmap_rows_ready;
     };
 
     explicit HMXInt8Selector(std::size_t reserve_hint_tokens = 0)
@@ -3234,6 +3237,11 @@ private:
                                                     std::fprintf(stderr,
                                                         "[HMX_INT8_NATIVE_BITMAP] layer=%d key_len=%d heads=%zu\n",
                                                         request.layer_id, request.key_len, count);
+                                                    if (request.topk_bitmap_rows_ready) {
+                                                        std::fprintf(stderr,
+                                                            "[HMX_INT8_DIRECT_BITMAP] layer=%d key_len=%d heads=%zu\n",
+                                                            request.layer_id, request.key_len, count);
+                                                    }
                                                 }
                                             }
                                             stream.matrices = group;
@@ -5557,6 +5565,22 @@ private:
             pipelineStreamingNotify();
         };
 
+        const auto direct_bitmap = [&](const DirectScoreStream &stream) {
+            return stream.decode_bitmap != nullptr && static_cast<bool>(request.topk_bitmap_rows_ready);
+        };
+        const auto consume_rows = [&](const DirectScoreStream &stream,
+                                      std::size_t local, int row_begin, int row_count) {
+            const std::size_t matrix = stream.matrices[local];
+            if (direct_bitmap(stream)) {
+                const auto stride = stream.index_head_stride;
+                request.topk_bitmap_rows_ready(matrix, row_begin, row_count,
+                                               {stream.indices + local * stride,
+                                                stride * sizeof(*stream.indices)});
+            } else {
+                request.topk_group_rows_ready(matrix, 1U, row_begin, row_count);
+            }
+        };
+
         // Submit before the RPC so CPU4/CPU6 are resident and waiting when
         // the DSP publishes head 0. Each worker owns disjoint four-row
         // blocks; the second completion publishes the head to CPU7.
@@ -5622,7 +5646,7 @@ private:
                     }
                 }
                 const std::size_t matrix = stream->matrices[local];
-                if (!selectTopKDirectMatrixPartition(
+                if (!direct_bitmap(*stream) && !selectTopKDirectMatrixPartition(
                         request, validated, matrix,
                         stream->scores
                             + local * stream->score_head_stride,
@@ -5672,9 +5696,7 @@ private:
                     const std::uint64_t assist_begin = timing_enabled
                         ? CPUAttentionProfiler::nowNs() : 0;
                     try {
-                        request.topk_group_rows_ready(
-                            matrix, 1U, row_begin,
-                            request.query_len - row_begin);
+                        consume_rows(*stream, local, row_begin, request.query_len - row_begin);
                         if (profile_enabled) {
                             sparse_assist_busy_ns +=
                                 CPUAttentionProfiler::nowNs() - assist_begin;
@@ -5749,9 +5771,7 @@ private:
                                 sparse_assist_row_begin[matrix];
                             const std::uint64_t assist_begin = timing_enabled
                                 ? CPUAttentionProfiler::nowNs() : 0;
-                            request.topk_group_rows_ready(
-                                matrix, 1U, row_begin,
-                                request.query_len - row_begin);
+                            consume_rows(*stream, local, row_begin, request.query_len - row_begin);
                             if (profile_enabled) {
                                 sparse_assist_busy_ns +=
                                     CPUAttentionProfiler::nowNs()
@@ -5775,6 +5795,17 @@ private:
                 pipelineStreamingNotify();
             });
         }
+
+        const auto join_sparse_assistant = [&] {
+            if (!sparse_assistant.valid()) return;
+            try {
+                sparse_assistant.get();
+            } catch (const std::exception &exception) {
+                if (sparse_assist_error.empty()) sparse_assist_error = exception.what();
+            } catch (...) {
+                if (sparse_assist_error.empty()) sparse_assist_error = "unknown exception in direct sparse assistant";
+            }
+        };
 
         const DirectScoreStreamCallback on_direct_stream =
             [&](const DirectScoreStream &stream,
@@ -5808,9 +5839,10 @@ private:
                                 const int row_count =
                                     sparse_assist_row_begin[matrix];
                                 if (row_count > 0) {
-                                    request.topk_group_rows_ready(
-                                        matrix, 1U, 0, row_count);
+                                    consume_rows(stream, consumed, 0, row_count);
                                 }
+                            } else if (direct_bitmap(stream)) {
+                                consume_rows(stream, consumed, 0, request.query_len);
                             } else {
                                 request.topk_group_ready(matrix, 1U);
                             }
@@ -5860,6 +5892,9 @@ private:
                 while (!topk_done.load(std::memory_order_acquire)) {
                     pipelineStreamingPause();
                 }
+                // Bitmap rows still borrow the RPC slab while the assistant
+                // runs. Drain it before returning the slab to its producer.
+                if (direct_bitmap(stream)) join_sparse_assistant();
                 if (timing_enabled) {
                     sparse_caller_finish_ns.store(
                         CPUAttentionProfiler::nowNs(),
@@ -5893,20 +5928,7 @@ private:
                 topk_error = "unknown exception in direct Top-k consumer";
             }
         }
-        if (sparse_assistant.valid()) {
-            try {
-                sparse_assistant.get();
-            } catch (const std::exception &exception) {
-                if (sparse_assist_error.empty()) {
-                    sparse_assist_error = exception.what();
-                }
-            } catch (...) {
-                if (sparse_assist_error.empty()) {
-                    sparse_assist_error =
-                        "unknown exception in direct sparse assistant";
-                }
-            }
-        }
+        join_sparse_assistant();
         if (timing_enabled) {
             sparse_finish_ns.store(
                 std::max(

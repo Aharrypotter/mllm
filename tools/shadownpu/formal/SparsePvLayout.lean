@@ -57,6 +57,28 @@ theorem hvx_visible_address (firstVisible key row : Nat) (hRow : row < 4) (hKey 
   unfold maskWord
   omega
 
+def groupWords (causalPrefix group : Nat) : Nat := ((causalPrefix + group * 4 + 1 + 3 + 31) / 32) * 4
+
+def groupOffset (causalPrefix : Nat) : Nat → Nat
+  | 0 => 0
+  | group + 1 => groupOffset causalPrefix group + groupWords causalPrefix group
+
+theorem hvx_global_word_in_group (causalPrefix group key lane : Nat)
+    (hLane : lane < 4) (hKey : key < causalPrefix + group * 4 + 1 + lane) :
+    groupOffset causalPrefix group ≤ groupOffset causalPrefix group + maskWord key lane ∧
+      groupOffset causalPrefix group + maskWord key lane < groupOffset causalPrefix (group + 1) := by
+  have h := (hvx_visible_address (causalPrefix + group * 4 + 1) key lane hLane hKey).1
+  constructor
+  · exact Nat.le_add_right _ _
+  · exact Nat.add_lt_add_left h _
+
+theorem hvx_adjacent_groups_disjoint (causalPrefix group key lane nextKey nextLane : Nat)
+    (hLane : lane < 4) (hKey : key < causalPrefix + group * 4 + 1 + lane) :
+    groupOffset causalPrefix group + maskWord key lane ≠ groupOffset causalPrefix (group + 1) + maskWord nextKey nextLane := by
+  have lower := (hvx_global_word_in_group causalPrefix group key lane hLane hKey).2
+  have upper := Nat.le_add_right (groupOffset causalPrefix (group + 1)) (maskWord nextKey nextLane)
+  exact Nat.ne_of_lt (Nat.lt_of_lt_of_le lower upper)
+
 theorem page_address (key : Nat) : key / 64 * 64 + key % 64 = key := by omega
 
 -- Integer arithmetic describes which contributions may be omitted. Rounding and instructions are outside this model.
@@ -85,5 +107,7 @@ end ShadowNPU.SparsePvLayout
 #print axioms ShadowNPU.SparsePvLayout.tile_output_in_bounds
 #print axioms ShadowNPU.SparsePvLayout.split_worker_writes_disjoint
 #print axioms ShadowNPU.SparsePvLayout.hvx_visible_address
+#print axioms ShadowNPU.SparsePvLayout.hvx_global_word_in_group
+#print axioms ShadowNPU.SparsePvLayout.hvx_adjacent_groups_disjoint
 #print axioms ShadowNPU.SparsePvLayout.page_address
 #print axioms ShadowNPU.SparsePvLayout.zero_weight_filter

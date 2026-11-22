@@ -15,6 +15,7 @@
 
 #include "mllm/backends/cpu/kernels/arm/SparsePVSme.hpp"
 #include "mllm/backends/cpu/kernels/arm/softmax.hpp"
+#include "mllm/backends/cpu/kernels/common/shadownpu/HmxTopKBitmap.hpp"
 #include "mllm/backends/cpu/kernels/common/ggml/quantize/quantize.hpp"
 #include "mllm/backends/cpu/kernels/common/ggml/vec_dot.hpp"
 #include "mllm/backends/cpu/kernels/x86/softmax.hpp"
@@ -254,6 +255,7 @@ struct HmxF16SparseScratch {
   std::vector<float> probabilities;
   std::vector<mllm_fp16_t> query;
   std::vector<mllm_fp16_t> weights;
+  std::vector<int32_t> row_indices;
 
   void resize(size_t key_len, size_t head_dim) {
     probabilities.resize(key_len);
@@ -457,7 +459,7 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
                                               size_t matrix_begin, size_t matrix_count, int32_t query_row_begin,
                                               int32_t query_row_count, const int32_t* external_indices,
                                               size_t external_head_stride, const int32_t* external_row_offsets,
-                                              size_t external_row_offsets_head_stride) {
+                                              size_t external_row_offsets_head_stride, HmxTopKBitmapView bitmap = {}) {
   if (query == nullptr || key == nullptr || value == nullptr || output == nullptr || external_indices == nullptr
       || external_row_offsets == nullptr || params.batch <= 0 || params.query_heads <= 0 || params.kv_heads <= 0
       || params.query_heads % params.kv_heads != 0 || params.query_len <= 0 || params.key_len < params.query_len
@@ -476,6 +478,15 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
 
   thread_local detail::HmxF16SparseScratch scratch;
   scratch.resize(static_cast<size_t>(params.key_len), static_cast<size_t>(params.query_key_dim));
+  const bool use_bitmap = bitmap.data != nullptr;
+  HmxTopKBitmapRows bitmap_rows;
+  if (use_bitmap) {
+    if (matrix_count != 1 || !params.causal_mask || params.query_len <= 1
+        || !bitmap_rows.reset(bitmap, params.query_len, params.key_len)) {
+      return false;
+    }
+    scratch.row_indices.resize(params.key_len);
+  }
 #if defined(MLLM_ANDROID_SME_SPARSE_PV)
   // HMX publishes unique per-row indices. The opt-in SME reduction uses the
   // same FP16 probabilities for finite values, grouped sixteen rows at a time.
@@ -512,9 +523,15 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
         return false;
       }
       const int32_t keep = end - begin;
-      const int32_t* selected = external_indices + matrix * external_head_stride + begin;
-      for (int32_t index = 0; index < keep; ++index) {
-        if (selected[index] < 0 || selected[index] >= valid) { return false; }
+      const int32_t* selected;
+      if (use_bitmap) {
+        if (!bitmap_rows.decode(query_index, {scratch.row_indices.data(), static_cast<size_t>(keep)})) return false;
+        selected = scratch.row_indices.data();
+      } else {
+        selected = external_indices + matrix * external_head_stride + begin;
+        for (int32_t index = 0; index < keep; ++index) {
+          if (selected[index] < 0 || selected[index] >= valid) { return false; }
+        }
       }
       const float* query_row = query + static_cast<size_t>(batch) * params.query_stride[0]
                                + static_cast<size_t>(query_head) * params.query_stride[1]
