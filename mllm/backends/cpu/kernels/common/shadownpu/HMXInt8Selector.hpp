@@ -5511,9 +5511,13 @@ private:
         std::string sparse_assist_error;
 
 #if defined(MLLM_ANDROID_SME_SPARSE_PV)
+        const bool native_bitmap = sparsePvOption("MLLM_HMX_INT8_NATIVE_BITMAP");
+        const bool compatible_panel = native_bitmap
+            ? sparsePvOption("MLLM_HMX_INT8_DIRECT_BITMAP_CONSUMER")
+                && useSparsePvBitmapPanel() && useSparsePvBitmapSharedValues()
+            : !useSparsePvRetiringPanel();
         const bool use_shared_chunks = useSparsePvSharedValues()
-            && !useSparsePvRetiringPanel()
-            && !sparsePvOption("MLLM_HMX_INT8_NATIVE_BITMAP")
+            && compatible_panel
             && request.query_len >= 2 * kSparsePvSharedRows
             && request.query_len % kSparsePvSharedRows == 0
             && request.key_len > 0
