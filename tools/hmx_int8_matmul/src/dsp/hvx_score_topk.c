@@ -6,8 +6,9 @@
 #include <string.h>
 
 enum { group_rows = HMX_I8_TOPK_BITMAP_ROWS, tile_cols = HMX_I8_TOPK_BITMAP_COLS,
-       bins = 256, bins_per_vector = 8, vector_bytes = 128 };
-typedef uint16_t LaneHistograms[bins / bins_per_vector][group_rows][2][bins_per_vector];
+       bins = 256, vector_bytes = 128 };
+typedef uint16_t Histograms[group_rows][bins];
+typedef uint16_t LaneHistograms[32][group_rows][2][8];
 
 extern void hmx_i8_hvx_histogram_tiles(const uint8_t *tiles, unsigned count, LaneHistograms lanes);
 
@@ -15,75 +16,40 @@ static unsigned tile_offset(int lane, int col) {
     return (unsigned)((col / tile_cols) * vector_bytes + lane * tile_cols + col % tile_cols);
 }
 
-typedef uint16_t GroupTotals[bins / bins_per_vector][group_rows];
-typedef union {
-    LaneHistograms banks;
-    HVX_Vector vectors[bins / bins_per_vector];
-} HistogramStorage;
-
-static void tile_histogram(const uint8_t *scores, int visible, HistogramStorage *hist, GroupTotals totals) {
+static void tile_histogram(const uint8_t *scores, int visible, Histograms hist) {
     const int complete = visible / tile_cols;
     if (complete > 0) {
-        hmx_i8_hvx_histogram_tiles(scores, (unsigned)complete, hist->banks);
-        for (int group = 0; group < bins / bins_per_vector; ++group) {
-            const HVX_Vector banks = hist->vectors[group];
-            // Each row occupies 32 bytes: two consecutive eight-bin banks.
-            // Fold into the first bank, then sum that bank's eight bins.
-            const HVX_Vector merged = Q6_Vh_vadd_VhVh(banks, Q6_V_vror_VR(banks, 16));
-            hist->vectors[group] = merged;
-            const HVX_Vector pairs = Q6_Vh_vadd_VhVh(merged, Q6_V_vror_VR(merged, 2));
-            const HVX_Vector quads = Q6_Vh_vadd_VhVh(pairs, Q6_V_vror_VR(pairs, 4));
-            const HVX_Vector sums = Q6_Vh_vadd_VhVh(quads, Q6_V_vror_VR(quads, 8));
-            for (int lane = 0; lane < group_rows; ++lane) {
-                totals[group][lane] = (uint16_t)Q6_R_vextract_VR(sums, lane * 32);
-            }
-        }
+        _Alignas(vector_bytes) LaneHistograms lanes;
+        hmx_i8_hvx_histogram_tiles(scores, (unsigned)complete, lanes);
+        for (int group = 0; group < 32; ++group)
+            for (int lane = 0; lane < group_rows; ++lane)
+                for (int bin = 0; bin < 8; ++bin)
+                    hist[lane][group * 8 + bin] = lanes[group][lane][0][bin] + lanes[group][lane][1][bin];
     } else {
-        memset(hist, 0, sizeof(*hist));
-        memset(totals, 0, sizeof(GroupTotals));
+        memset(hist, 0, sizeof(Histograms));
     }
-    for (int lane = 0; lane < group_rows; ++lane) {
-        for (int col = complete * tile_cols; col < visible + lane; ++col) {
-            const unsigned score = scores[tile_offset(lane, col)];
-            const unsigned group = score / bins_per_vector;
-            ++hist->banks[group][lane][0][score % bins_per_vector];
-            ++totals[group][lane];
-        }
-    }
-}
-
-static int select_cutoff(const LaneHistograms hist, const GroupTotals totals, int lane, int *remaining) {
-    enum { groups_per_sign = bins / (2 * bins_per_vector) };
-    for (int group = groups_per_sign - 1; group >= -groups_per_sign; --group) {
-        const unsigned hardware_group = (unsigned)group & (bins / bins_per_vector - 1);
-        const int count = totals[hardware_group][lane];
-        if (*remaining > count) {
-            *remaining -= count;
-            continue;
-        }
-        const uint16_t *bank = hist[hardware_group][lane][0];
-        for (int bin = bins_per_vector - 1; bin >= 0; --bin) {
-            if (*remaining <= bank[bin]) return group * bins_per_vector + bin;
-            *remaining -= bank[bin];
-        }
-        break;
-    }
-    return -129;
+    for (int lane = 0; lane < group_rows; ++lane)
+        for (int col = complete * tile_cols; col < visible + lane; ++col)
+            ++hist[lane][scores[tile_offset(lane, col)]];
 }
 
 static inline HVX_Vector pack_predicate(HVX_VectorPred predicate) {
-    // Match the four-row HMX tile. A 4-byte dot product makes a nibble;
-    // a 2-halfword dot product combines two adjacent nibbles into a byte.
+    // Each four-byte dot product packs four adjacent predicate bytes into a nibble.
     const HVX_Vector weighted = Q6_V_vand_QR(predicate, 0x08040201);
     const HVX_Vector words = Q6_Vuw_vrmpy_VubRub(weighted, 0x01010101);
-    const HVX_Vector nibbles = Q6_Vh_vpacke_VwVw(words, words);
-    const HVX_Vector masks = Q6_Vw_vdmpy_VhRh_sat(nibbles, 0x00100001);
-    const HVX_Vector halfwords = Q6_Vh_vpacke_VwVw(masks, masks);
+    const HVX_Vector halfwords = Q6_Vh_vpacke_VwVw(words, words);
     return Q6_Vb_vpacke_VhVh(halfwords, halfwords);
 }
 
+static inline uint32_t dense_nibbles(uint32_t value) {
+    value = (value | (value >> 4)) & UINT32_C(0x00ff00ff);
+    return (value | (value >> 8)) & UINT32_C(0xffff);
+}
+
 static inline uint32_t row_mask(HVX_Vector packed, int lane) {
-    return (uint32_t)Q6_R_vextract_VR(packed, lane * 4);
+    const uint32_t low = (uint32_t)Q6_R_vextract_VR(packed, lane * 8);
+    const uint32_t high = (uint32_t)Q6_R_vextract_VR(packed, lane * 8 + 4);
+    return dense_nibbles(low) | (dense_nibbles(high) << 16);
 }
 
 static uint32_t take_equal_prefix(uint32_t equal, int *remaining) {
@@ -173,17 +139,20 @@ static inline __attribute__((always_inline)) int select_topk(
     for (int group = 0; group < rows; group += group_rows) {
         const int visible = valid_columns - rows + group + 1;
         const uint8_t *block = scores + (size_t)group * padded_columns;
-        _Alignas(vector_bytes) HistogramStorage histogram;
-        GroupTotals totals;
+        Histograms histogram;
         int thresholds[group_rows], ties[group_rows], keep[group_rows];
         uint16_t *out[group_rows];
-        tile_histogram(block, visible, &histogram, totals);
+        tile_histogram(block, visible, histogram);
         for (int lane = 0; lane < group_rows; ++lane) {
             const int row = group + lane;
             keep[lane] = offsets[row + 1] - offsets[row];
             if (!emit_bitmap) out[lane] = indices + offsets[row];
             int remaining = keep[lane];
-            const int threshold = select_cutoff(histogram.banks, totals, lane, &remaining);
+            int threshold = 127;
+            while (threshold >= -128 && remaining > histogram[lane][(uint8_t)threshold]) {
+                remaining -= histogram[lane][(uint8_t)threshold];
+                --threshold;
+            }
             if (threshold < -128) return -1;
             thresholds[lane] = threshold;
             ties[lane] = remaining;
