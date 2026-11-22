@@ -25,8 +25,10 @@ GraphStatus packCorrection(Tensor& output, const Tensor& activation, const Tenso
   const auto [batch, height, width, depth] = activation.dims();
   const auto [code_batch, code_height, code_width, code_depth] = codes.dims();
   const auto [control_batch, control_height, control_width, control_depth] = controls.dims();
+  const auto [out_batch, out_height, out_spatial_width, out_depth] = output.dims();
   if (batch != 1 || height * width != tile_rows || depth != in_width
       || code_batch != batch || code_height != height || code_width != width || code_depth != out_width
+      || out_batch != 1 || out_height != tile_rows || out_spatial_width != 1 || out_depth != words_per_row
       || control_batch * control_height * control_width * control_depth != 3) {
     return GraphStatus::ErrorDimensions;
   }
@@ -36,10 +38,7 @@ GraphStatus packCorrection(Tensor& output, const Tensor& activation, const Tenso
     return GraphStatus::ErrorFatal;
   }
 
-  constexpr std::size_t output_words_per_row = sizeof(correction_packet) / (tile_rows * sizeof(std::int32_t));
-  constexpr std::size_t output_shape[] = {1, tile_rows, 1, output_words_per_row};
-  if (!output.set_dims(output_shape) || output.total_storage_elements() < tile_rows * output_words_per_row
-      || activation.total_storage_elements() < tile_rows * in_width
+  if (output.total_storage_elements() < packet_words || activation.total_storage_elements() < tile_rows * in_width
       || codes.total_storage_elements() < tile_rows * out_width || controls.total_storage_elements() < 3) {
     return GraphStatus::ErrorDimensions;
   }
@@ -56,7 +55,11 @@ GraphStatus packCorrection(Tensor& output, const Tensor& activation, const Tenso
 
 }  // namespace
 
-DEF_PACKAGE_OP(packCorrection, "ShadowCorrectionPacket")
+DEF_PACKAGE_OP_AND_COST_AND_FLAGS(packCorrection, "ShadowCorrectionPacket", SNAIL, Flags::RESOURCE_HVX)
+// The full M256 activation exceeds VTCM. The HVX kernel streams contiguous rows from DDR.
+DEF_TENSOR_PROPERTIES(Op("ShadowCorrectionPacket", "activation", "codes", "controls"),
+                      Flat("*", "activation", "codes", "controls"),
+                      MainMemory("*", "activation", "codes", "controls"))
 DEF_PACKAGE_PARAM_ORDER("ShadowCorrectionPacket", "controls", true, nullptr)
 
 END_PKG_OP_DEFINITION(PKG_ShadowCorrectionPacket);
