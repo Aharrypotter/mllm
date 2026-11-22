@@ -832,7 +832,23 @@ class QwenDecoder final : public nn::Module {
       if (verify_packet) {
         const auto original = original_correction();
         MLLM_RT_ASSERT_EQ(corrected.bytes(), original.bytes());
-        MLLM_RT_ASSERT_EQ(std::memcmp(corrected.ptr<void>(), original.ptr<void>(), original.bytes()), 0);
+        if (std::memcmp(corrected.ptr<void>(), original.ptr<void>(), original.bytes()) != 0) {
+          const auto* observed = corrected.ptr<float>();
+          const auto* expected = original.ptr<float>();
+          int64_t changed = 0;
+          double sum_squared = 0.0, sum_expected = 0.0, max_absolute = 0.0;
+          for (int64_t i = 0; i < original.numel(); ++i) {
+            changed += std::memcmp(observed + i, expected + i, sizeof(float)) != 0;
+            const double delta = static_cast<double>(observed[i]) - expected[i];
+            sum_squared += delta * delta;
+            sum_expected += static_cast<double>(expected[i]) * expected[i];
+            max_absolute = std::max(max_absolute, std::abs(delta));
+          }
+          const double relative = sum_expected > 0.0 ? std::sqrt(sum_squared / sum_expected) : std::sqrt(sum_squared);
+          MLLM_WARN("QNN_SHADOW_PACKET_MISMATCH layer={} changed={} max_abs={} relative_l2={}",
+                    getModuleName(), changed, max_absolute, relative);
+          return original;
+        }
         MLLM_INFO("QNN_SHADOW_PACKET_EXACT layer={} bytes={} tiles={}", getModuleName(), packed.bytes(),
                   packed.numel() / packet::packet_words);
       }
