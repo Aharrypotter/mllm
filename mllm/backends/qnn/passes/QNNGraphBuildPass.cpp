@@ -25,9 +25,114 @@
 
 #include "mllm/backends/qnn/op/QNNLinearOp.hpp"
 
+#include <cmath>
+#include <cstdlib>
 #include <memory>
+#include <string_view>
 
 namespace mllm::qnn {
+
+namespace {
+
+using TensorValue = ir::tensor::TensorValue;
+
+bool isQwenMlpGraph(std::string_view name) {
+  constexpr std::string_view prefix = "model.layers.";
+  if (!name.starts_with(prefix) || (!name.ends_with("_1") && !name.ends_with("_2"))) { return false; }
+  name.remove_prefix(prefix.size());
+  name.remove_suffix(2);
+  return !name.empty() && name.find_first_not_of("0123456789") == std::string_view::npos;
+}
+
+ir::op_ptr_t findMlpQuantizeConsumer(const std::string& graph_name, const ir::graph::SubGraphOp::ptr_t& graph,
+                                    const ir::op_ptr_t& mul) {
+  const auto* mul_op = dynamic_cast<const ir::linalg::MulOp*>(mul.get());
+  if (!mul_op || mul_op->getAOp()->getName() != graph_name + ".Mul.0") { return {}; }
+  auto reject = [&](const char* reason) -> ir::op_ptr_t {
+    MLLM_INFO("QNN_MLP_HVX_MUL_QUANTIZE16_REJECT graph={} reason={}", graph_name, reason);
+    return {};
+  };
+  if (!dynamic_cast<QNNMulOp*>(mul_op->getAOp()) || mul->inputs().size() != 2 || mul->outputs().size() != 1) {
+    return reject("multiply_signature");
+  }
+  const auto* gate = dynamic_cast<const TensorValue*>(mul->inputs().front().get_weak());
+  const auto* up = dynamic_cast<const TensorValue*>(mul->inputs().back().get_weak());
+  auto* product = dynamic_cast<TensorValue*>(mul->outputs().front().get_weak());
+  if (!gate || !up || !product || product->name().empty()) { return reject("multiply_tensors"); }
+  if (getQnnOutputTensorType(product->cast_<TensorValue>()) != QNN_TENSOR_TYPE_NATIVE) {
+    return reject("exported_product");
+  }
+  const auto& shape = product->tensor_.shape();
+  if (shape != Tensor::shape_t{1, 16, 16, 8960} && shape != Tensor::shape_t{1, 256, 1, 8960}) {
+    return reject("multiply_shape");
+  }
+  if (product->tensor_.dtype() != kFloat32 || gate->tensor_.dtype() != kFloat32 || up->tensor_.dtype() != kFloat32
+      || gate->tensor_.shape() != shape || up->tensor_.shape() != shape) {
+    return reject("multiply_operand_layout");
+  }
+
+  // QNN resolves tensor edges by their names. Follow that edge and reject
+  // any other consumer, including returns and downstream reshapes.
+  ir::op_ptr_t consumer;
+  bool seen_producer = false;
+  for (const auto& op : graph->getTopRegion()->ops()) {
+    for (const auto& input : op->inputs()) {
+      auto* tensor = dynamic_cast<TensorValue*>(input.get_weak());
+      if (tensor && tensor->name() == product->name()) {
+        if (!seen_producer || consumer) { return reject("nonprivate_product"); }
+        consumer = op;
+      }
+    }
+    if (op == mul) { seen_producer = true; }
+  }
+  if (!consumer) { return reject("no_consumer"); }
+  auto* cast = dynamic_cast<ir::linalg::CastTypeOp*>(consumer.get());
+  if (!cast || !dynamic_cast<QNNCastTypeOp*>(cast->getAOp())
+      || cast->inputs().size() != 1 || cast->outputs().size() != 1) {
+    const auto* linalg = dynamic_cast<const ir::linalg::LinalgIROp*>(consumer.get());
+    MLLM_INFO("QNN_MLP_HVX_MUL_QUANTIZE16_CONSUMER graph={} op={}", graph_name,
+              linalg ? linalg->getAOp()->getName() : "<non-linalg>");
+    return reject("consumer_signature");
+  }
+  const auto* cast_input = dynamic_cast<const TensorValue*>(cast->inputs().front().get_weak());
+  const auto* quantized = dynamic_cast<const TensorValue*>(cast->outputs().front().get_weak());
+  if (!cast_input || !quantized || cast_input->tensor_.dtype() != kFloat32
+      || quantized->tensor_.dtype() != kInt16 || cast_input->tensor_.shape() != shape || quantized->tensor_.shape() != shape) {
+    return reject("cast_layout");
+  }
+  return consumer;
+}
+
+bool addMlpMulQuantize(const std::string& graph_name, const std::shared_ptr<QNNModel>& model, const ir::op_ptr_t& mul,
+                       const ir::op_ptr_t& cast) {
+  const auto gate = mul->inputs().front()->cast_<TensorValue>();
+  const auto up = mul->inputs().back()->cast_<TensorValue>();
+  const auto output = cast->outputs().front()->cast_<TensorValue>();
+  const auto& cast_name = cast->cast_<ir::linalg::CastTypeOp>()->getAOp()->getName();
+  const auto quant_params = createQuantizeParams(output->tensor_);
+  const float scale = quant_params.scaleOffsetEncoding.scale;
+  if (!(scale > 0.0F && std::isfinite(scale))) {
+    MLLM_ERROR("Invalid INT16 quantization scale for graph '{}'", graph_name);
+    return false;
+  }
+  auto scale_param =
+      QNNParamTensorWrapper::create("scale", cast_name + ".quantize_scale", QNN_DATATYPE_FLOAT_32, std::vector<uint32_t>{1});
+  *static_cast<float*>(scale_param->alloc()) = scale;
+  if (model->addTensor(output->name(), getQnnOutputTensorType(output), output->tensor_, quant_params) != MODEL_NO_ERROR) {
+    MLLM_ERROR("Failed to add fused INT16 output {} to graph '{}'", output->name(), graph_name);
+    return false;
+  }
+  const auto err = model->addNode(QNN_OPCONFIG_VERSION_1, cast_name + ".llama_hvx_mul_quantize16", QNN_Custom_Op_Package,
+                                  "LLaMAMulQuantize16", {scale_param}, {}, {gate->name(), up->name()}, {output->name()});
+  if (err != MODEL_NO_ERROR) {
+    MLLM_ERROR("Failed to add fused multiply and quantize to graph '{}': {}", graph_name, static_cast<int>(err));
+    return false;
+  }
+  MLLM_INFO("QNN_MLP_HVX_MUL_QUANTIZE16_LOWERING graph={} node={}", graph_name, cast_name);
+  return true;
+}
+
+}  // namespace
 
 QNNGraphBuildPass::QNNGraphBuildPass() {
   regPattern<QNNAddPattern, QNNMulPattern, QNNLinearPattern, QNNRMSNormPattern, QNNViewPattern, QNNTransposePattern,
@@ -36,6 +141,8 @@ QNNGraphBuildPass::QNNGraphBuildPass() {
   // register custom op patterns
   patterns_.emplace((mllm::OpTypes)mllm::Context::instance().lookupCustomizedOpId(mllm::kQNN, "DequantizeAdd"),
                     std::make_shared<QNNDequantizeAddPattern>());
+  patterns_.emplace(static_cast<mllm::OpTypes>(mllm::Context::instance().lookupCustomizedOpId(mllm::kQNN, "ShadowCorrectionPacket")),
+                    std::make_shared<QNNShadowCorrectionPacketPattern>());
 }
 
 uint8_t QNNGraphBuildPass::run(const ir::node_ptr_t& op) {
@@ -147,11 +254,21 @@ bool QNNGraphBuildPass::buildQnnGraph(const ir::graph::SubGraphOp::ptr_t& sub_gr
     }
   }
 
-  // Record MLLM expected output order from ReturnOp
-  std::vector<std::string> expectedOutputOrder;
-
   // Process each operation in the subgraph
-  for (auto& region_op : graph_region->ops()) {
+  const char* fuse_request = std::getenv("MLLM_QNN_MLP_HVX_MUL_QUANTIZE16");
+  const bool fuse_mul_quantize = fuse_request && std::string_view(fuse_request) == "1" && isQwenMlpGraph(graph_name);
+  const auto& ops = graph_region->ops();
+  ir::op_ptr_t fused_consumer;
+  if (fuse_mul_quantize) { MLLM_INFO("QNN_MLP_HVX_MUL_QUANTIZE16_SCAN graph={}", graph_name); }
+  for (const auto& region_op : ops) {
+    if (region_op == fused_consumer) { continue; }
+    if (fuse_mul_quantize && !fused_consumer) {
+      if (auto consumer = findMlpQuantizeConsumer(graph_name, sub_graph_op, region_op)) {
+        if (!addMlpMulQuantize(graph_name, qnn_model, region_op, consumer)) { return false; }
+        fused_consumer = std::move(consumer);
+        continue;
+      }
+    }
     // Handle linalg operations
     if (auto linalg_op = std::dynamic_pointer_cast<ir::linalg::LinalgIROp>(region_op)) {
       auto op_types = linalg_op->getAOpTypes();

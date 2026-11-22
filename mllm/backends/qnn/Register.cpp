@@ -54,5 +54,6 @@ void initQnnBackend(const std::string& context_path, bool prepare_only) {
   // register QNN custom ops
   Context::instance().registerCustomizedOp(kQNN, "DequantizeAdd",
                                            std::shared_ptr<BaseOpFactory>((BaseOpFactory*)(new qnn::DequantizeAddFactory())));
+  ctx.registerCustomizedOp(kQNN, "ShadowCorrectionPacket", std::make_shared<qnn::ShadowCorrectionPacketFactory>());
 }
 }  // namespace mllm

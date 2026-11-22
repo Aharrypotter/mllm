@@ -1,4 +1,8 @@
 #include "CustomOpPatterns.hpp"
+
+#include <cstring>
+
+#include "mllm/backends/qnn/custom-op-package/LLaMAPackage/src/ops/ShadowCorrectionPacketLayout.hpp"
 #include "mllm/backends/qnn/QNNBackend.hpp"
 #include "mllm/backends/qnn/QNNUtils.hpp"
 #include "mllm/backends/qnn/CustomLayers.hpp"
@@ -90,6 +94,33 @@ bool QNNDequantizeAddPattern::addNode(const std::string& graphName, const ir::op
   qnnBackend->graphAddNode(graphName, dequantizeAddOp->getName(), "LLaMADequantizeAdd", {inputs[0]->name(), biasName},
                            {outputs[0]->name()}, {scaleParam}, {}, QNN_Custom_Op_Package);
 
+  return true;
+}
+
+bool QNNShadowCorrectionPacketPattern::addNode(const std::string& graph_name, const ir::op_ptr_t& op,
+                                                const std::vector<ir::tensor::TensorValue::ptr_t>& inputs,
+                                                const std::vector<ir::tensor::TensorValue::ptr_t>& outputs) {
+  const auto* ir_op = dynamic_cast<ir::linalg::CustomizedOp*>(op.get());
+  const auto* packet_op = ir_op ? dynamic_cast<ShadowCorrectionPacketOp*>(ir_op->getAOp()) : nullptr;
+  if (!packet_op || inputs.size() != 2 || outputs.size() != 1) { return false; }
+  const auto& shape = inputs[0]->tensor_.shape();
+  if (shape[1] * shape[2] != ::shadow_correction_packet::tile_rows) {
+    MLLM_ERROR("ShadowCorrectionPacket requires an M256 QNN graph, got {}", graph_name);
+    return false;
+  }
+  auto backend = std::dynamic_pointer_cast<QNNBackend>(Context::instance().getBackend(kQNN));
+  if (!backend || !backend->addTensor(graph_name, outputs[0]->name(), getQnnOutputTensorType(outputs[0]), outputs[0]->tensor_)) {
+    return false;
+  }
+
+  auto controls = QNNParamTensorWrapper::create("controls", packet_op->getName() + ".controls", QNN_DATATYPE_INT_32,
+                                                std::vector<uint32_t>{1, 1, 1, 3});
+  const auto& words = packet_op->controls();
+  std::memcpy(controls->alloc(), words.data(), words.size() * sizeof(words[0]));
+  backend->graphAddNode(graph_name, packet_op->getName(), "ShadowCorrectionPacket",
+                        {inputs[0]->name(), inputs[1]->name()}, {outputs[0]->name()},
+                        {controls}, {}, QNN_Custom_Op_Package);
+  MLLM_INFO("QNN_SHADOW_CORRECTION_PACKET graph={} positive={} negative={} flags={}", graph_name, words[0], words[1], words[2]);
   return true;
 }
 

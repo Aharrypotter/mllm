@@ -11,6 +11,7 @@
 
 #include "mllm/backends/cpu/kernels/arm/cast_types.hpp"
 #include "mllm/backends/qnn/CustomLayers.hpp"
+#include "mllm/backends/qnn/custom-op-package/LLaMAPackage/src/ops/ShadowCorrectionPacketLayout.hpp"
 #include "mllm/compile/ir/Trace.hpp"
 #include "mllm/core/DataTypes.hpp"
 #include "mllm/core/DeviceTypes.hpp"
@@ -556,6 +557,7 @@ class QwenOutProjAndMLP final : public nn::Module {
   nn::Param o_proj_quantize_scale_;
   nn::Param pre_mlp_proj_quantize_scale_;
   nn::Param down_proj_quantize_scale_;
+  std::optional<nn::qnn::ShadowCorrectionPacket> shadow_packet_;
 
   int hidden_size_, intermediate_size_;
   bool shadow_down_proj_ = false;
@@ -605,6 +607,9 @@ class QwenOutProjAndMLP final : public nn::Module {
         reg<nn::Param>("pre_mlp_proj_quantize_scale_", getModuleName() + ".mlp.gate_proj.input_scale", Tensor::shape_t{1});
     down_proj_quantize_scale_ =
         reg<nn::Param>("down_proj_quantize_scale_", getModuleName() + ".mlp.down_proj.input_scale", Tensor::shape_t{1});
+    if (shadow_down_proj_ && cfg.qnn_shadow_correction_packet) {
+      shadow_packet_.emplace(reg<nn::qnn::ShadowCorrectionPacket>("mlp.down_proj.packet"));
+    }
   }
 
   Tensor prepareAttentionInput(Tensor attention) {
@@ -734,16 +739,23 @@ class QwenOutProjAndMLP final : public nn::Module {
     x.attach("qnn_quant_scale", down_proj_quantize_scale_.weight().impl());
     x = x.to(kInt16);
     x = down_proj_(x);
+    const auto native_down_proj = x;
     x = x.view({B, S, 1, hidden_size_});
     auto quantized_down_proj = x;
     x = x.to(kFloat32);
     x = x.view({B, S, hidden_size_});
 
     x = x + tmp;
-    if (shadow_down_proj_) {
-      return {shadow_input, quantized_down_proj, x};
+    if (!shadow_down_proj_) { return {x}; }
+    if (shadow_packet_ && B == 1 && S % ::shadow_correction_packet::tile_rows == 0) {
+      // The packet reads the Float32 multiplier output directly. The raw
+      // activation stays available for a tile whose packet cannot represent it.
+      auto projection = native_down_proj;
+      if (mlp_width != token_width) { projection = projection.view({B, S / mlp_width, mlp_width, hidden_size_}); }
+      auto packet = (*shadow_packet_)(shadow_input, projection);
+      return {shadow_input, quantized_down_proj, x, packet};
     }
-    return {x};
+    return {shadow_input, quantized_down_proj, x};
   }
 };
 
@@ -783,11 +795,48 @@ class QwenDecoder final : public nn::Module {
   Tensor finishMlp(const Tensor& attention, const Tensor& residual) {
     auto out_mlp_states = self_attn_out_mlp_(attention, residual);
     if (shadow_down_proj_) {
-      MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 3);
-      auto activation = out_mlp_states[0].to(kCPU).contiguous();
-      if (activation.dtype() == kFloat16) { activation = activation.to(kFloat32); }
-      return down_proj_shadow_correction_(activation, out_mlp_states[1].to(kCPU).contiguous(),
-                                          out_mlp_states[2].to(kCPU).contiguous());
+      namespace packet = ::shadow_correction_packet;
+      MLLM_RT_ASSERT(out_mlp_states.size() == 3 || out_mlp_states.size() == 4);
+      auto quantized = out_mlp_states[1].to(kCPU).contiguous();
+      auto baseline = out_mlp_states[2].to(kCPU).contiguous();
+      const auto original_correction = [&] {
+        auto activation = out_mlp_states[0].to(kCPU).contiguous();
+        if (activation.dtype() == kFloat16) { activation = activation.to(kFloat32); }
+        return down_proj_shadow_correction_(activation, quantized, baseline);
+      };
+      if (out_mlp_states.size() == 3 || Context::instance().thisThread()->trace_mode) { return original_correction(); }
+
+      const auto packed = out_mlp_states[3].to(kCPU).contiguous();
+      MLLM_RT_ASSERT(packed.dtype() == kInt32 && packed.numel() > 0 && packed.numel() % packet::packet_words == 0);
+      const auto* words = packed.ptr<int32_t>();
+      bool overflow = false;
+      for (size_t offset = 0; offset < static_cast<size_t>(packed.numel()); offset += packet::packet_words) {
+        const auto status = words[offset];
+        MLLM_RT_ASSERT(status == packet::complete || status == packet::needs_original_tile);
+        overflow |= status == packet::needs_original_tile;
+      }
+      static const bool force_original = [] {
+        const char* value = std::getenv("MLLM_QNN_SHADOW_PACKET_FORCE_FALLBACK");
+        return value && value[0] == '1' && value[1] == '\0';
+      }();
+      if (overflow || force_original) {
+        MLLM_INFO("QNN_SHADOW_PACKET_FALLBACK layer={} overflow={} forced={}", getModuleName(), overflow, force_original);
+        return original_correction();
+      }
+
+      auto corrected = down_proj_shadow_correction_(packed, quantized, baseline);
+      static const bool verify_packet = [] {
+        const char* value = std::getenv("MLLM_QNN_SHADOW_PACKET_VERIFY");
+        return value && value[0] == '1' && value[1] == '\0';
+      }();
+      if (verify_packet) {
+        const auto original = original_correction();
+        MLLM_RT_ASSERT_EQ(corrected.bytes(), original.bytes());
+        MLLM_RT_ASSERT_EQ(std::memcmp(corrected.ptr<void>(), original.ptr<void>(), original.bytes()), 0);
+        MLLM_INFO("QNN_SHADOW_PACKET_EXACT layer={} bytes={} tiles={}", getModuleName(), packed.bytes(),
+                  packed.numel() / packet::packet_words);
+      }
+      return corrected;
     }
     MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 1);
     return out_mlp_states[0];
