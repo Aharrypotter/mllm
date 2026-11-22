@@ -81,6 +81,16 @@ theorem hvx_adjacent_groups_disjoint (causalPrefix group key lane nextKey nextLa
 
 theorem page_address (key : Nat) : key / 64 * 64 + key % 64 = key := by omega
 
+-- Two producer words map to the two nonoverlapping halves of one active-key page.
+theorem hvx_word_to_active_page (key : Nat) :
+    key / 32 / 2 = key / 64 ∧ (key / 32 % 2) * 32 + key % 32 = key % 64 := by
+  omega
+
+-- A split worker can begin inside a producer group and still recover its tile lane.
+theorem fragment_to_tile_lane (start localRow : Nat) :
+    (start + localRow) / 4 * 4 + (start + localRow) % 4 - start = localRow := by
+  omega
+
 -- Integer arithmetic describes which contributions may be omitted. Rounding and instructions are outside this model.
 def pv (keys : List Nat) (weight value : Nat → Int) : Int :=
   keys.foldr (fun key acc => weight key * value key + acc) 0
@@ -110,4 +120,6 @@ end ShadowNPU.SparsePvLayout
 #print axioms ShadowNPU.SparsePvLayout.hvx_global_word_in_group
 #print axioms ShadowNPU.SparsePvLayout.hvx_adjacent_groups_disjoint
 #print axioms ShadowNPU.SparsePvLayout.page_address
+#print axioms ShadowNPU.SparsePvLayout.hvx_word_to_active_page
+#print axioms ShadowNPU.SparsePvLayout.fragment_to_tile_lane
 #print axioms ShadowNPU.SparsePvLayout.zero_weight_filter

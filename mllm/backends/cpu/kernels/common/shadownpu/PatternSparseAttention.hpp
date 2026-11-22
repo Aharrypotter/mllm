@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <span>
 #include <vector>
 
 #include "mllm/backends/cpu/kernels/arm/SparsePVSme.hpp"
@@ -269,6 +270,8 @@ struct SparsePvTile {
   std::vector<mllm_fp16_t> panel;
   std::vector<uint64_t> active_keys;
   std::vector<int32_t> keys;
+  std::vector<mllm_fp16_t> tile_weights;
+  std::array<size_t, kSparsePvRows + 1> tile_offsets{};
 
   void reserve(int32_t key_len) {
     panel.resize(static_cast<size_t>(key_len) * kSparsePvRows);
@@ -281,6 +284,20 @@ struct SparsePvTile {
     std::fill(active_keys.begin(), active_keys.end(), uint64_t(0));
   }
 
+  void startBitmap(size_t weights) {
+    tile_weights.resize(weights);
+    tile_offsets[0] = 0;
+    std::fill(active_keys.begin(), active_keys.end(), uint64_t(0));
+  }
+
+  mllm_fp16_t* bitmapWeightRow(int32_t row, int32_t keep) {
+    const auto begin = tile_offsets[row];
+    const auto end = begin + static_cast<size_t>(keep);
+    if (end > tile_weights.size()) return nullptr;
+    tile_offsets[row + 1] = end;
+    return tile_weights.data() + begin;
+  }
+
   void addRow(int32_t row, const int32_t* selected, const mllm_fp16_t* weights, int32_t keep) {
     for (int32_t index = 0; index < keep; ++index) {
       const auto key = static_cast<size_t>(selected[index]);
@@ -289,7 +306,7 @@ struct SparsePvTile {
     }
   }
 
-  void compute(const mllm_fp16_t* values, float* output) {
+  int32_t collectActiveKeys() {
     int32_t count = 0;
     for (size_t word = 0; word < active_keys.size(); ++word) {
       uint64_t pending = active_keys[word];
@@ -298,7 +315,22 @@ struct SparsePvTile {
         pending &= pending - 1;
       }
     }
+    return count;
+  }
+
+  void compute(const mllm_fp16_t* values, float* output) {
+    const int32_t count = collectActiveKeys();
     sparsePvRowsSme(values, keys.data(), panel.data(), count, output);
+  }
+
+  bool computeBitmap(const HmxTopKBitmapRows& bitmap, int32_t first_row, const mllm_fp16_t* values, float* output) {
+    const int32_t count = collectActiveKeys();
+    for (int32_t i = 0; i < count; ++i) {
+      std::fill_n(panel.data() + static_cast<size_t>(keys[i]) * kSparsePvRows, kSparsePvRows, mllm_fp16_t(0));
+    }
+    if (!bitmap.scatterWeights<mllm_fp16_t, kSparsePvRows>(first_row, tile_offsets, tile_weights, panel)) return false;
+    sparsePvRowsSme(values, keys.data(), panel.data(), count, output);
+    return true;
   }
 };
 #endif
@@ -492,6 +524,7 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
   // same FP16 probabilities for finite values, grouped sixteen rows at a time.
   const bool use_sme = params.value_dim == kSparsePvChannels && params.output_stride[2] == kSparsePvChannels
                        && query_row_count >= kSparsePvRows && useSparsePvSme();
+  const bool use_bitmap_panel = use_sme && use_bitmap && useSparsePvBitmapPanel();
   const int32_t sme_end = query_row_begin + (use_sme ? query_row_count / kSparsePvRows * kSparsePvRows : 0);
   thread_local detail::SparsePvTile pv_tile;
   if (use_sme) pv_tile.reserve(params.key_len);
@@ -508,6 +541,7 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
         key + static_cast<size_t>(batch) * params.key_stride[0] + static_cast<size_t>(kv_head) * params.key_stride[1];
     const mllm_fp16_t* value_base =
         value + static_cast<size_t>(batch) * params.value_stride[0] + static_cast<size_t>(kv_head) * params.value_stride[1];
+    const int32_t* row_offsets = external_row_offsets + static_cast<size_t>(query_head) * external_row_offsets_head_stride;
     for (int32_t query_index = query_row_begin; query_index < query_row_begin + query_row_count; ++query_index) {
       const int32_t valid = params.causal_mask && params.query_len > 1
                                 ? std::min(params.key_len, params.key_len - params.query_len + query_index + 1)
@@ -516,16 +550,31 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
           valid <= params.dense_tokens
               ? valid
               : std::max(1, std::min(valid, static_cast<int32_t>(std::ceil(density * static_cast<float>(valid)))));
-      const int32_t* row_offsets = external_row_offsets + static_cast<size_t>(query_head) * external_row_offsets_head_stride;
       const int32_t begin = row_offsets[query_index];
       const int32_t end = row_offsets[query_index + 1];
       if (begin < 0 || end <= begin || end - begin != expected_keep || static_cast<size_t>(end) > external_head_stride) {
         return false;
       }
       const int32_t keep = end - begin;
+      std::span<uint64_t> active_keys;
+      mllm_fp16_t* weights = scratch.weights.data();
+#if defined(MLLM_ANDROID_SME_SPARSE_PV)
+      const bool bitmap_panel_row = use_bitmap_panel && query_index < sme_end;
+      const int32_t lane = (query_index - query_row_begin) % kSparsePvRows;
+      if (bitmap_panel_row) {
+        if (lane == 0) {
+          const int32_t tile_end = row_offsets[query_index + kSparsePvRows];
+          if (tile_end < end || static_cast<size_t>(tile_end) > external_head_stride) return false;
+          pv_tile.startBitmap(static_cast<size_t>(tile_end - begin));
+        }
+        active_keys = pv_tile.active_keys;
+        weights = pv_tile.bitmapWeightRow(lane, keep);
+        if (weights == nullptr) return false;
+      }
+#endif
       const int32_t* selected;
       if (use_bitmap) {
-        if (!bitmap_rows.decode(query_index, {scratch.row_indices.data(), static_cast<size_t>(keep)})) return false;
+        if (!bitmap_rows.decode(query_index, {scratch.row_indices.data(), static_cast<size_t>(keep)}, active_keys)) return false;
         selected = scratch.row_indices.data();
       } else {
         selected = external_indices + matrix * external_head_stride + begin;
@@ -540,20 +589,26 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
       detail::selectedQKScoresF16<true>(scratch.query.data(), key_base, params.key_stride[2], selected, keep,
                                         params.query_key_dim, scale, scratch.probabilities.data());
       detail::normalizeSoftmax(scratch.probabilities.data(), keep);
-      mllm_fp32_to_fp16_row(scratch.probabilities.data(), scratch.weights.data(), keep);
+      mllm_fp32_to_fp16_row(scratch.probabilities.data(), weights, keep);
       float* output_row = output + static_cast<size_t>(batch) * params.output_stride[0]
                           + static_cast<size_t>(query_head) * params.output_stride[1]
                           + static_cast<size_t>(query_index) * params.output_stride[2];
 #if defined(MLLM_ANDROID_SME_SPARSE_PV)
       if (query_index < sme_end) {
-        const int32_t row = (query_index - query_row_begin) % kSparsePvRows;
-        if (row == 0) pv_tile.start();
-        pv_tile.addRow(row, selected, scratch.weights.data(), keep);
-        if (row == kSparsePvRows - 1) pv_tile.compute(value_base, output_row - row * kSparsePvChannels);
+        if (bitmap_panel_row) {
+          if (lane == kSparsePvRows - 1
+              && !pv_tile.computeBitmap(bitmap_rows, query_index - lane, value_base, output_row - lane * kSparsePvChannels)) {
+            return false;
+          }
+        } else {
+          if (lane == 0) pv_tile.start();
+          pv_tile.addRow(lane, selected, weights, keep);
+          if (lane == kSparsePvRows - 1) pv_tile.compute(value_base, output_row - lane * kSparsePvChannels);
+        }
         continue;
       }
 #endif
-      detail::sparseValueF16(value_base, selected, scratch.weights.data(), keep, params.value_dim, output_row);
+      detail::sparseValueF16(value_base, selected, weights, keep, params.value_dim, output_row);
     }
   }
 #if defined(MLLM_ANDROID_SME_SPARSE_PV)
@@ -561,6 +616,10 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
     std::fprintf(stderr, "[SHADOWNPU_SME_PV] key_len=%d matrix_begin=%zu matrices=%zu row_begin=%d tiled_rows=%d tail_rows=%d\n",
                  params.key_len, matrix_begin, matrix_count, query_row_begin, sme_end - query_row_begin,
                  query_row_begin + query_row_count - sme_end);
+    if (use_bitmap_panel) {
+      std::fprintf(stderr, "[SHADOWNPU_SME_BITMAP_PANEL] key_len=%d matrix_begin=%zu row_begin=%d tiled_rows=%d\n",
+                   params.key_len, matrix_begin, query_row_begin, sme_end - query_row_begin);
+    }
   }
 #endif
   return true;
