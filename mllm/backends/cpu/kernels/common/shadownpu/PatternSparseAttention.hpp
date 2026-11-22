@@ -302,11 +302,12 @@ struct SparsePvTile {
     return tile_weights.data() + begin;
   }
 
+  template<bool TrackKeys = true>
   void addRow(int32_t row, const int32_t* selected, const mllm_fp16_t* weights, int32_t keep) {
     for (int32_t index = 0; index < keep; ++index) {
       const auto key = static_cast<size_t>(selected[index]);
       panel[key * kSparsePvRows + row] = weights[index];
-      active_keys[key / 64] |= uint64_t(1) << (key % 64);
+      if constexpr (TrackKeys) { active_keys[key / 64] |= uint64_t(1) << (key % 64); }
     }
   }
 
@@ -534,7 +535,7 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
   const bool use_sme = params.value_dim == kSparsePvChannels && params.output_stride[2] == kSparsePvChannels
                        && query_row_count >= kSparsePvRows && useSparsePvSme();
   const bool use_bitmap_panel = use_sme && use_bitmap && useSparsePvBitmapPanel();
-  const bool retire_panel = use_sme && !use_bitmap && useSparsePvRetiringPanel();
+  const bool retire_panel = use_sme && (!use_bitmap || use_bitmap_panel) && useSparsePvRetiringPanel();
   const int32_t sme_end = query_row_begin + (use_sme ? query_row_count / kSparsePvRows * kSparsePvRows : 0);
   thread_local detail::SparsePvTile pv_tile;
   if (use_sme) pv_tile.reserve(params.key_len);
@@ -570,16 +571,21 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
       mllm_fp16_t* weights = scratch.weights.data();
 #if defined(MLLM_ANDROID_SME_SPARSE_PV)
       const bool bitmap_panel_row = use_bitmap_panel && query_index < sme_end;
+      const bool deferred_bitmap_row = bitmap_panel_row && !retire_panel;
       const int32_t lane = (query_index - query_row_begin) % kSparsePvRows;
       if (bitmap_panel_row) {
-        if (lane == 0) {
-          const int32_t tile_end = row_offsets[query_index + kSparsePvRows];
-          if (tile_end < end || static_cast<size_t>(tile_end) > external_head_stride) return false;
-          pv_tile.startBitmap(static_cast<size_t>(tile_end - begin));
-        }
         active_keys = pv_tile.active_keys;
-        weights = pv_tile.bitmapWeightRow(lane, keep);
-        if (weights == nullptr) return false;
+        if (deferred_bitmap_row) {
+          if (lane == 0) {
+            const int32_t tile_end = row_offsets[query_index + kSparsePvRows];
+            if (tile_end < end || static_cast<size_t>(tile_end) > external_head_stride) return false;
+            pv_tile.startBitmap(static_cast<size_t>(tile_end - begin));
+          }
+          weights = pv_tile.bitmapWeightRow(lane, keep);
+          if (weights == nullptr) return false;
+        } else if (lane == 0) {
+          pv_tile.start(true);
+        }
       }
 #endif
       const int32_t* selected;
@@ -605,14 +611,19 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
                           + static_cast<size_t>(query_index) * params.output_stride[2];
 #if defined(MLLM_ANDROID_SME_SPARSE_PV)
       if (query_index < sme_end) {
-        if (bitmap_panel_row) {
+        if (deferred_bitmap_row) {
           if (lane == kSparsePvRows - 1
               && !pv_tile.computeBitmap(bitmap_rows, query_index - lane, value_base, output_row - lane * kSparsePvChannels)) {
             return false;
           }
         } else {
-          if (lane == 0) pv_tile.start(retire_panel);
-          pv_tile.addRow(lane, selected, weights, keep);
+          if (bitmap_panel_row) {
+            // Decode already accumulated the active-key mask for this tile.
+            pv_tile.addRow<false>(lane, selected, weights, keep);
+          } else {
+            if (lane == 0) pv_tile.start(retire_panel);
+            pv_tile.addRow(lane, selected, weights, keep);
+          }
           if (lane == kSparsePvRows - 1) pv_tile.compute(value_base, output_row - lane * kSparsePvChannels, retire_panel);
         }
         continue;
@@ -633,6 +644,10 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
     if (retire_panel) {
       std::fprintf(stderr, "[SHADOWNPU_SME_RETIRE_PANEL] key_len=%d matrix_begin=%zu matrices=%zu row_begin=%d tiled_rows=%d\n",
                    params.key_len, matrix_begin, matrix_count, query_row_begin, sme_end - query_row_begin);
+      if (use_bitmap_panel) {
+        std::fprintf(stderr, "[SHADOWNPU_SME_DIRECT_BITMAP_WEIGHTS] key_len=%d matrix_begin=%zu row_begin=%d tiled_rows=%d\n",
+                     params.key_len, matrix_begin, query_row_begin, sme_end - query_row_begin);
+      }
     }
   }
 #endif

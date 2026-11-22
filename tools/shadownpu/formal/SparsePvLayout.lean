@@ -115,6 +115,22 @@ theorem retire_after_last_channel_load (channel : Nat) (inPanel : channel < 128)
     channel / 64 ≤ 1 ∧ (channel / 64 = 1 ↔ 64 ≤ channel) := by
   omega
 
+-- The direct scatter uses the same decoded row masks for the panel and its active keys.
+def activeFromTile (selected : Nat → Nat → Bool) (key : Nat) : Bool :=
+  (List.range 16).any (fun lane => selected key lane)
+
+theorem selected_lane_is_active (selected : Nat → Nat → Bool) (key lane : Nat)
+    (inTile : lane < 16) (written : selected key lane = true) : activeFromTile selected key = true := by
+  apply List.any_eq_true.mpr
+  exact ⟨lane, List.mem_range.mpr inTile, written⟩
+
+theorem direct_scatter_retires (selected : Nat → Nat → Bool) (weight : Nat → Nat → Int)
+    (key lane : Nat) (inTile : lane < 16) :
+    retiredPanel (activeFromTile selected) (scatteredPanel selected weight) key lane = 0 := by
+  cases written : selected key lane with
+  | false => cases active : activeFromTile selected key <;> simp [retiredPanel, scatteredPanel, active, written]
+  | true => simp [retiredPanel, selected_lane_is_active selected key lane inTile written]
+
 -- Integer arithmetic describes which contributions may be omitted. Rounding and instructions are outside this model.
 def pv (keys : List Nat) (weight value : Nat → Int) : Int :=
   keys.foldr (fun key acc => weight key * value key + acc) 0
@@ -148,4 +164,5 @@ end ShadowNPU.SparsePvLayout
 #print axioms ShadowNPU.SparsePvLayout.fragment_to_tile_lane
 #print axioms ShadowNPU.SparsePvLayout.retire_restores_zero_panel
 #print axioms ShadowNPU.SparsePvLayout.retire_after_last_channel_load
+#print axioms ShadowNPU.SparsePvLayout.direct_scatter_retires
 #print axioms ShadowNPU.SparsePvLayout.zero_weight_filter
