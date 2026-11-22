@@ -424,10 +424,13 @@ private:
         std::size_t count = 0;
     };
 
-    // View of one in-flight all-head long RPC.  The DSP publishes each
-    // ready word after flushing the corresponding score matrix or compact
-    // index list. The CPU reads rpcmem after an acquire load. The view stays
-    // valid for the duration of the callback.
+    using DecodeTopKBitmapRowsFn = int (*)(
+        const void *, std::size_t, std::int32_t, std::int32_t,
+        std::int32_t, std::int32_t, const std::int32_t *, std::int32_t *, std::size_t);
+
+    // View of one in-flight all-head long RPC. The DSP publishes each ready
+    // word after flushing the score matrix or native selection payload. The
+    // CPU reads rpcmem after an acquire load and only during the callback.
     struct DirectScoreStream {
         volatile std::int32_t *ready = nullptr;
         std::size_t ready_stride = 0;
@@ -436,6 +439,7 @@ private:
         std::size_t score_row_stride = 0;
         const std::uint16_t *indices = nullptr;
         std::size_t index_head_stride = 0;
+        DecodeTopKBitmapRowsFn decode_bitmap = nullptr;
         const std::size_t *matrices = nullptr;
         std::size_t count = 0;
     };
@@ -735,6 +739,8 @@ private:
         ExecuteCpuPackedPerHeadHnFn execute_cpu_packed_per_head_hn = nullptr;
         ExecuteCpuPackedSharedKeyHnFn execute_cpu_packed_shared_key_hn = nullptr;
         ExecuteCpuPackedSharedKeyTopKHnFn execute_cpu_packed_shared_key_topk_hn = nullptr;
+        ExecuteCpuPackedSharedKeyTopKHnFn execute_cpu_packed_shared_key_bitmap_hn = nullptr;
+        DecodeTopKBitmapRowsFn decode_topk_bitmap_rows = nullptr;
         PrepareRawKeyFn prepare_raw_key = nullptr;
         PrepareRawKeyScaledFn prepare_raw_key_scaled = nullptr;
         ExecuteRawHnFn execute_raw_hn = nullptr;
@@ -3036,13 +3042,23 @@ private:
                                 const char *value = std::getenv("MLLM_HMX_INT8_NATIVE_TOPK");
                                 return value != nullptr && std::strcmp(value, "1") == 0;
                             }();
+                            static const bool native_bitmap_enabled = [] {
+                                const char *value = std::getenv("MLLM_HMX_INT8_NATIVE_BITMAP");
+                                return value != nullptr && std::strcmp(value, "1") == 0;
+                            }();
+                            const bool native_bitmap = native_bitmap_enabled
+                                && bucket.execute_cpu_packed_shared_key_bitmap_hn != nullptr
+                                && bucket.decode_topk_bitmap_rows != nullptr;
+                            const auto execute_native = native_bitmap
+                                ? bucket.execute_cpu_packed_shared_key_bitmap_hn
+                                : bucket.execute_cpu_packed_shared_key_topk_hn;
                             const std::size_t index_head_stride =
                                 static_cast<std::size_t>(bucket.info.n) * bucket.info.k;
                             std::array<const std::int32_t *, 16> native_row_offsets{};
                             const std::uint16_t *native_indices = nullptr;
                             if (native_topk_enabled && key_sources && long_rpc_pipeline
                                 && on_direct_stream && ready_stride == kLongRpcReadyStride
-                                && bucket.execute_cpu_packed_shared_key_topk_hn != nullptr
+                                && execute_native != nullptr
                                 && bucket.raw_key_data != nullptr && bucket.info.m == 512
                                 && bucket.info.n % 32 == 0 && bucket.info.k % 32 == 0
                                 && query_begin == 0 && request.query_len == bucket.info.m
@@ -3056,7 +3072,7 @@ private:
                                 for (std::size_t local = 0; local < count && fits; ++local) {
                                     const auto *offsets = rowOffsetsForMatrix(request, group[local]);
                                     native_row_offsets[local] = offsets;
-                                    fits = static_cast<std::size_t>(offsets[request.query_len])
+                                    fits = native_bitmap || static_cast<std::size_t>(offsets[request.query_len])
                                         <= index_head_stride - offset_bytes / sizeof(std::uint16_t);
                                 }
                                 if (fits) native_indices = bucket.raw_key_data(context);
@@ -3149,7 +3165,7 @@ private:
                             const auto execute_cpu_packed = [&]() {
                                 const auto heads = static_cast<std::int32_t>(count);
                                 if (native_indices != nullptr) {
-                                    return bucket.execute_cpu_packed_shared_key_topk_hn(
+                                    return execute_native(
                                         context, heads, actual_n, per_head_requant_scales.data(),
                                         *key_sources, native_row_offsets.data(), request.key_len);
                                 }
@@ -3208,10 +3224,17 @@ private:
                                                     actual_n);
                                             stream.indices = native_indices;
                                             stream.index_head_stride = index_head_stride;
+                                            stream.decode_bitmap = native_bitmap && native_indices != nullptr
+                                                ? bucket.decode_topk_bitmap_rows : nullptr;
                                             if (native_indices != nullptr && profile_enabled) {
                                                 std::fprintf(stderr,
                                                     "[HMX_INT8_NATIVE_TOPK] layer=%d key_len=%d heads=%zu\n",
                                                     request.layer_id, request.key_len, count);
+                                                if (stream.decode_bitmap != nullptr) {
+                                                    std::fprintf(stderr,
+                                                        "[HMX_INT8_NATIVE_BITMAP] layer=%d key_len=%d heads=%zu\n",
+                                                        request.layer_id, request.key_len, count);
+                                                }
                                             }
                                             stream.matrices = group;
                                             stream.count = count;
@@ -4837,7 +4860,9 @@ private:
         const Request &request, const ValidatedRequest &validated,
         std::size_t matrix, const std::int8_t *source,
         std::size_t source_row_stride, std::size_t worker,
-        std::size_t worker_count, const std::uint16_t *indices = nullptr) noexcept {
+        std::size_t worker_count, const std::uint16_t *indices = nullptr,
+        DecodeTopKBitmapRowsFn decode_bitmap = nullptr,
+        std::size_t index_head_stride = 0) noexcept {
         if (matrix >= validated.matrix_count || source == nullptr
             || (indices == nullptr
                 && source_row_stride < static_cast<std::size_t>(request.key_len))
@@ -4863,6 +4888,12 @@ private:
         std::int32_t *destination = request.topk_indices
             + matrix * validated.topk_head_stride;
         if (indices != nullptr) {
+            if (decode_bitmap != nullptr) {
+                return decode_bitmap(indices, index_head_stride * sizeof(*indices),
+                    request.query_len, request.key_len,
+                    static_cast<std::int32_t>(row_begin), static_cast<std::int32_t>(row_end),
+                    offsets, destination, validated.topk_head_stride) == 0;
+            }
             const std::size_t first = offsets[row_begin];
             const std::size_t last = offsets[row_end];
             std::copy(indices + first, indices + last, destination + first);
@@ -5597,7 +5628,8 @@ private:
                             + local * stream->score_head_stride,
                         stream->score_row_stride, worker, worker_count,
                         stream->indices == nullptr ? nullptr
-                            : stream->indices + local * stream->index_head_stride)) {
+                            : stream->indices + local * stream->index_head_stride,
+                        stream->decode_bitmap, stream->index_head_stride)) {
                     report_topk_error(
                         "direct cooperative rpcmem INT8 Top-k failed for "
                         "head " + std::to_string(matrix));
@@ -6348,6 +6380,14 @@ private:
                     bucket.library,
                     "hmx_qk_i8_operator_execute_cpu_packed_shared_key_topk_hn",
                     bucket.execute_cpu_packed_shared_key_topk_hn);
+                (void)loadOptionalSymbolFrom(
+                    bucket.library,
+                    "hmx_qk_i8_operator_execute_cpu_packed_shared_key_bitmap_hn",
+                    bucket.execute_cpu_packed_shared_key_bitmap_hn);
+                (void)loadOptionalSymbolFrom(
+                    bucket.library,
+                    "hmx_qk_i8_operator_decode_topk_bitmap_rows",
+                    bucket.decode_topk_bitmap_rows);
                 (void)loadOptionalSymbolFrom(
                     bucket.library,
                     "hmx_qk_i8_operator_prepare_raw_key_scaled_hn",

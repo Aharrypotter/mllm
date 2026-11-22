@@ -1,6 +1,8 @@
 #ifndef HMX_QK_I8_OPERATOR_H
 #define HMX_QK_I8_OPERATOR_H
 
+#include <stddef.h>
+
 #include "hmx_i8_common.h"
 #include "hmx_i8_dsp_timing.h"
 
@@ -209,6 +211,15 @@ HMX_I8_API int hmx_qk_i8_operator_execute_cpu_packed_shared_key_topk_hn(
     hmx_i8_context *context, int32_t heads, int32_t n,
     const float *requant_scales, uint64_t key_sources,
     const int32_t *const *row_offsets, int32_t valid_columns);
+/* Variant of the native Top-k ABI that publishes four uint32 masks per tile. */
+HMX_I8_API int hmx_qk_i8_operator_execute_cpu_packed_shared_key_bitmap_hn(
+    hmx_i8_context *context, int32_t heads, int32_t n,
+    const float *requant_scales, uint64_t key_sources,
+    const int32_t *const *row_offsets, int32_t valid_columns);
+HMX_I8_API int hmx_qk_i8_operator_decode_topk_bitmap_rows(
+    const void *bitmap, size_t bitmap_bytes, int32_t rows, int32_t valid_columns,
+    int32_t row_begin, int32_t row_end, const int32_t *offsets,
+    int32_t *indices, size_t index_capacity);
 HMX_I8_API int hmx_qk_i8_operator_begin(
     hmx_i8_context *context,
     int32_t n);

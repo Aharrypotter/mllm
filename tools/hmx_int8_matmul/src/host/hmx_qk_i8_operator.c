@@ -1,4 +1,5 @@
 #include "hmx_qk_i8_operator.h"
+#include "hmx_i8_topk_bitmap_decode.h"
 
 #include "hmx_i8_fixed.h"
 
@@ -75,6 +76,10 @@ int hmx_i8_execute_qk_i8_cpu_packed_shared_key(
     hmx_i8_context *context, int32_t heads, int32_t n,
     const float *requant_scales, uint64_t key_sources);
 int hmx_i8_execute_qk_i8_cpu_packed_shared_key_topk(
+    hmx_i8_context *context, int32_t heads, int32_t n,
+    const float *requant_scales, uint64_t key_sources,
+    const int32_t *const *row_offsets, int32_t valid_columns);
+int hmx_i8_execute_qk_i8_cpu_packed_shared_key_bitmap(
     hmx_i8_context *context, int32_t heads, int32_t n,
     const float *requant_scales, uint64_t key_sources,
     const int32_t *const *row_offsets, int32_t valid_columns);
@@ -270,6 +275,23 @@ int hmx_qk_i8_operator_execute_cpu_packed_shared_key_topk_hn(
     const int32_t *const *row_offsets, int32_t valid_columns) {
     return hmx_i8_execute_qk_i8_cpu_packed_shared_key_topk(
         context, heads, n, requant_scales, key_sources, row_offsets, valid_columns);
+}
+
+int hmx_qk_i8_operator_execute_cpu_packed_shared_key_bitmap_hn(
+    hmx_i8_context *context, int32_t heads, int32_t n,
+    const float *requant_scales, uint64_t key_sources,
+    const int32_t *const *row_offsets, int32_t valid_columns) {
+    return hmx_i8_execute_qk_i8_cpu_packed_shared_key_bitmap(
+        context, heads, n, requant_scales, key_sources, row_offsets, valid_columns);
+}
+
+int hmx_qk_i8_operator_decode_topk_bitmap_rows(
+    const void *bitmap, size_t bitmap_bytes, int32_t rows, int32_t valid_columns,
+    int32_t row_begin, int32_t row_end, const int32_t *offsets,
+    int32_t *indices, size_t index_capacity) {
+    return hmx_i8_decode_topk_bitmap_rows(bitmap, bitmap_bytes, rows, valid_columns,
+               row_begin, row_end, offsets, indices, index_capacity) == 0
+        ? HMX_I8_OK : HMX_I8_INVALID_ARGUMENT;
 }
 
 int hmx_qk_i8_operator_begin(hmx_i8_context *context, int32_t n) {

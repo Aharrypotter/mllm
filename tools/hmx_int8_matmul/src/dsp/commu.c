@@ -1397,6 +1397,7 @@ struct hmx_cpu_packed_score_publication {
     size_t index_stride;
     int32 padded_columns;
     int32 valid_columns;
+    size_t bitmap_words;
     hmx_native_topk_job pending;
     int pending_active;
 };
@@ -1421,13 +1422,22 @@ static void rank_cpu_packed_heads(
         qurt_mem_cache_clean((qurt_addr_t)offsets,
             (HMX_FIXED_M_PADDED + 1) * sizeof(*offsets),
             QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
-        job->status[lane] = hmx_i8_hvx_topk_native(
-            scores, HMX_FIXED_M_PADDED, publication->padded_columns,
-            publication->valid_columns, offsets, (uint16_t *)slab,
-            job->offset_start / sizeof(uint16_t));
-        if (job->status[lane] != 0) return;
-        job->index_bytes[head] =
-            (size_t)offsets[HMX_FIXED_M_PADDED] * sizeof(uint16_t);
+        if (publication->bitmap_words != 0) {
+            job->status[lane] = hmx_i8_hvx_topk_bitmap(
+                scores, HMX_FIXED_M_PADDED, publication->padded_columns,
+                publication->valid_columns, offsets, (uint32_t *)slab,
+                job->offset_start / sizeof(uint32_t));
+            if (job->status[lane] != 0) return;
+            job->index_bytes[head] = publication->bitmap_words * sizeof(uint32_t);
+        } else {
+            job->status[lane] = hmx_i8_hvx_topk_native(
+                scores, HMX_FIXED_M_PADDED, publication->padded_columns,
+                publication->valid_columns, offsets, (uint16_t *)slab,
+                job->offset_start / sizeof(uint16_t));
+            if (job->status[lane] != 0) return;
+            job->index_bytes[head] =
+                (size_t)offsets[HMX_FIXED_M_PADDED] * sizeof(uint16_t);
+        }
         if (publish_per_head) {
             job->flush_ticks[lane] += flush_native_topk_head(job, head);
             publish_cpu_packed_ready(publication->ready, head, head + 1);
@@ -1511,13 +1521,15 @@ static AEEResult execute_qk_i8_cpu_packed(
     int shared_key,
     uint64_t key_sources,
     int32 index_arena_offset,
-    int32 valid_columns) {
+    int32 valid_columns,
+    int emit_bitmap) {
     const int native_topk = index_arena_offset >= 0;
     if (buffer_fd < 0 || query_offset < 0 || key_offset < 0 ||
         key_sums_offset < 0 || output_offset < 0 || scales_offset < 0 ||
         ready_offset < 0 || heads <= 0 || heads > HMX_FIXED_HEADS ||
         n <= 0 || n > HMX_FIXED_N_PADDED || (n % 32) != 0 ||
         (shared_key && !hmx_packed_key_map_valid(key_sources, heads)) ||
+        (emit_bitmap && !native_topk) ||
         (native_topk && (!HMX_I8_VTCM_SHARED_KEY || !shared_key ||
                          HMX_FIXED_M_PADDED != 512 ||
                          heads != HMX_LONG_RPC_READY_GROUP_HEADS ||
@@ -1597,6 +1609,8 @@ static AEEResult execute_qk_i8_cpu_packed(
             .index_stride = (size_t)HMX_FIXED_N_PADDED * HMX_FIXED_K_PADDED
                 * sizeof(uint16_t),
             .padded_columns = n, .valid_columns = valid_columns,
+            .bitmap_words = emit_bitmap
+                ? hmx_i8_topk_bitmap_words(HMX_FIXED_M_PADDED, valid_columns) : 0,
         };
         const uint64_t hmx_begin = HAP_perf_get_qtimer_count();
         status = hmx_i8_kernel_qk_i8_packed_shared_key(
@@ -1743,7 +1757,7 @@ AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_per_head(
     (void)handle;
     return execute_qk_i8_cpu_packed(
         buffer_fd, query_offset, key_offset, key_sums_offset, output_offset,
-        scales_offset, ready_offset, heads, n, 0, 0, -1, 0);
+        scales_offset, ready_offset, heads, n, 0, 0, -1, 0, 0);
 }
 
 AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_shared_key(
@@ -1756,7 +1770,7 @@ AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_shared_key(
         | ((uint64_t)key_sources_high << 32);
     return execute_qk_i8_cpu_packed(
         buffer_fd, query_offset, key_offset, key_sums_offset, output_offset,
-        scales_offset, ready_offset, heads, n, 1, key_sources, -1, 0);
+        scales_offset, ready_offset, heads, n, 1, key_sources, -1, 0, 0);
 }
 
 AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_shared_key_topk(
@@ -1772,7 +1786,23 @@ AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_shared_key_topk(
     return execute_qk_i8_cpu_packed(
         buffer_fd, query_offset, key_offset, key_sums_offset, output_offset,
         scales_offset, ready_offset, heads, n, 1, key_sources,
-        index_arena_offset, valid_columns);
+        index_arena_offset, valid_columns, 0);
+}
+
+AEEResult hmx_int8_rpc_execute_qk_i8_cpu_packed_shared_key_bitmap(
+    remote_handle64 handle, int32 buffer_fd, int32 query_offset,
+    int32 key_offset, int32 key_sums_offset, int32 output_offset,
+    int32 scales_offset, int32 ready_offset, int32 heads, int32 n,
+    uint32 key_sources_low, uint32 key_sources_high,
+    int32 bitmap_arena_offset, int32 valid_columns) {
+    (void)handle;
+    if (bitmap_arena_offset < 0) return AEE_EBADPARM;
+    const uint64_t key_sources = (uint64_t)key_sources_low
+        | ((uint64_t)key_sources_high << 32);
+    return execute_qk_i8_cpu_packed(
+        buffer_fd, query_offset, key_offset, key_sums_offset, output_offset,
+        scales_offset, ready_offset, heads, n, 1, key_sources,
+        bitmap_arena_offset, valid_columns, 1);
 }
 
 AEEResult hmx_int8_rpc_prepare_qk_i8_raw_key(

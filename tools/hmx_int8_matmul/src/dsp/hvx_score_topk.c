@@ -1,10 +1,12 @@
 #include "dsp/hvx_score_topk.h"
+#include "hmx_i8_packed_topk_layout.h"
 
 #include <hexagon_protos.h>
 #include <hexagon_types.h>
 #include <string.h>
 
-enum { group_rows = 4, tile_cols = 32, bins = 256, bins_per_vector = 8, vector_bytes = 128 };
+enum { group_rows = HMX_I8_TOPK_BITMAP_ROWS, tile_cols = HMX_I8_TOPK_BITMAP_COLS,
+       bins = 256, bins_per_vector = 8, vector_bytes = 128 };
 typedef uint16_t LaneHistograms[bins / bins_per_vector][group_rows][2][bins_per_vector];
 
 extern void hmx_i8_hvx_histogram_tiles(const uint8_t *tiles, unsigned count, LaneHistograms lanes);
@@ -100,8 +102,10 @@ static uint32_t take_equal_prefix(uint32_t equal, int *remaining) {
     return result;
 }
 
-static int emit_four_rows(const uint8_t *block, int first_visible, const int thresholds[group_rows],
-                          int ties[group_rows], const int keep[group_rows], uint16_t *out[group_rows]) {
+static inline __attribute__((always_inline)) int emit_four_rows(
+    const uint8_t *block, int first_visible, const int thresholds[group_rows],
+    int ties[group_rows], const int keep[group_rows], uint16_t *out[group_rows],
+    uint32_t *bitmap, int emit_bitmap) {
     union { HVX_Vector vector; uint8_t bytes[vector_bytes]; } cutoffs;
     for (int lane = 0; lane < group_rows; ++lane)
         memset(cutoffs.bytes + lane * tile_cols, (uint8_t)thresholds[lane], tile_cols);
@@ -114,36 +118,47 @@ static int emit_four_rows(const uint8_t *block, int first_visible, const int thr
         const HVX_Vector equal = pack_predicate(Q6_Q_vcmp_eq_VbVb(scores, cutoffs.vector));
         for (int lane = 0; lane < group_rows; ++lane) {
             const int left = first_visible + lane - column;
-            if (left <= 0) continue;
+            if (left <= 0) {
+                if (emit_bitmap) bitmap[lane] = 0;
+                continue;
+            }
             const uint32_t valid = left >= tile_cols ? UINT32_MAX : UINT32_MAX >> (tile_cols - left);
             uint32_t selected = row_mask(greater, lane) & valid;
             if (ties[lane] > 0) {
                 const uint32_t matching = row_mask(equal, lane) & valid;
                 selected |= take_equal_prefix(matching, &ties[lane]);
             }
-            if (__builtin_popcount(selected) > keep[lane] - emitted[lane]) return -1;
-            while (selected != 0) {
-                const int bit = __builtin_ctz(selected);
-                out[lane][emitted[lane]++] = (uint16_t)(column + bit);
-                selected &= selected - 1;
+            if (emit_bitmap) {
+                emitted[lane] += __builtin_popcount(selected);
+                bitmap[lane] = selected;
+            } else {
+                if (__builtin_popcount(selected) > keep[lane] - emitted[lane]) return -1;
+                while (selected != 0) {
+                    const int bit = __builtin_ctz(selected);
+                    out[lane][emitted[lane]++] = (uint16_t)(column + bit);
+                    selected &= selected - 1;
+                }
             }
         }
+        if (emit_bitmap) bitmap += group_rows;
     }
     for (int lane = 0; lane < group_rows; ++lane)
         if (emitted[lane] != keep[lane] || ties[lane] != 0) return -1;
     return 0;
 }
 
-int hmx_i8_hvx_topk_native(const uint8_t *scores, int rows, int padded_columns,
-                           int valid_columns, const int32_t *offsets,
-                           uint16_t *indices, size_t capacity) {
-    if (scores == NULL || offsets == NULL || indices == NULL ||
+static inline __attribute__((always_inline)) int select_topk(
+    const uint8_t *scores, int rows, int padded_columns, int valid_columns,
+    const int32_t *offsets, uint16_t *indices, uint32_t *bitmap, size_t capacity,
+    int emit_bitmap) {
+    if (scores == NULL || offsets == NULL ||
+        (emit_bitmap ? bitmap == NULL : indices == NULL) ||
         ((uintptr_t)scores & (vector_bytes - 1)) != 0 ||
         rows <= 0 || rows % group_rows != 0 ||
         valid_columns < rows || valid_columns > UINT16_MAX ||
         padded_columns < valid_columns || padded_columns % tile_cols != 0 ||
         offsets[0] != 0 || offsets[rows] <= 0 ||
-        (size_t)offsets[rows] > capacity) {
+        (emit_bitmap ? hmx_i8_topk_bitmap_words(rows, valid_columns) : (size_t)offsets[rows]) > capacity) {
         return -1;
     }
     for (int row = 0; row < rows; ++row) {
@@ -166,16 +181,29 @@ int hmx_i8_hvx_topk_native(const uint8_t *scores, int rows, int padded_columns,
         for (int lane = 0; lane < group_rows; ++lane) {
             const int row = group + lane;
             keep[lane] = offsets[row + 1] - offsets[row];
-            out[lane] = indices + offsets[row];
+            if (!emit_bitmap) out[lane] = indices + offsets[row];
             int remaining = keep[lane];
             const int threshold = select_cutoff(histogram.banks, totals, lane, &remaining);
             if (threshold < -128) return -1;
             thresholds[lane] = threshold;
             ties[lane] = remaining;
         }
-        if (emit_four_rows(block, visible, thresholds, ties, keep, out) != 0) {
+        if (emit_four_rows(block, visible, thresholds, ties, keep, out, bitmap, emit_bitmap) != 0) {
             return -1;
         }
+        if (emit_bitmap) bitmap += hmx_i8_topk_bitmap_group_words(visible);
     }
     return 0;
+}
+
+int hmx_i8_hvx_topk_native(const uint8_t *scores, int rows, int padded_columns,
+                          int valid_columns, const int32_t *offsets,
+                          uint16_t *indices, size_t capacity) {
+    return select_topk(scores, rows, padded_columns, valid_columns, offsets, indices, NULL, capacity, 0);
+}
+
+int hmx_i8_hvx_topk_bitmap(const uint8_t *scores, int rows, int padded_columns,
+                          int valid_columns, const int32_t *offsets,
+                          uint32_t *bitmap, size_t capacity_words) {
+    return select_topk(scores, rows, padded_columns, valid_columns, offsets, NULL, bitmap, capacity_words, 1);
 }
