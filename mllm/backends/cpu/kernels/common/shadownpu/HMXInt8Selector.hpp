@@ -5835,10 +5835,17 @@ private:
                             ++consumed;
                             continue;
                         }
-                        if (cancelled.load(std::memory_order_acquire)
-                            || (topk_done.load(std::memory_order_acquire)
-                                && consumed == available)) {
+                        if (cancelled.load(std::memory_order_acquire)) {
                             break;
+                        }
+                        if (topk_done.load(std::memory_order_acquire)) {
+                            // The producer can publish its final head between
+                            // our first progress load and the completion load.
+                            if (consumed == topk_published.value.load(
+                                                std::memory_order_acquire)) {
+                                break;
+                            }
+                            continue;
                         }
                         pipelineStreamingPause();
                     }
