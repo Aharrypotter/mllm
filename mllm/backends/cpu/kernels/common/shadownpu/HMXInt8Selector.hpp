@@ -8,6 +8,7 @@
 #include "HmxTopKBitmap.hpp"
 #include "INT8TopK.hpp"
 #include "PipelineTaskExecutor.hpp"
+#include "mllm/backends/cpu/kernels/arm/SparsePVSme.hpp"
 
 #include <algorithm>
 #include <array>
@@ -5496,6 +5497,20 @@ private:
         std::string sparse_error;
         std::string sparse_assist_error;
 
+#if defined(MLLM_ANDROID_SME_SPARSE_PV)
+        const bool use_shared_chunks = useSparsePvSharedValues()
+            && !useSparsePvRetiringPanel()
+            && !sparsePvOption("MLLM_HMX_INT8_NATIVE_BITMAP")
+            && request.query_len >= 2 * kSparsePvSharedRows
+            && request.query_len % kSparsePvSharedRows == 0
+            && request.key_len > 0
+            && static_cast<uint32_t>(request.key_len - 1) <= kSparsePvSharedKeyMask;
+        const int assist_tile_rows = use_shared_chunks ? kSparsePvSharedRows : kSparsePvRows;
+        const bool aligned_assist = sparse_assist && useSparsePvAlignedAssist()
+            && useSparsePvOrderedKeys() && request.head_dim == kSparsePvChannels
+            && request.query_len >= 2 * kSparsePvRows
+            && request.query_len % kSparsePvRows == 0 && useSparsePvSme();
+#endif
         std::vector<int> sparse_assist_row_begin(
             validated.matrix_count, request.query_len);
         if (sparse_assist) {
@@ -5526,6 +5541,28 @@ private:
                     tail_cost += static_cast<std::uint64_t>(
                         request.head_dim + 64);
                 }
+#if defined(MLLM_ANDROID_SME_SPARSE_PV)
+                if (aligned_assist && row_begin % assist_tile_rows != 0) {
+                    // Round to the interior tile boundary with the closest
+                    // estimated suffix cost. Both workers then receive complete
+                    // query tiles and keep their current order within each row.
+                    const int below = row_begin / assist_tile_rows * assist_tile_rows;
+                    const int above = below + assist_tile_rows;
+                    if (below == 0 || above == request.query_len) {
+                        row_begin = below == 0 ? above : below;
+                    } else {
+                        const auto cost_error = [&](int split) {
+                            const auto keep = static_cast<std::uint64_t>(
+                                offsets[request.query_len] - offsets[split]);
+                            const auto rows = static_cast<std::uint64_t>(request.query_len - split);
+                            const auto cost = keep * static_cast<std::uint64_t>(2 * request.head_dim + 8)
+                                + rows * static_cast<std::uint64_t>(request.head_dim + 64);
+                            return target >= cost ? target - cost : cost - target;
+                        };
+                        row_begin = cost_error(below) <= cost_error(above) ? below : above;
+                    }
+                }
+#endif
                 sparse_assist_row_begin[matrix] = row_begin;
             }
         }
@@ -5979,6 +6016,10 @@ private:
                       << " topk_workers=" << topk_worker_count
                       << " sparse_assist_percent="
                       << sparse_assist_percent
+#if defined(MLLM_ANDROID_SME_SPARSE_PV)
+                      << " sparse_assist_tile_aligned=" << (aligned_assist ? 1 : 0)
+                      << " sparse_assist_tile_rows=" << (aligned_assist ? assist_tile_rows : 0)
+#endif
                       << " sparse_assist_lane="
                       << (dedicated_sparse_assist
                               ? "persistent-sparse-worker"

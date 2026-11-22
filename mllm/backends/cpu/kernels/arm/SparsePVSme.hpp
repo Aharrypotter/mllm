@@ -57,6 +57,11 @@ inline bool useSparsePvOrderedKeys() noexcept {
   return enabled;
 }
 
+inline bool useSparsePvAlignedAssist() noexcept {
+  static const bool enabled = sparsePvOption("MLLM_HMX_SME_PV_ALIGN_ASSIST");
+  return enabled;
+}
+
 inline bool useSparsePvSharedValues() noexcept {
   static const bool enabled = sparsePvOption("MLLM_HMX_SME_PV_SHARED_VALUES");
   return enabled;
