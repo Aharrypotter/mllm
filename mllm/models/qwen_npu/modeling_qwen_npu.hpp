@@ -2,7 +2,9 @@
 // Licensed under the MIT License.
 
 #include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -20,6 +22,8 @@
 #include "mllm/nn/layers/Param.hpp"
 #include "mllm/utils/Common.hpp"
 #include "mllm/models/ARGeneration.hpp"
+#include "mllm/models/qwen_npu/QnnAttentionLayout.hpp"
+#include "mllm/models/qwen_npu/ShadowNPUAttentionQuantization.hpp"
 #include "configuration_qwen_npu.hpp"
 
 namespace mllm::models::qwen_npu {
@@ -31,39 +35,147 @@ inline auto makeRoPEInvFreq(int output_dim, float rope_theta) -> Tensor {
   return inv_freq;
 }
 
-inline auto stageHmxPrefillKV(Tensor states) -> Tensor {
+inline Tensor qwenQnnProjectionCpuInput(Tensor projection, bool use_host_view, size_t& aliased_bytes) {
+  if (!use_host_view || projection.device() != kQNN || projection.dtype() != kFloat32 || !projection.isContiguous()
+      || projection.impl()->storageOffset() != 0) {
+    return projection.to(kCPU);
+  }
+  auto source = projection.impl()->storage();
+  const auto bytes = projection.bytes();
+  if (source->mem_type_ != kNormal || !source->ptr_ || source->size_ < bytes) { return projection.to(kCPU); }
+
+  // graphExecute has completed before the decoder receives these logical QKV outputs.
+  // Both storage objects must outlive any derived CPU views, which share this control block.
+  struct HostViewStorage {
+    TensorViewImpl::storage_t source;
+    TensorViewImpl::storage_t host;
+  };
+  const auto shape = projection.shape();
+  auto host = TensorStorage::create(shape, kFloat32, kCPU);
+  host->mem_type_ = kManual;
+  host->ptr_ = source->ptr_;
+  auto owners = std::make_shared<HostViewStorage>(HostViewStorage{std::move(source), host});
+  TensorViewImpl::storage_t retained(std::move(owners), host.get());
+  aliased_bytes += bytes;
+  return Tensor(TensorViewImpl::create(shape, retained));
+}
+
 #if defined(MLLM_HOST_ARCH_ARM64)
-  static const bool direct_cast = [] {
+inline bool hmxDirectKVCastEnabled() {
+  static const bool enabled = [] {
     const char* value = std::getenv("MLLM_HMX_DIRECT_KV_CAST");
     return value && value[0] == '1' && value[1] == '\0';
   }();
-  if (direct_cast && !Context::instance().thisThread()->trace_mode && states.device() == kCPU
-      && states.dtype() == kFloat32 && !states.isContiguous()) {
-    const auto shape = states.shape();
+  return enabled;
+}
+
+inline bool supportsDirectHmxKVStage(const Tensor& states) {
+  const auto shape = states.shape();
+  if (states.device() != kCPU || states.dtype() != kFloat32 || shape.size() != 4 || shape[0] != 1 || shape[1] <= 0
+      || shape[2] <= 0 || shape[3] <= 0) {
+    return false;
+  }
+  const auto stride = states.stride();
+  const int64_t head_elements = static_cast<int64_t>(shape[2]) * shape[3];
+  return stride[3] == 1 && stride[2] == shape[3] && stride[1] >= head_elements
+         && head_elements <= std::numeric_limits<int>::max();
+}
+
+inline void reportHmxDirectKVStage(int32_t head_stride, int64_t live_head_elements, int64_t query_heads) {
+  static std::once_flag log_first_cast;
+  std::call_once(log_first_cast, [&] {
+    MLLM_INFO("SHADOWNPU_HMX_DIRECT_KV_CAST head_stride={} live_head_elements={} heads={}", head_stride,
+              live_head_elements, query_heads);
+  });
+}
+
+// The shared CPU-decode cache remains Float32. This staging buffer keeps only
+// the native KV heads in Float16, with a stable head stride across prefill chunks.
+class IncrementalHmxKVStage {
+ public:
+  Tensor stage(const Tensor& states, int head_group_size, int new_tokens) {
+    auto shape = states.shape();
     const auto stride = states.stride();
-    if (shape.size() == 4 && shape[0] == 1 && shape[1] > 0 && shape[2] > 0 && shape[3] > 0
-        && stride[3] == 1 && stride[2] == shape[3]) {
-      const int64_t head_elements = static_cast<int64_t>(shape[2]) * shape[3];
-      if (head_elements <= std::numeric_limits<int>::max() && stride[1] >= head_elements) {
-        auto staged = Tensor::empty(shape, kFloat16, kCPU).alloc();
-        const auto* input = states.ptr<mllm_fp32_t>();
-        auto* output = staged.ptr<mllm_fp16_t>();
-        for (int64_t head = 0; head < shape[1]; ++head) {
-          cpu::arm::fp32_2_fp16(input + head * stride[1], output + head * head_elements,
-                                static_cast<int>(head_elements), 1);
-        }
-        static std::once_flag log_first_cast;
-        std::call_once(log_first_cast, [&] {
-          MLLM_INFO("SHADOWNPU_HMX_DIRECT_KV_CAST head_stride={} live_head_elements={} heads={}", stride[1],
-                    head_elements, shape[1]);
-        });
-        return staged;
-      }
+    const int32_t live_tokens = shape[2];
+    const int32_t head_dim = shape[3];
+    const int32_t head_capacity = stride[1] / head_dim;
+    shape[1] /= head_group_size;
+    shape[2] = head_capacity;
+
+    if (staged_.isNil() || staged_.shape() != shape) {
+      staged_ = Tensor::empty(shape, kFloat16, kCPU).alloc();
+      staged_tokens_ = 0;
     }
+    const auto source = states.impl()->storage();
+    const auto* input = states.ptr<mllm_fp32_t>();
+    const int32_t append_at = live_tokens - new_tokens;
+    const bool append = append_at > 0 && staged_tokens_ == append_at && source_.lock() == source
+                        && source_data_ == input && source_head_stride_ == stride[1];
+    const int32_t begin = append ? append_at : 0;
+    const int64_t element_offset = static_cast<int64_t>(begin) * head_dim;
+    const int elements = (live_tokens - begin) * head_dim;
+    auto* output = staged_.ptr<mllm_fp16_t>();
+    for (int64_t head = 0; head < shape[1]; ++head) {
+      cpu::arm::fp32_2_fp16(input + head * head_group_size * stride[1] + element_offset,
+                           output + head * head_capacity * head_dim + element_offset, elements, 1);
+    }
+    reportHmxDirectKVStage(stride[1], static_cast<int64_t>(live_tokens) * head_dim, states.shape()[1]);
+    if (append) {
+      static std::once_flag log_first_append;
+      std::call_once(log_first_append, [&] {
+        MLLM_INFO("SHADOWNPU_HMX_INCREMENTAL_KV_STAGE kv_heads={} capacity={} prefix={} appended={}", shape[1],
+                  head_capacity, append_at, new_tokens);
+      });
+    }
+    staged_tokens_ = live_tokens;
+    source_ = source;
+    source_data_ = input;
+    source_head_stride_ = stride[1];
+    return staged_[{kAll, kAll, {kAll, live_tokens}, kAll}];
+  }
+
+  void invalidate() { staged_tokens_ = 0; }
+
+ private:
+  Tensor staged_;
+  std::weak_ptr<TensorStorage> source_;
+  const mllm_fp32_t* source_data_ = nullptr;
+  int32_t source_head_stride_ = 0;
+  int32_t staged_tokens_ = 0;
+};
+#endif
+
+inline auto stageHmxPrefillKV(Tensor states, int head_group_size = 1) -> Tensor {
+#if defined(MLLM_HOST_ARCH_ARM64)
+  if (hmxDirectKVCastEnabled() && !Context::instance().thisThread()->trace_mode
+      && (head_group_size > 1 || !states.isContiguous()) && supportsDirectHmxKVStage(states)) {
+    auto shape = states.shape();
+    const auto stride = states.stride();
+    const int64_t head_elements = static_cast<int64_t>(shape[2]) * shape[3];
+    const int64_t repeated_heads = shape[1];
+    MLLM_RT_ASSERT(head_group_size > 0 && repeated_heads % head_group_size == 0);
+    shape[1] /= head_group_size;
+    auto staged = Tensor::empty(shape, kFloat16, kCPU).alloc();
+    const auto* input = states.ptr<mllm_fp32_t>();
+    auto* output = staged.ptr<mllm_fp16_t>();
+    for (int64_t head = 0; head < shape[1]; ++head) {
+      const int64_t source_head = head * head_group_size;
+      cpu::arm::fp32_2_fp16(input + source_head * stride[1], output + head * head_elements,
+                           static_cast<int>(head_elements), 1);
+    }
+    reportHmxDirectKVStage(stride[1], head_elements, repeated_heads);
+    if (head_group_size > 1) {
+      static std::once_flag log_first_compact_cast;
+      std::call_once(log_first_compact_cast, [&] {
+        MLLM_INFO("SHADOWNPU_HMX_COMPACT_KV_STAGE query_heads={} kv_heads={} group_size={}", repeated_heads, shape[1],
+                  head_group_size);
+      });
+    }
+    return staged;
   }
 #endif
-  // The live BHSD view can retain the full-capacity head stride. The normal
-  // cast expects contiguous data, including each physically repeated GQA head.
+  MLLM_RT_ASSERT(head_group_size == 1);
+  // The live BHSD view can retain the full-capacity head stride.
   return states.contiguous().to(kFloat16);
 }
 
@@ -275,6 +387,10 @@ class QwenAttentionMatmul final : public nn::Module {
   bool use_sparse_prefill_attention_ = false;
   bool use_pattern_sparse_prefill_attention_ = false;
   bool use_hmx_key_staging_ = false;
+#if defined(MLLM_HOST_ARCH_ARM64)
+  IncrementalHmxKVStage hmx_prefill_keys_;
+  IncrementalHmxKVStage hmx_prefill_values_;
+#endif
 
  public:
   QwenAttentionMatmul() = default;
@@ -335,6 +451,12 @@ class QwenAttentionMatmul final : public nn::Module {
 
     int B = inputs[0].shape()[0];
     int S = inputs[0].shape()[2];
+#if defined(MLLM_HOST_ARCH_ARM64)
+    if (S <= 1) {
+      hmx_prefill_keys_.invalidate();
+      hmx_prefill_values_.invalidate();
+    }
+#endif
 
     query_states = q_rope_(query_states, llm_embedding_sin, llm_embedding_cos);
     key_states = k_rope_(key_states, llm_embedding_sin, llm_embedding_cos);
@@ -348,8 +470,38 @@ class QwenAttentionMatmul final : public nn::Module {
     if (use_sparse_prefill_attention_ && S > 1) {
       if (use_pattern_sparse_prefill_attention_) {
         if (use_hmx_key_staging_) {
-          const auto sparse_key_states = stageHmxPrefillKV(key_states);
-          const auto sparse_value_states = stageHmxPrefillKV(value_states);
+          int kv_head_group_size = 1;
+          Tensor sparse_key_states, sparse_value_states;
+#if defined(MLLM_HOST_ARCH_ARM64)
+          static const bool compact_kv_stage = [] {
+            const char* value = std::getenv("MLLM_HMX_COMPACT_KV_STAGE");
+            return value && value[0] == '1' && value[1] == '\0';
+          }();
+          // StaticCache stores replicas of each KV head consecutively. Both
+          // sparse attention and the HMX selector already map query heads to KV heads.
+          if (compact_kv_stage && num_key_value_groups_ > 1 && hmxDirectKVCastEnabled()
+              && !Context::instance().thisThread()->trace_mode && supportsDirectHmxKVStage(key_states)
+              && supportsDirectHmxKVStage(value_states) && key_states.shape()[1] == num_attention_heads_
+              && value_states.shape()[1] == num_attention_heads_) {
+            kv_head_group_size = num_key_value_groups_;
+          }
+          static const bool incremental_kv_stage = [] {
+            const char* value = std::getenv("MLLM_HMX_INCREMENTAL_KV_STAGE");
+            return value && value[0] == '1' && value[1] == '\0';
+          }();
+          if (incremental_kv_stage && kv_head_group_size > 1 && kv_cache_.getStaticCache() != nullptr) {
+            sparse_key_states = hmx_prefill_keys_.stage(key_states, kv_head_group_size, S);
+            sparse_value_states = hmx_prefill_values_.stage(value_states, kv_head_group_size, S);
+          } else
+#endif
+          {
+#if defined(MLLM_HOST_ARCH_ARM64)
+            hmx_prefill_keys_.invalidate();
+            hmx_prefill_values_.invalidate();
+#endif
+            sparse_key_states = stageHmxPrefillKV(key_states, kv_head_group_size);
+            sparse_value_states = stageHmxPrefillKV(value_states, kv_head_group_size);
+          }
           output =
               pattern_sparse_attention_(query_states.to(kFloat32), sparse_key_states, sparse_value_states, sparse_key_states);
         } else {
@@ -379,6 +531,10 @@ class QwenAttentionMatmul final : public nn::Module {
       output = nn::functional::matmul(attn, value_states.to(attn.dtype()));
     }
     // [B, H, S, D] -> [B, S, H, D] -> [B, S, H * D]
+    if (!args.empty() && args[0].get<bool>() && output.device() == kCPU && output.dtype() == kFloat32
+        && output.isContiguous()) {
+      return {output};
+    }
     output = output.transpose(1, 2).view({B, S, num_attention_heads_ * head_dim_});
 
     return {output};
@@ -403,9 +559,10 @@ class QwenOutProjAndMLP final : public nn::Module {
 
   int hidden_size_, intermediate_size_;
   bool shadow_down_proj_ = false;
+  bool shadow_activation_fp16_ = false;
+  bool shadow_int8_input_ = false;
   bool spatial_down_proj_tokens_ = false;
   bool spatial_mlp_tokens_ = false;
-  bool quantize_mlp_before_spatial_view_ = false;
 
  public:
   QwenOutProjAndMLP() = default;
@@ -413,9 +570,10 @@ class QwenOutProjAndMLP final : public nn::Module {
     hidden_size_ = cfg.hidden_size;
     intermediate_size_ = cfg.intermediate_size;
     shadow_down_proj_ = shadow_down_proj;
+    shadow_activation_fp16_ = shadow_down_proj && cfg.qnn_shadow_activation_fp16;
+    shadow_int8_input_ = shadow_down_proj && cfg.qnn_shadow_int8_input;
     spatial_down_proj_tokens_ = cfg.qnn_down_proj_spatial_tiles;
-    spatial_mlp_tokens_ = shadow_down_proj_ ? cfg.qnn_mlp_spatial_shadow_tiles : cfg.qnn_mlp_spatial_tiles;
-    quantize_mlp_before_spatial_view_ = cfg.qnn_mlp_quantize_before_spatial_view;
+    spatial_mlp_tokens_ = cfg.qnn_mlp_spatial_tiles && !shadow_down_proj_;
 
     o_proj_ = reg<nn::Linear>("self_attn.o_proj",
                               aops::LinearOpOptions{.in_channels = cfg.hidden_size,
@@ -449,6 +607,73 @@ class QwenOutProjAndMLP final : public nn::Module {
         reg<nn::Param>("down_proj_quantize_scale_", getModuleName() + ".mlp.down_proj.input_scale", Tensor::shape_t{1});
   }
 
+  Tensor prepareAttentionInput(Tensor attention) {
+    const auto shape = attention.shape();
+    const bool head_major = shape.size() == 4;
+    if (!head_major && !shadow_int8_input_) { return attention.to(kQNN); }
+
+    MLLM_RT_ASSERT_EQ(attention.device(), kCPU);
+    MLLM_RT_ASSERT_EQ(attention.dtype(), kFloat32);
+    auto input_shape = shape;
+    if (head_major) {
+      MLLM_RT_ASSERT(attention.isContiguous());
+      MLLM_RT_ASSERT_EQ(shape[1] * shape[3], hidden_size_);
+      input_shape = {shape[0], shape[2], hidden_size_};
+      static const bool trace_direct_output = [] {
+        const auto* option = std::getenv("MLLM_QNN_ATTENTION_OUTPUT_DIRECT_TRACE");
+        return option && option[0] == '1' && option[1] == '\0';
+      }();
+      if (trace_direct_output) {
+        MLLM_INFO("QNN_ATTENTION_OUTPUT_DIRECT layer={} int8={} removed_bytes={}", getModuleName(),
+                  static_cast<int>(shadow_int8_input_), attention.bytes() * (shadow_int8_input_ ? 2 : 1));
+      }
+    }
+    if (!shadow_int8_input_) {
+      auto input = Tensor::empty(input_shape, kFloat32, kQNN).alloc();
+      writeQnnAttentionRows(attention.ptr<float>(), input.ptr<float>(), shape[0], shape[1], shape[2], shape[3],
+                            [](const float* source, float* destination, size_t count) {
+                              std::memcpy(destination, source, count * sizeof(float));
+                            });
+      return input;
+    }
+
+    // Match QNNCastTypeOp's range-to-step conversion before exposing codes to QNN.
+    const float step = static_cast<float>(o_proj_quantize_scale_.weight().ptr<float>()[0] / 127.0);
+    MLLM_RT_ASSERT(std::isfinite(step) && step > 0.0F);
+    auto scale = Tensor::empty({1}, kFloat32, kCPU).alloc();
+    scale.ptr<float>()[0] = step;
+    auto input = Tensor::empty(input_shape, kInt8, kQNN);
+    input.attach("qnn_quant_scale", scale.impl());
+    if (!Context::instance().thisThread()->trace_mode) {
+      if (!head_major) { attention = attention.contiguous(); }
+      input.alloc();
+      static const bool round_through_half = [] {
+        const auto* option = std::getenv("MLLM_QNN_SHADOW_INT8_FP16_ROUNDTRIP");
+        return option && option[0] == '1' && option[1] == '\0';
+      }();
+      const auto* values = attention.ptr<float>();
+      auto* codes = input.ptr<int8_t>();
+      const float inverse_step = 1.0F / step;
+      const auto write_codes = [&]<bool RoundThroughHalf>() {
+        const auto write_row = [inverse_step](const float* source, int8_t* destination, size_t count) {
+          quantizeShadowAttentionInt8<RoundThroughHalf>(source, destination, count, inverse_step);
+        };
+        if (head_major) {
+          writeQnnAttentionRows(values, codes, shape[0], shape[1], shape[2], shape[3], write_row);
+        } else {
+          write_row(values, codes, attention.numel());
+        }
+      };
+      // Match the captured QNN Cast codes by rounding the attention values through FP16 when requested.
+      if (round_through_half) {
+        write_codes.template operator()<true>();
+      } else {
+        write_codes.template operator()<false>();
+      }
+    }
+    return input;
+  }
+
   std::vector<Tensor> forward(const std::vector<Tensor>& inputs, const std::vector<AnyValue>& args) override {
     int B = inputs[0].shape()[0];
     int S = inputs[0].shape()[1];
@@ -459,8 +684,12 @@ class QwenOutProjAndMLP final : public nn::Module {
     // [B, S, H * D] ->  [B * S, H * D]
     auto input = inputs[0];
     input = input.view({B, S, 1, hidden_size_});
-    input.attach("qnn_quant_scale", o_proj_quantize_scale_.weight().impl());
-    input = input.to(kInt8);
+    if (shadow_int8_input_) {
+      MLLM_RT_ASSERT_EQ(input.dtype(), kInt8);
+    } else {
+      input.attach("qnn_quant_scale", o_proj_quantize_scale_.weight().impl());
+      input = input.to(kInt8);
+    }
     auto x = o_proj_(input);
     x = x.view({B, S, 1, hidden_size_});
     x = x.to(kFloat32);
@@ -473,21 +702,13 @@ class QwenOutProjAndMLP final : public nn::Module {
     constexpr int spatial_width = 16;
     const bool use_spatial_tiles = S % spatial_width == 0;
     const int mlp_width = spatial_mlp_tokens_ && use_spatial_tiles ? spatial_width : 1;
-    const Tensor::shape_t mlp_shape{B, S / mlp_width, mlp_width, hidden_size_};
-    const bool quantize_before_view = quantize_mlp_before_spatial_view_ && mlp_width != 1;
-    // The QNN quantizer requires rank 4. Keep the token axis flat until the conversion to INT8.
-    x = quantize_before_view ? x.view({B, S, 1, hidden_size_}) : x.view(mlp_shape);
+    x = x.view({B, S / mlp_width, mlp_width, hidden_size_});
     if (mlp_width != 1) {
       MLLM_INFO("QNN_MLP_SPATIAL_LAYOUT module={} shape=[{},{},{},{}]",
                 getModuleName(), B, S / mlp_width, mlp_width, hidden_size_);
     }
     x.attach("qnn_quant_scale", pre_mlp_proj_quantize_scale_.weight().impl());
     x = x.to(kInt8);
-    if (quantize_before_view) {
-      MLLM_INFO("QNN_MLP_INT8_SPATIAL_VIEW module={} shape=[{},{},{},{}]",
-                getModuleName(), B, S / mlp_width, mlp_width, hidden_size_);
-      x = x.view(mlp_shape);
-    }
     auto gate = gate_proj_(x);
     gate = gate.view({B, S / mlp_width, mlp_width, intermediate_size_});
     gate = gate.to(kFloat32);
@@ -499,10 +720,9 @@ class QwenOutProjAndMLP final : public nn::Module {
 
     x = gate * up;
     auto shadow_input = x;
-    if (shadow_down_proj_ && mlp_width != 1) {
-      // Export a separate tensor for CPU correction while the down projection consumes the packed activation.
-      shadow_input = x.view({B, S, 1, intermediate_size_});
-    }
+    // QNN serializes graph outputs in producer order. Emit the shadow
+    // activation before the quantized projection and the residual.
+    if (shadow_activation_fp16_) { shadow_input = shadow_input.to(kFloat16); }
 
     const int token_width = spatial_down_proj_tokens_ && use_spatial_tiles ? spatial_width : mlp_width;
     // The spatial MLP already produces a square activation for the down projection.
@@ -520,7 +740,9 @@ class QwenOutProjAndMLP final : public nn::Module {
     x = x.view({B, S, hidden_size_});
 
     x = x + tmp;
-    if (shadow_down_proj_) { return {shadow_input, quantized_down_proj, x}; }
+    if (shadow_down_proj_) {
+      return {shadow_input, quantized_down_proj, x};
+    }
     return {x};
   }
 };
@@ -562,7 +784,9 @@ class QwenDecoder final : public nn::Module {
     auto out_mlp_states = self_attn_out_mlp_(attention, residual);
     if (shadow_down_proj_) {
       MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 3);
-      return down_proj_shadow_correction_(out_mlp_states[0].to(kCPU).contiguous(), out_mlp_states[1].to(kCPU).contiguous(),
+      auto activation = out_mlp_states[0].to(kCPU).contiguous();
+      if (activation.dtype() == kFloat16) { activation = activation.to(kFloat32); }
+      return down_proj_shadow_correction_(activation, out_mlp_states[1].to(kCPU).contiguous(),
                                           out_mlp_states[2].to(kCPU).contiguous());
     }
     MLLM_RT_ASSERT_EQ(out_mlp_states.size(), 1);
@@ -571,9 +795,23 @@ class QwenDecoder final : public nn::Module {
 
   Tensor attentionFromProjection(std::vector<Tensor> states, const Tensor& sin, const Tensor& cos) {
     captured_debug_boundaries_.clear();
-    auto query_states = states[0].to(kCPU);
-    auto key_states = states[1].to(kCPU);
-    auto value_states = states[2].to(kCPU);
+    static const bool host_view_enabled = [] {
+      const auto* value = std::getenv("MLLM_QNN_QKV_HOST_ALIAS");
+      return value && value[0] == '1' && value[1] == '\0';
+    }();
+    static const bool trace_host_view = [] {
+      const auto* value = std::getenv("MLLM_QNN_QKV_HOST_ALIAS_TRACE");
+      return value && value[0] == '1' && value[1] == '\0';
+    }();
+    const bool use_host_view = host_view_enabled && !Context::instance().thisThread()->trace_mode;
+    size_t aliased_bytes = 0;
+    auto query_states = qwenQnnProjectionCpuInput(states[0], use_host_view, aliased_bytes);
+    auto key_states = qwenQnnProjectionCpuInput(states[1], use_host_view, aliased_bytes);
+    auto value_states = qwenQnnProjectionCpuInput(states[2], use_host_view, aliased_bytes);
+    if (trace_host_view && use_host_view) {
+      MLLM_INFO("QNN_QKV_HOST_ALIAS layer={} bytes={} expected_bytes={}", getModuleName(), aliased_bytes,
+                query_states.bytes() + key_states.bytes() + value_states.bytes());
+    }
 
     if (capture_debug_boundaries_) {
       captured_debug_boundaries_.push_back(query_states.transpose(1, 2).contiguous());
@@ -581,9 +819,16 @@ class QwenDecoder final : public nn::Module {
       captured_debug_boundaries_.push_back(value_states.transpose(1, 2).contiguous());
     }
 
-    auto x = self_attn_matmul_(query_states, key_states, value_states, sin, cos)[0];
+    static const bool direct_output_enabled = [] {
+      const auto* option = std::getenv("MLLM_QNN_ATTENTION_OUTPUT_DIRECT");
+      return option && option[0] == '1' && option[1] == '\0';
+    }();
+    const bool keep_head_major = direct_output_enabled && !capture_debug_boundaries_
+                                 && !Context::instance().thisThread()->trace_mode && query_states.shape()[2] > 1;
+    auto x = keep_head_major ? self_attn_matmul_(query_states, key_states, value_states, sin, cos, AnyValue(true))[0]
+                             : self_attn_matmul_(query_states, key_states, value_states, sin, cos)[0];
     if (capture_debug_boundaries_) { captured_debug_boundaries_.push_back(x.contiguous()); }
-    return x.to(kQNN);
+    return self_attn_out_mlp_.prepareAttentionInput(x);
   }
 
   nn::KVCache& getKVCache() { return self_attn_matmul_.getKVCache(); }
