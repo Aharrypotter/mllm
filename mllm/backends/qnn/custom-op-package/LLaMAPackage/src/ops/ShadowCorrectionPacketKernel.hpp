@@ -25,6 +25,14 @@ static inline uint32_t word_bits(const float *value) {
 }
 
 #if defined(__hexagon__) || defined(__hexagon)
+#if defined(__HEXAGON_ARCH__) && __HEXAGON_ARCH__ >= 81
+static inline bool any_predicate_byte(HVX_VectorPred predicate) {
+  // The last word is the inclusive count of all active predicate bytes.
+  constexpr int last_word_offset = sizeof(HVX_Vector) - sizeof(uint32_t);
+  return Q6_R_vextract_VR(Q6_Vw_prefixsum_Q(predicate), last_word_offset) != 0;
+}
+#endif
+
 static inline uint32_t clipping_mask(const float *values, uint32_t positive, uint32_t negative) {
   // One uniquely weighted bit per word reduces the predicate to a scalar lane mask.
   static const uint32_t lane_bits[vector_width] __attribute__((aligned(128))) = {
@@ -35,12 +43,17 @@ static inline uint32_t clipping_mask(const float *values, uint32_t positive, uin
   };
   HVX_Vector bits, lane_values;
   memcpy(&bits, values, sizeof(bits));
-  memcpy(&lane_values, lane_bits, sizeof(lane_values));
   const HVX_Vector zero = Q6_V_vsplat_R(0);
   const HVX_Vector magnitude = Q6_V_vand_VV(bits, Q6_V_vsplat_R(INT32_MAX));
   const HVX_VectorPred signs = Q6_Q_vcmp_gt_VwVw(zero, bits);
   const HVX_Vector cuts = Q6_V_vmux_QVV(signs, Q6_V_vsplat_R(negative - 1), Q6_V_vsplat_R(positive - 1));
   const HVX_VectorPred exceed = Q6_Q_vcmp_gt_VwVw(magnitude, cuts);
+#if defined(__HEXAGON_ARCH__) && __HEXAGON_ARCH__ >= 81
+  // Most activation vectors contain no clipping entries. Avoid forming the
+  // individual lane bits when the vector contributes nothing to the packet.
+  if (!any_predicate_byte(exceed)) return 0;
+#endif
+  memcpy(&lane_values, lane_bits, sizeof(lane_values));
   HVX_Vector selected = Q6_V_vmux_QVV(exceed, lane_values, zero);
   selected = Q6_V_vor_VV(selected, Q6_V_vror_VR(selected, 4));
   selected = Q6_V_vor_VV(selected, Q6_V_vror_VR(selected, 8));
@@ -64,6 +77,22 @@ static inline uint32_t clipping_mask(const float *values, uint32_t positive, uin
 #endif
 
 static int row_needs_output_repair(const int16_t *codes, uint16_t minimum, uint16_t maximum) {
+#if defined(__HEXAGON_ARCH__) && __HEXAGON_ARCH__ >= 81
+  constexpr unsigned codes_per_vector = sizeof(HVX_Vector) / sizeof(int16_t);
+  static_assert(out_width % codes_per_vector == 0);
+  const HVX_Vector min_codes = Q6_Vh_vsplat_R(minimum);
+  const HVX_Vector max_codes = Q6_Vh_vsplat_R(maximum);
+  const HVX_Vector zero = Q6_V_vsplat_R(0);
+  HVX_VectorPred found = Q6_Q_vcmp_gt_VwVw(zero, zero);
+  for (unsigned channel = 0; channel < out_width; channel += codes_per_vector) {
+    HVX_Vector chunk;
+    memcpy(&chunk, codes + channel, sizeof(chunk));
+    const auto at_limit = Q6_Q_or_QQ(Q6_Q_vcmp_eq_VhVh(chunk, min_codes),
+                                    Q6_Q_vcmp_eq_VhVh(chunk, max_codes));
+    found = Q6_Q_or_QQ(found, at_limit);
+  }
+  return any_predicate_byte(found);
+#else
   const auto *words = reinterpret_cast<const uint16_t *>(codes);
   for (unsigned channel = 0; channel < out_width; ++channel) {
     if (words[channel] == minimum || words[channel] == maximum) {
@@ -71,6 +100,7 @@ static int row_needs_output_repair(const int16_t *codes, uint16_t minimum, uint1
     }
   }
   return 0;
+#endif
 }
 
 inline int pack_shadow_correction_tile(const float *activation, const int16_t *codes,
