@@ -91,6 +91,30 @@ theorem fragment_to_tile_lane (start localRow : Nat) :
     (start + localRow) / 4 * 4 + (start + localRow) % 4 - start = localRow := by
   omega
 
+-- Scatter starts from a zero panel. Retirement clears all lanes of each used key.
+def scatteredPanel (selected : Nat → Nat → Bool) (weight : Nat → Nat → Int) (key lane : Nat) : Int :=
+  if selected key lane then weight key lane else 0
+
+def retiredPanel (used : Nat → Bool) (panel : Nat → Nat → Int) (key lane : Nat) : Int :=
+  if used key then 0 else panel key lane
+
+theorem retire_restores_zero_panel (selected : Nat → Nat → Bool) (used : Nat → Bool)
+    (weight : Nat → Nat → Int) (covers : ∀ key lane, selected key lane = true → used key = true) :
+    retiredPanel used (scatteredPanel selected weight) = fun _ _ => 0 := by
+  funext key lane
+  cases active : used key with
+  | true => simp [retiredPanel, active]
+  | false =>
+    cases writes : selected key lane with
+    | false => simp [retiredPanel, scatteredPanel, active, writes]
+    | true =>
+      have conflict := covers key lane writes
+      simp [active] at conflict
+
+theorem retire_after_last_channel_load (channel : Nat) (inPanel : channel < 128) :
+    channel / 64 ≤ 1 ∧ (channel / 64 = 1 ↔ 64 ≤ channel) := by
+  omega
+
 -- Integer arithmetic describes which contributions may be omitted. Rounding and instructions are outside this model.
 def pv (keys : List Nat) (weight value : Nat → Int) : Int :=
   keys.foldr (fun key acc => weight key * value key + acc) 0
@@ -122,4 +146,6 @@ end ShadowNPU.SparsePvLayout
 #print axioms ShadowNPU.SparsePvLayout.page_address
 #print axioms ShadowNPU.SparsePvLayout.hvx_word_to_active_page
 #print axioms ShadowNPU.SparsePvLayout.fragment_to_tile_lane
+#print axioms ShadowNPU.SparsePvLayout.retire_restores_zero_panel
+#print axioms ShadowNPU.SparsePvLayout.retire_after_last_channel_load
 #print axioms ShadowNPU.SparsePvLayout.zero_weight_filter

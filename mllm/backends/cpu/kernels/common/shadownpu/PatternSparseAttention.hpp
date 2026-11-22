@@ -272,6 +272,7 @@ struct SparsePvTile {
   std::vector<int32_t> keys;
   std::vector<mllm_fp16_t> tile_weights;
   std::array<size_t, kSparsePvRows + 1> tile_offsets{};
+  bool panel_needs_clear = false;
 
   void reserve(int32_t key_len) {
     panel.resize(static_cast<size_t>(key_len) * kSparsePvRows);
@@ -279,12 +280,15 @@ struct SparsePvTile {
     keys.resize(key_len);
   }
 
-  void start() {
-    std::fill(panel.begin(), panel.end(), mllm_fp16_t(0));
+  void start(bool retire) {
+    if (!retire || panel_needs_clear) std::fill(panel.begin(), panel.end(), mllm_fp16_t(0));
     std::fill(active_keys.begin(), active_keys.end(), uint64_t(0));
+    // An unfinished tile must be cleared before reuse.
+    panel_needs_clear = true;
   }
 
   void startBitmap(size_t weights) {
+    panel_needs_clear = true;
     tile_weights.resize(weights);
     tile_offsets[0] = 0;
     std::fill(active_keys.begin(), active_keys.end(), uint64_t(0));
@@ -318,9 +322,14 @@ struct SparsePvTile {
     return count;
   }
 
-  void compute(const mllm_fp16_t* values, float* output) {
+  void compute(const mllm_fp16_t* values, float* output, bool retire) {
     const int32_t count = collectActiveKeys();
-    sparsePvRowsSme(values, keys.data(), panel.data(), count, output);
+    if (retire) {
+      sparsePvRowsSmeRetirePanel(values, keys.data(), panel.data(), count, output);
+      panel_needs_clear = false;
+    } else {
+      sparsePvRowsSme(values, keys.data(), panel.data(), count, output);
+    }
   }
 
   bool computeBitmap(const HmxTopKBitmapRows& bitmap, int32_t first_row, const mllm_fp16_t* values, float* output) {
@@ -525,6 +534,7 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
   const bool use_sme = params.value_dim == kSparsePvChannels && params.output_stride[2] == kSparsePvChannels
                        && query_row_count >= kSparsePvRows && useSparsePvSme();
   const bool use_bitmap_panel = use_sme && use_bitmap && useSparsePvBitmapPanel();
+  const bool retire_panel = use_sme && !use_bitmap && useSparsePvRetiringPanel();
   const int32_t sme_end = query_row_begin + (use_sme ? query_row_count / kSparsePvRows * kSparsePvRows : 0);
   thread_local detail::SparsePvTile pv_tile;
   if (use_sme) pv_tile.reserve(params.key_len);
@@ -601,9 +611,9 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
             return false;
           }
         } else {
-          if (lane == 0) pv_tile.start();
+          if (lane == 0) pv_tile.start(retire_panel);
           pv_tile.addRow(lane, selected, weights, keep);
-          if (lane == kSparsePvRows - 1) pv_tile.compute(value_base, output_row - lane * kSparsePvChannels);
+          if (lane == kSparsePvRows - 1) pv_tile.compute(value_base, output_row - lane * kSparsePvChannels, retire_panel);
         }
         continue;
       }
@@ -619,6 +629,10 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
     if (use_bitmap_panel) {
       std::fprintf(stderr, "[SHADOWNPU_SME_BITMAP_PANEL] key_len=%d matrix_begin=%zu row_begin=%d tiled_rows=%d\n",
                    params.key_len, matrix_begin, query_row_begin, sme_end - query_row_begin);
+    }
+    if (retire_panel) {
+      std::fprintf(stderr, "[SHADOWNPU_SME_RETIRE_PANEL] key_len=%d matrix_begin=%zu matrices=%zu row_begin=%d tiled_rows=%d\n",
+                   params.key_len, matrix_begin, matrix_count, query_row_begin, sme_end - query_row_begin);
     }
   }
 #endif

@@ -17,8 +17,9 @@ __attribute__((always_inline)) inline svfloat16_t interleave(
   return svzip1_f16(svld1_f16(panel, first), svld1_f16(panel, second));
 }
 
+template<bool Retire, class Weight>
 __arm_new("za") void accumulateRows(
-    const __fp16* values, const int32_t* keys, const __fp16* panel, int32_t key_count, float* output) __arm_streaming {
+    const __fp16* values, const int32_t* keys, Weight* panel, int32_t key_count, float* output) __arm_streaming {
   static constexpr __fp16 zero_value[kSparsePvChannels] = {};
   static constexpr __fp16 zero_panel[kSparsePvRows] = {};
   const svbool_t half_panel = svptrue_pat_b16(SV_VL16);
@@ -33,9 +34,17 @@ __arm_new("za") void accumulateRows(
       const int key1 = index + 1 < key_count ? keys[index + 1] : -1;
       const __fp16* value0 = values + static_cast<size_t>(key0) * kSparsePvChannels + dim;
       const __fp16* value1 = key1 >= 0 ? values + static_cast<size_t>(key1) * kSparsePvChannels + dim : zero_value + dim;
-      const __fp16* panel0 = panel + static_cast<size_t>(key0) * kSparsePvRows;
+      auto* panel0 = panel + static_cast<size_t>(key0) * kSparsePvRows;
       const __fp16* panel1 = key1 >= 0 ? panel + static_cast<size_t>(key1) * kSparsePvRows : zero_panel;
       const auto coeff = interleave(panel0, panel1, half_panel);
+      if constexpr (Retire) {
+        // The second channel tile has loaded the last use of these weights.
+        if (dim == kSparsePvChannels - 64) {
+          const auto zero = svdup_f16(0);
+          svst1_f16(half_panel, panel0, zero);
+          if (key1 >= 0) svst1_f16(half_panel, panel + static_cast<size_t>(key1) * kSparsePvRows, zero);
+        }
+      }
       svmopa_za32_f16_m(0, lanes, lanes, coeff, interleave(value0, value1, half_panel));
       svmopa_za32_f16_m(1, lanes, lanes, coeff, interleave(value0 + 16, value1 + 16, half_panel));
       svmopa_za32_f16_m(2, lanes, lanes, coeff, interleave(value0 + 32, value1 + 32, half_panel));
@@ -55,7 +64,12 @@ __arm_new("za") void accumulateRows(
 
 __arm_locally_streaming void sparsePvRowsSme(
     const __fp16* values, const int32_t* keys, const __fp16* panel, int32_t key_count, float* output) noexcept {
-  accumulateRows(values, keys, panel, key_count, output);
+  accumulateRows<false>(values, keys, panel, key_count, output);
+}
+
+__arm_locally_streaming void sparsePvRowsSmeRetirePanel(
+    const __fp16* values, const int32_t* keys, __fp16* panel, int32_t key_count, float* output) noexcept {
+  accumulateRows<true>(values, keys, panel, key_count, output);
 }
 
 }  // namespace mllm::cpu::shadownpu
