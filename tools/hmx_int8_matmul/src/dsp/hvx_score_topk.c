@@ -70,22 +70,18 @@ static int select_cutoff(const LaneHistograms hist, const GroupTotals totals, in
 }
 
 static inline HVX_Vector pack_predicate(HVX_VectorPred predicate) {
-    // Each four-byte dot product packs four adjacent predicate bytes into a nibble.
+    // Match the four-row HMX tile. A 4-byte dot product makes a nibble;
+    // a 2-halfword dot product combines two adjacent nibbles into a byte.
     const HVX_Vector weighted = Q6_V_vand_QR(predicate, 0x08040201);
     const HVX_Vector words = Q6_Vuw_vrmpy_VubRub(weighted, 0x01010101);
-    const HVX_Vector halfwords = Q6_Vh_vpacke_VwVw(words, words);
+    const HVX_Vector nibbles = Q6_Vh_vpacke_VwVw(words, words);
+    const HVX_Vector masks = Q6_Vw_vdmpy_VhRh_sat(nibbles, 0x00100001);
+    const HVX_Vector halfwords = Q6_Vh_vpacke_VwVw(masks, masks);
     return Q6_Vb_vpacke_VhVh(halfwords, halfwords);
 }
 
-static inline uint32_t dense_nibbles(uint32_t value) {
-    value = (value | (value >> 4)) & UINT32_C(0x00ff00ff);
-    return (value | (value >> 8)) & UINT32_C(0xffff);
-}
-
 static inline uint32_t row_mask(HVX_Vector packed, int lane) {
-    const uint32_t low = (uint32_t)Q6_R_vextract_VR(packed, lane * 8);
-    const uint32_t high = (uint32_t)Q6_R_vextract_VR(packed, lane * 8 + 4);
-    return dense_nibbles(low) | (dense_nibbles(high) << 16);
+    return (uint32_t)Q6_R_vextract_VR(packed, lane * 4);
 }
 
 static uint32_t take_equal_prefix(uint32_t equal, int *remaining) {
