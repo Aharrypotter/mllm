@@ -13,25 +13,60 @@ static unsigned tile_offset(int lane, int col) {
     return (unsigned)((col / tile_cols) * vector_bytes + lane * tile_cols + col % tile_cols);
 }
 
-static void tile_histogram(const uint8_t *scores, int visible, LaneHistograms hist) {
+typedef uint16_t GroupTotals[bins / bins_per_vector][group_rows];
+typedef union {
+    LaneHistograms banks;
+    HVX_Vector vectors[bins / bins_per_vector];
+} HistogramStorage;
+
+static void tile_histogram(const uint8_t *scores, int visible, HistogramStorage *hist, GroupTotals totals) {
     const int complete = visible / tile_cols;
     if (complete > 0) {
-        hmx_i8_hvx_histogram_tiles(scores, (unsigned)complete, hist);
+        hmx_i8_hvx_histogram_tiles(scores, (unsigned)complete, hist->banks);
+        for (int group = 0; group < bins / bins_per_vector; ++group) {
+            const HVX_Vector banks = hist->vectors[group];
+            // Each row occupies 32 bytes: two consecutive eight-bin banks.
+            // Fold into the first bank, then sum that bank's eight bins.
+            const HVX_Vector merged = Q6_Vh_vadd_VhVh(banks, Q6_V_vror_VR(banks, 16));
+            hist->vectors[group] = merged;
+            const HVX_Vector pairs = Q6_Vh_vadd_VhVh(merged, Q6_V_vror_VR(merged, 2));
+            const HVX_Vector quads = Q6_Vh_vadd_VhVh(pairs, Q6_V_vror_VR(pairs, 4));
+            const HVX_Vector sums = Q6_Vh_vadd_VhVh(quads, Q6_V_vror_VR(quads, 8));
+            for (int lane = 0; lane < group_rows; ++lane) {
+                totals[group][lane] = (uint16_t)Q6_R_vextract_VR(sums, lane * 32);
+            }
+        }
     } else {
-        memset(hist, 0, sizeof(LaneHistograms));
+        memset(hist, 0, sizeof(*hist));
+        memset(totals, 0, sizeof(GroupTotals));
     }
     for (int lane = 0; lane < group_rows; ++lane) {
         for (int col = complete * tile_cols; col < visible + lane; ++col) {
             const unsigned score = scores[tile_offset(lane, col)];
-            ++hist[score / bins_per_vector][lane][0][score % bins_per_vector];
+            const unsigned group = score / bins_per_vector;
+            ++hist->banks[group][lane][0][score % bins_per_vector];
+            ++totals[group][lane];
         }
     }
 }
 
-static inline unsigned lane_count(const LaneHistograms hist, int lane, uint8_t score) {
-    const uint16_t (*banks)[bins_per_vector] = hist[score / bins_per_vector][lane];
-    const unsigned bin = score % bins_per_vector;
-    return (unsigned)banks[0][bin] + banks[1][bin];
+static int select_cutoff(const LaneHistograms hist, const GroupTotals totals, int lane, int *remaining) {
+    enum { groups_per_sign = bins / (2 * bins_per_vector) };
+    for (int group = groups_per_sign - 1; group >= -groups_per_sign; --group) {
+        const unsigned hardware_group = (unsigned)group & (bins / bins_per_vector - 1);
+        const int count = totals[hardware_group][lane];
+        if (*remaining > count) {
+            *remaining -= count;
+            continue;
+        }
+        const uint16_t *bank = hist[hardware_group][lane][0];
+        for (int bin = bins_per_vector - 1; bin >= 0; --bin) {
+            if (*remaining <= bank[bin]) return group * bins_per_vector + bin;
+            *remaining -= bank[bin];
+        }
+        break;
+    }
+    return -129;
 }
 
 static inline HVX_Vector pack_predicate(HVX_VectorPred predicate) {
@@ -127,24 +162,17 @@ int hmx_i8_hvx_topk_native(const uint8_t *scores, int rows, int padded_columns,
     for (int group = 0; group < rows; group += group_rows) {
         const int visible = valid_columns - rows + group + 1;
         const uint8_t *block = scores + (size_t)group * padded_columns;
-        _Alignas(vector_bytes) LaneHistograms histogram;
+        _Alignas(vector_bytes) HistogramStorage histogram;
+        GroupTotals totals;
         int thresholds[group_rows], ties[group_rows], keep[group_rows];
         uint16_t *out[group_rows];
-        tile_histogram(block, visible, histogram);
+        tile_histogram(block, visible, &histogram, totals);
         for (int lane = 0; lane < group_rows; ++lane) {
             const int row = group + lane;
-            int threshold = 127;
             keep[lane] = offsets[row + 1] - offsets[row];
             out[lane] = indices + offsets[row];
             int remaining = keep[lane];
-            // The histogram instruction groups bins by vector and bank. Keep
-            // that layout and reduce just the bins visited in this row.
-            while (threshold >= -128) {
-                const int count = (int)lane_count(histogram, lane, (uint8_t)threshold);
-                if (remaining <= count) break;
-                remaining -= count;
-                --threshold;
-            }
+            const int threshold = select_cutoff(histogram.banks, totals, lane, &remaining);
             if (threshold < -128) return -1;
             thresholds[lane] = threshold;
             ties[lane] = remaining;
