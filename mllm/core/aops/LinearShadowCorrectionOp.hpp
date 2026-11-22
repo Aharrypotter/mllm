@@ -19,7 +19,8 @@ struct LinearShadowCorrectionOpOptions : public BaseOpOptions<LinearShadowCorrec
 // Restores the unclipped tails of a per-tensor symmetric quantized linear.
 //
 // Inputs:
-//   0. Original Float32 linear input; its last dimension is in_channels.
+//   0. Original Float32 linear input (last dimension in_channels), or a complete
+//      Int32 correction packet for each 256-row tile of the 8960 x 1536 projection.
 //   1. Saturated signed quantized linear output; its last dimension is
 //      out_channels.
 //   2. Float32 baseline after dequantization and residual addition.

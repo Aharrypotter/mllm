@@ -6,6 +6,7 @@
 #include <array>
 #include <string_view>
 
+#include "mllm/backends/qnn/custom-op-package/LLaMAPackage/src/ops/ShadowCorrectionPacketLayout.hpp"
 #include "mllm/compile/ir/graph/Op.hpp"
 #include "mllm/compile/ir/linalg/Op.hpp"
 #include "mllm/compile/ir/tensor/Op.hpp"
@@ -81,10 +82,8 @@ void LinearShadowCorrectionOp::reshape(const std::vector<Tensor>& inputs, std::v
   MLLM_RT_ASSERT(!original_input.shape().empty());
   MLLM_RT_ASSERT(!quantized_output.shape().empty());
   MLLM_RT_ASSERT(!baseline.shape().empty());
-  MLLM_RT_ASSERT_EQ(original_input.shape().back(), options_.in_channels);
   MLLM_RT_ASSERT_EQ(quantized_output.shape().back(), options_.out_channels);
   MLLM_RT_ASSERT_EQ(baseline.shape().back(), options_.out_channels);
-  MLLM_RT_ASSERT_EQ(original_input.dtype(), kFloat32);
   MLLM_RT_ASSERT_EQ(quantized_output.dtype(), kInt16);
   MLLM_RT_ASSERT_EQ(baseline.dtype(), kFloat32);
   MLLM_RT_ASSERT_EQ(original_input.device(), kCPU);
@@ -92,7 +91,19 @@ void LinearShadowCorrectionOp::reshape(const std::vector<Tensor>& inputs, std::v
   MLLM_RT_ASSERT_EQ(baseline.device(), kCPU);
 
   const auto tokens = baseline.numel() / options_.out_channels;
-  MLLM_RT_ASSERT_EQ(original_input.numel(), tokens * options_.in_channels);
+  if (original_input.dtype() == kInt32) {
+    using namespace ::shadow_correction_packet;
+    MLLM_RT_ASSERT_EQ(options_.in_channels, in_width);
+    MLLM_RT_ASSERT_EQ(options_.out_channels, out_width);
+    MLLM_RT_ASSERT(tokens > 0 && tokens % tile_rows == 0);
+    MLLM_RT_ASSERT_EQ(original_input.shape().back(), words_per_row);
+    MLLM_RT_ASSERT_EQ(original_input.numel(), tokens * words_per_row);
+    MLLM_RT_ASSERT(original_input.isContiguous() && quantized_output.isContiguous() && baseline.isContiguous());
+  } else {
+    MLLM_RT_ASSERT_EQ(original_input.dtype(), kFloat32);
+    MLLM_RT_ASSERT_EQ(original_input.shape().back(), options_.in_channels);
+    MLLM_RT_ASSERT_EQ(original_input.numel(), tokens * options_.in_channels);
+  }
   MLLM_RT_ASSERT_EQ(quantized_output.numel(), tokens * options_.out_channels);
   outputs.emplace_back(Tensor::empty(baseline.shape(), kFloat32, kCPU));
 }

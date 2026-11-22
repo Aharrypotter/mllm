@@ -3,6 +3,8 @@
 #include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#include "ShadowCorrectionPacketLayout.hpp"
 #include <string.h>
 
 #if defined(__hexagon__) || defined(__hexagon)
@@ -12,36 +14,7 @@
 
 namespace shadow_correction_packet {
 
-enum {
-  tile_rows = 256,
-  in_width = 8960,
-  out_width = 1536,
-  sparse_capacity = 8192,
-  dense_capacity = 2,
-  vector_width = 32,
-};
-
-enum { complete = 0, needs_original_tile = 1 };
-
-struct sparse_entry {
-  uint32_t channel;
-  uint32_t value_bits;
-};
-
-struct correction_packet {
-  uint32_t status;
-  uint32_t sparse_count;
-  uint32_t dense_count;
-  uint32_t mask_flags;
-  uint32_t row_offsets[tile_rows + 1];
-  uint32_t dense_row_ids[dense_capacity];
-  struct sparse_entry sparse[sparse_capacity];
-  uint32_t dense_rows[dense_capacity][in_width];
-  uint32_t padding[249];
-};
-
-static_assert(sizeof(struct correction_packet) == tile_rows * 136 * sizeof(uint32_t),
-               "QNN tiled Int32 wrapper must have exactly 136 words per sequence row");
+constexpr int vector_width = 32;
 
 static inline uint32_t word_bits(const float *value) {
   uint32_t bits;
@@ -100,7 +73,6 @@ static int row_needs_output_repair(const int16_t *codes) {
 inline int pack_shadow_correction_tile(const float *activation, const int16_t *codes,
                                 uint32_t positive, uint32_t negative, uint32_t flags,
                                 struct correction_packet *packet) {
-  enum { clip_input = 1, clip_output = 2 };
   memset(packet, 0, sizeof(*packet));
   packet->status = needs_original_tile;
   packet->mask_flags = flags;
