@@ -122,6 +122,9 @@ void CPULinearShadowCorrectionOp::forward(const std::vector<Tensor>& inputs, std
 }
 
 void CPULinearShadowCorrectionOp::forwardPacket(const std::vector<Tensor>& inputs, std::vector<Tensor>& outputs) {
+#if defined(__clang__)
+#pragma clang fp reassociate(off)
+#endif
   const auto& original_input = inputs[0];
   const auto& quantized_output = inputs[1];
   const auto& baseline = inputs[2];
@@ -132,8 +135,14 @@ void CPULinearShadowCorrectionOp::forwardPacket(const std::vector<Tensor>& input
   const bool clip_input = scalarFlag(clip_input_);
   const bool clip_output = scalarFlag(clip_output_);
   const float weight_step = weight_scale_.ptr<float>()[0];
-  const float input_step = input_scale_.ptr<float>()[0] / static_cast<float>(kQuantMax);
-  const float output_step = output_scale_.ptr<float>()[0] / static_cast<float>(kQuantMax);
+  const float input_scale = input_scale_.ptr<float>()[0];
+  const float output_scale = output_scale_.ptr<float>()[0];
+  const float input_step = input_scale * (1.0f / static_cast<float>(kQuantMax));
+  const float output_step = output_scale * (1.0f / static_cast<float>(kQuantMax));
+  const float inverse_input_scale = 1.0f / input_scale;
+  const float dense_input_multiplier = static_cast<float>(kQuantMax) / input_scale;
+  const float dense_output_multiplier = static_cast<float>(kQuantMax) / output_scale;
+  const float weight_input_step = input_step * weight_step;
   MLLM_RT_ASSERT(std::isfinite(weight_step) && weight_step > 0.0F);
   MLLM_RT_ASSERT(std::isfinite(input_step) && input_step > 0.0F);
   MLLM_RT_ASSERT(std::isfinite(output_step) && output_step > 0.0F);
@@ -147,14 +156,15 @@ void CPULinearShadowCorrectionOp::forwardPacket(const std::vector<Tensor>& input
   const int64_t tokens = baseline.numel() / out_channels;
 
   const auto repair_input_channel = [&](int64_t token, uint32_t channel, float activation) {
-    const float unbounded_q = std::round(activation / input_step);
+    const float unbounded_q = std::round((activation * static_cast<float>(kQuantMax)) * inverse_input_scale);
     if (unbounded_q >= static_cast<float>(kQuantMin) && unbounded_q <= static_cast<float>(kQuantMax)) { return; }
     const float clipped_q = std::clamp(unbounded_q, static_cast<float>(kQuantMin), static_cast<float>(kQuantMax));
-    const float correction_scale = (unbounded_q - clipped_q) * input_step * weight_step;
+    const float correction_scale = (unbounded_q - clipped_q) * weight_input_step;
     const auto* weight_row = weight + static_cast<int64_t>(channel) * out_channels;
     auto* token_output = output + token * out_channels;
     for (int32_t output_channel = 0; output_channel < out_channels; ++output_channel) {
-      token_output[output_channel] += correction_scale * static_cast<float>(weight_row[output_channel]);
+      token_output[output_channel] =
+          std::fma(correction_scale, static_cast<float>(weight_row[output_channel]), token_output[output_channel]);
     }
   };
 
@@ -172,15 +182,20 @@ void CPULinearShadowCorrectionOp::forwardPacket(const std::vector<Tensor>& input
       const int16_t q_value = token_q_output[output_channel];
       if (!needsOutputRepair(q_value)) { continue; }
 
-      float full_sum = 0.0F;
-      for (int32_t input_channel = 0; input_channel < in_channels; ++input_channel) {
-        const float unbounded_q = std::round(token_input[input_channel] / input_step);
-        const int8_t q_weight = weight[static_cast<int64_t>(input_channel) * out_channels + output_channel];
-        full_sum += unbounded_q * input_step * static_cast<float>(q_weight) * weight_step;
+      // The retained Android loop accumulates the even and odd channels
+      // independently before restoring the output code.
+      float even = 0.0f;
+      float odd = 0.0f;
+      for (int32_t channel = 0; channel < in_channels; channel += 2) {
+        const auto* w = weight + static_cast<int64_t>(channel) * out_channels + output_channel;
+        const float even_q = std::round(token_input[channel] * dense_input_multiplier);
+        const float odd_q = std::round(token_input[channel + 1] * dense_input_multiplier);
+        even = std::fma(even_q * weight_input_step, static_cast<float>(w[0]), even);
+        odd = std::fma(odd_q * weight_input_step, static_cast<float>(w[out_channels]), odd);
       }
-      const float restored_q = std::round(full_sum / output_step);
+      const float restored_q = std::round((even + odd) * dense_output_multiplier);
       token_output[output_channel] =
-          token_baseline[output_channel] - static_cast<float>(q_value) * output_step + restored_q * output_step;
+          std::fma(restored_q - static_cast<float>(q_value), output_step, token_baseline[output_channel]);
     }
   };
 
