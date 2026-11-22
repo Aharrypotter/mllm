@@ -12,6 +12,10 @@ class CPULinearShadowCorrectionOp final : public aops::LinearShadowCorrectionOp 
   explicit CPULinearShadowCorrectionOp(const aops::LinearShadowCorrectionOpOptions& options);
 
   void forward(const std::vector<Tensor>& inputs, std::vector<Tensor>& outputs) override;
+
+ private:
+  void forwardOriginal(const std::vector<Tensor>& inputs, std::vector<Tensor>& outputs);
+  void forwardPacket(const std::vector<Tensor>& inputs, std::vector<Tensor>& outputs);
 };
 
 class CPULinearShadowCorrectionOpFactory
