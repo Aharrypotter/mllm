@@ -16,6 +16,8 @@ namespace shadow_correction_packet {
 
 constexpr int vector_width = 32;
 
+enum class code_encoding : uint16_t { signed_fixed = 0, offset_binary = 0x8000 };
+
 static inline uint32_t word_bits(const float *value) {
   uint32_t bits;
   memcpy(&bits, value, sizeof(bits));
@@ -61,9 +63,10 @@ static inline uint32_t clipping_mask(const float *values, uint32_t positive, uin
 }
 #endif
 
-static int row_needs_output_repair(const int16_t *codes) {
+static int row_needs_output_repair(const int16_t *codes, uint16_t minimum, uint16_t maximum) {
+  const auto *words = reinterpret_cast<const uint16_t *>(codes);
   for (unsigned channel = 0; channel < out_width; ++channel) {
-    if (codes[channel] == INT16_MIN || codes[channel] == INT16_MAX) {
+    if (words[channel] == minimum || words[channel] == maximum) {
       return 1;
     }
   }
@@ -72,7 +75,8 @@ static int row_needs_output_repair(const int16_t *codes) {
 
 inline int pack_shadow_correction_tile(const float *activation, const int16_t *codes,
                                 uint32_t positive, uint32_t negative, uint32_t flags,
-                                struct correction_packet *packet) {
+                                struct correction_packet *packet,
+                                code_encoding encoding = code_encoding::signed_fixed) {
   memset(packet, 0, sizeof(*packet));
   packet->status = needs_original_tile;
   packet->mask_flags = flags;
@@ -81,11 +85,15 @@ inline int pack_shadow_correction_tile(const float *activation, const int16_t *c
     return needs_original_tile;
   }
 
+  // Adding the offset 32768 to a signed code flips only its sign bit.
+  const uint16_t bias = static_cast<uint16_t>(encoding);
+  const uint16_t minimum = static_cast<uint16_t>(INT16_MIN) ^ bias;
+  const uint16_t maximum = static_cast<uint16_t>(INT16_MAX) ^ bias;
   unsigned sparse_count = 0;
   unsigned dense_count = 0;
   for (unsigned row = 0; row < tile_rows; ++row) {
     const float *values = activation + row * in_width;
-    if (!(flags & clip_output) && row_needs_output_repair(codes + row * out_width)) {
+    if (!(flags & clip_output) && row_needs_output_repair(codes + row * out_width, minimum, maximum)) {
       if (dense_count == dense_capacity) return needs_original_tile;
       packet->dense_row_ids[dense_count] = row;
       memcpy(packet->dense_rows[dense_count], values, in_width * sizeof(float));

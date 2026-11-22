@@ -36,7 +36,10 @@ GraphStatus packCorrection(Tensor& output, const Tensor& activation, const Tenso
            control_batch, control_height, control_width, control_depth, out_batch, out_height, out_spatial_width, out_depth);
     return GraphStatus::ErrorDimensions;
   }
-  if (activation.get_dtype() != DType::Float32 || codes.get_dtype() != DType::QInt16 || codes.interface_offset() != 0
+  const auto code_type = codes.get_dtype();
+  const bool offset_binary = code_type == DType::QUInt16;
+  if (activation.get_dtype() != DType::Float32 || (!offset_binary && code_type != DType::QInt16)
+      || codes.interface_offset() != (offset_binary ? 32768 : 0)
       || controls.get_dtype() != DType::Int32 || output.get_dtype() != DType::Int32
       || !isFlat(output) || !isFlat(activation) || !isFlat(codes) || !isFlat(controls)) {
     errlog("ShadowCorrectionPacket tensor types=%u:%u:%u:%u formats=%x:%x:%x:%x code_offset=%d",
@@ -65,7 +68,8 @@ GraphStatus packCorrection(Tensor& output, const Tensor& activation, const Tenso
   }
 
   auto* packet = new (destination) correction_packet;
-  pack_shadow_correction_tile(rows, projected, limits[0], limits[1], limits[2], packet);
+  const auto encoding = offset_binary ? code_encoding::offset_binary : code_encoding::signed_fixed;
+  pack_shadow_correction_tile(rows, projected, limits[0], limits[1], limits[2], packet, encoding);
   return GraphStatus::Success;
 }
 
