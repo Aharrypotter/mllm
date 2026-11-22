@@ -5,12 +5,15 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <vector>
 
+#include "mllm/backends/cpu/kernels/arm/SparsePVSme.hpp"
 #include "mllm/backends/cpu/kernels/arm/softmax.hpp"
 #include "mllm/backends/cpu/kernels/common/ggml/quantize/quantize.hpp"
 #include "mllm/backends/cpu/kernels/common/ggml/vec_dot.hpp"
@@ -259,6 +262,45 @@ struct HmxF16SparseScratch {
   }
 };
 
+#if defined(MLLM_ANDROID_SME_SPARSE_PV)
+struct SparsePvTile {
+  std::vector<mllm_fp16_t> panel;
+  std::vector<uint64_t> active_keys;
+  std::vector<int32_t> keys;
+
+  void reserve(int32_t key_len) {
+    panel.resize(static_cast<size_t>(key_len) * kSparsePvRows);
+    active_keys.resize((static_cast<size_t>(key_len) + 63) / 64);
+    keys.resize(key_len);
+  }
+
+  void start() {
+    std::fill(panel.begin(), panel.end(), mllm_fp16_t(0));
+    std::fill(active_keys.begin(), active_keys.end(), uint64_t(0));
+  }
+
+  void addRow(int32_t row, const int32_t* selected, const mllm_fp16_t* weights, int32_t keep) {
+    for (int32_t index = 0; index < keep; ++index) {
+      const auto key = static_cast<size_t>(selected[index]);
+      panel[key * kSparsePvRows + row] = weights[index];
+      active_keys[key / 64] |= uint64_t(1) << (key % 64);
+    }
+  }
+
+  void compute(const mllm_fp16_t* values, float* output) {
+    int32_t count = 0;
+    for (size_t word = 0; word < active_keys.size(); ++word) {
+      uint64_t pending = active_keys[word];
+      while (pending != 0) {
+        keys[count++] = static_cast<int32_t>(word * 64 + std::countr_zero(pending));
+        pending &= pending - 1;
+      }
+    }
+    sparsePvRowsSme(values, keys.data(), panel.data(), count, output);
+  }
+};
+#endif
+
 template<bool TrackMax>
 inline float selectedQKScoresF16(const mllm_fp16_t* query, const mllm_fp16_t* key_base, int32_t key_stride,
                                  const int32_t* selected, int32_t keep, int32_t head_dim, float scale, float* scores) {
@@ -434,6 +476,15 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
 
   thread_local detail::HmxF16SparseScratch scratch;
   scratch.resize(static_cast<size_t>(params.key_len), static_cast<size_t>(params.query_key_dim));
+#if defined(MLLM_ANDROID_SME_SPARSE_PV)
+  // HMX publishes unique per-row indices. The opt-in SME reduction uses the
+  // same FP16 probabilities for finite values, grouped sixteen rows at a time.
+  const bool use_sme = params.value_dim == kSparsePvChannels && params.output_stride[2] == kSparsePvChannels
+                       && query_row_count >= kSparsePvRows && useSparsePvSme();
+  const int32_t sme_end = query_row_begin + (use_sme ? query_row_count / kSparsePvRows * kSparsePvRows : 0);
+  thread_local detail::SparsePvTile pv_tile;
+  if (use_sme) pv_tile.reserve(params.key_len);
+#endif
   const int32_t groups = params.query_heads / params.kv_heads;
   const float scale = 1.0F / std::sqrt(static_cast<float>(params.query_key_dim));
   for (size_t matrix = matrix_begin; matrix < matrix_begin + matrix_count; ++matrix) {
@@ -476,9 +527,25 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
       float* output_row = output + static_cast<size_t>(batch) * params.output_stride[0]
                           + static_cast<size_t>(query_head) * params.output_stride[1]
                           + static_cast<size_t>(query_index) * params.output_stride[2];
+#if defined(MLLM_ANDROID_SME_SPARSE_PV)
+      if (query_index < sme_end) {
+        const int32_t row = (query_index - query_row_begin) % kSparsePvRows;
+        if (row == 0) pv_tile.start();
+        pv_tile.addRow(row, selected, scratch.weights.data(), keep);
+        if (row == kSparsePvRows - 1) pv_tile.compute(value_base, output_row - row * kSparsePvChannels);
+        continue;
+      }
+#endif
       detail::sparseValueF16(value_base, selected, scratch.weights.data(), keep, params.value_dim, output_row);
     }
   }
+#if defined(MLLM_ANDROID_SME_SPARSE_PV)
+  if (use_sme && traceSparsePvSme()) {
+    std::fprintf(stderr, "[SHADOWNPU_SME_PV] key_len=%d matrix_begin=%zu matrices=%zu row_begin=%d tiled_rows=%d tail_rows=%d\n",
+                 params.key_len, matrix_begin, matrix_count, query_row_begin, sme_end - query_row_begin,
+                 query_row_begin + query_row_count - sme_end);
+  }
+#endif
   return true;
 }
 
