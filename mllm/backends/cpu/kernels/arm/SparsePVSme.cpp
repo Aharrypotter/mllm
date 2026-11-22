@@ -6,28 +6,18 @@
 #if defined(MLLM_ANDROID_SME_SPARSE_PV)
 #include <arm_sme.h>
 #include <arm_sve.h>
-#include <asm/hwcap.h>
-#include <sys/auxv.h>
-#include <sys/prctl.h>
 
 #include <cstddef>
-#include <cstdlib>
-#include <cstring>
 
 namespace mllm::cpu::shadownpu {
 namespace {
 
-bool enabled(const char* name) noexcept {
-  const auto* value = std::getenv(name);
-  return value != nullptr && std::strcmp(value, "1") == 0;
-}
-
-__attribute__((target("+sme"), always_inline)) inline svfloat16_t interleave(
+__attribute__((always_inline)) inline svfloat16_t interleave(
     const __fp16* first, const __fp16* second, svbool_t panel) __arm_streaming {
   return svzip1_f16(svld1_f16(panel, first), svld1_f16(panel, second));
 }
 
-__attribute__((target("+sme"))) __arm_new("za") void accumulateRows(
+__arm_new("za") void accumulateRows(
     const __fp16* values, const int32_t* keys, const __fp16* panel, int32_t key_count, float* output) __arm_streaming {
   static constexpr __fp16 zero_value[kSparsePvChannels] = {};
   static constexpr __fp16 zero_panel[kSparsePvRows] = {};
@@ -63,20 +53,7 @@ __attribute__((target("+sme"))) __arm_new("za") void accumulateRows(
 
 }  // namespace
 
-bool useSparsePvSme() noexcept {
-  constexpr unsigned long required = HWCAP2_SME | HWCAP2_SME_F16F32;
-  static const bool available = enabled("MLLM_HMX_SME_PV") && (getauxval(AT_HWCAP2) & required) == required;
-  if (!available) return false;
-  const int length = prctl(PR_SME_GET_VL, 0L, 0L, 0L, 0L);
-  return length >= 0 && (length & PR_SME_VL_LEN_MASK) == 64;
-}
-
-bool traceSparsePvSme() noexcept {
-  static const bool trace = enabled("MLLM_HMX_SME_PV_TRACE");
-  return trace;
-}
-
-__attribute__((target("+sme"))) __arm_locally_streaming void sparsePvRowsSme(
+__arm_locally_streaming void sparsePvRowsSme(
     const __fp16* values, const int32_t* keys, const __fp16* panel, int32_t key_count, float* output) noexcept {
   accumulateRows(values, keys, panel, key_count, output);
 }

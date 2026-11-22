@@ -7,15 +7,36 @@
     && __has_include(<arm_sme.h>)
 #define MLLM_ANDROID_SME_SPARSE_PV 1
 
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#include <sys/prctl.h>
+
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 namespace mllm::cpu::shadownpu {
 
 inline constexpr int kSparsePvRows = 16;
 inline constexpr int kSparsePvChannels = 128;
 
-bool useSparsePvSme() noexcept;
-bool traceSparsePvSme() noexcept;
+inline bool sparsePvOption(const char* name) noexcept {
+  const auto* value = std::getenv(name);
+  return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+inline bool useSparsePvSme() noexcept {
+  constexpr unsigned long required = HWCAP2_SME | HWCAP2_SME_F16F32;
+  static const bool available = sparsePvOption("MLLM_HMX_SME_PV") && (getauxval(AT_HWCAP2) & required) == required;
+  if (!available) return false;
+  const int length = prctl(PR_SME_GET_VL, 0L, 0L, 0L, 0L);
+  return length >= 0 && (length & PR_SME_VL_LEN_MASK) == 64;
+}
+
+inline bool traceSparsePvSme() noexcept {
+  static const bool trace = sparsePvOption("MLLM_HMX_SME_PV_TRACE");
+  return trace;
+}
 
 // The panel is key-major, with sixteen FP16 row weights per key.
 void sparsePvRowsSme(const __fp16* values, const int32_t* keys, const __fp16* panel, int32_t key_count,
