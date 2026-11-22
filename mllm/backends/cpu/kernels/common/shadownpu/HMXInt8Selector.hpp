@@ -5444,6 +5444,15 @@ private:
             return fail("MLLM_HMX_PIPELINE_DIRECT_SPARSE_ASSIST_PERCENT "
                         "must be in [0, 90]", error);
         }
+        const int sparse_target_cpu = directSparseCallerCpu();
+        if (sparse_target_cpu < -1) {
+            return fail("invalid MLLM_HMX_PIPELINE_DIRECT_SPARSE_CALLER_CPU", error);
+        }
+#if !defined(__linux__)
+        if (sparse_target_cpu >= 0) {
+            return fail("direct sparse caller placement requires Linux/Android", error);
+        }
+#endif
         const bool sparse_assist = sparse_assist_percent > 0;
         if (sparse_assist && !request.topk_group_rows_ready) {
             return fail("direct sparse assistance requires the row-range "
@@ -5489,6 +5498,8 @@ private:
 #else
         const int sparse_caller_cpu = -1;
 #endif
+        int sparse_consumer_cpu_begin = -1;
+        int sparse_consumer_cpu_end = -1;
         std::uint64_t topk_busy_ns = 0;
         std::uint64_t sparse_busy_ns = 0;
         std::uint64_t sparse_assist_busy_ns = 0;
@@ -5855,6 +5866,16 @@ private:
                     pipelineStreamingNotify();
                     return false;
                 }
+#if defined(__linux__)
+                ScopedDirectSparseAffinity placement;
+                if (!placement.pin(sparse_target_cpu)) {
+                    stream_error = "direct sparse caller CPU is unavailable in its inherited affinity";
+                    cancelled.store(true, std::memory_order_release);
+                    pipelineStreamingNotify();
+                    return false;
+                }
+                if (timeline_enabled) sparse_consumer_cpu_begin = sched_getcpu();
+#endif
                 stable_stream = stream;
                 stream_seen.store(true, std::memory_order_release);
                 stream_view.store(&stable_stream, std::memory_order_release);
@@ -5937,6 +5958,13 @@ private:
                         CPUAttentionProfiler::nowNs(),
                         std::memory_order_release);
                 }
+#if defined(__linux__)
+                if (timeline_enabled) sparse_consumer_cpu_end = sched_getcpu();
+                if (!placement.restore()) {
+                    stream_error = "failed to restore the direct sparse caller affinity";
+                    cancelled.store(true, std::memory_order_release);
+                }
+#endif
                 pipelineStreamingNotify();
                 if (!topk_error.empty() && stream_error.empty()) {
                     stream_error = topk_error;
@@ -6026,6 +6054,9 @@ private:
                               : (topk_inline_sparse_assist
                                      ? "topk-worker-0" : "none"))
                       << " sparse_caller_cpu=" << sparse_caller_cpu
+                      << " sparse_target_cpu=" << sparse_target_cpu
+                      << " sparse_consumer_cpu_begin=" << sparse_consumer_cpu_begin
+                      << " sparse_consumer_cpu_end=" << sparse_consumer_cpu_end
                       << " sparse_assist_cpu="
                       << sparse_assist_cpu.load(std::memory_order_relaxed)
                       << " first_ready_us="
@@ -6080,6 +6111,51 @@ private:
         }
         return static_cast<int>(parsed);
     }
+
+    static int directSparseCallerCpu() noexcept {
+        static const int cpu = [] {
+            const char *value = std::getenv("MLLM_HMX_PIPELINE_DIRECT_SPARSE_CALLER_CPU");
+            if (value == nullptr || value[0] == '\0') return -1;
+            char *end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (end == value || *end != '\0' || parsed < 0
+                || parsed > std::numeric_limits<int>::max()) return -2;
+            return static_cast<int>(parsed);
+        }();
+        return cpu;
+    }
+
+#if defined(__linux__)
+    class ScopedDirectSparseAffinity final {
+    public:
+        bool pin(int cpu) noexcept {
+            if (cpu < 0) return true;
+            if (cpu >= CPU_SETSIZE
+                || sched_getaffinity(0, sizeof(original_), &original_) != 0
+                || !CPU_ISSET(cpu, &original_)) return false;
+            cpu_set_t target;
+            CPU_ZERO(&target);
+            CPU_SET(cpu, &target);
+            if (CPU_EQUAL(&original_, &target)) return true;
+            pinned_ = sched_setaffinity(0, sizeof(target), &target) == 0;
+            return pinned_;
+        }
+
+        bool restore() noexcept {
+            if (pinned_ && sched_setaffinity(0, sizeof(original_), &original_) != 0) {
+                return false;
+            }
+            pinned_ = false;
+            return true;
+        }
+
+        ~ScopedDirectSparseAffinity() { restore(); }
+
+    private:
+        cpu_set_t original_{};
+        bool pinned_ = false;
+    };
+#endif
 
     static bool directSparseWorkerAssistEnabled() noexcept {
         const char *value = std::getenv(
