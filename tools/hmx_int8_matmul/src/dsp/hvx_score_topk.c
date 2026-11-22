@@ -4,9 +4,8 @@
 #include <hexagon_types.h>
 #include <string.h>
 
-enum { group_rows = 4, tile_cols = 32, bins = 256, vector_bytes = 128 };
-typedef uint16_t Histograms[group_rows][bins];
-typedef uint16_t LaneHistograms[32][group_rows][2][8];
+enum { group_rows = 4, tile_cols = 32, bins = 256, bins_per_vector = 8, vector_bytes = 128 };
+typedef uint16_t LaneHistograms[bins / bins_per_vector][group_rows][2][bins_per_vector];
 
 extern void hmx_i8_hvx_histogram_tiles(const uint8_t *tiles, unsigned count, LaneHistograms lanes);
 
@@ -14,21 +13,25 @@ static unsigned tile_offset(int lane, int col) {
     return (unsigned)((col / tile_cols) * vector_bytes + lane * tile_cols + col % tile_cols);
 }
 
-static void tile_histogram(const uint8_t *scores, int visible, Histograms hist) {
+static void tile_histogram(const uint8_t *scores, int visible, LaneHistograms hist) {
     const int complete = visible / tile_cols;
     if (complete > 0) {
-        _Alignas(vector_bytes) LaneHistograms lanes;
-        hmx_i8_hvx_histogram_tiles(scores, (unsigned)complete, lanes);
-        for (int group = 0; group < 32; ++group)
-            for (int lane = 0; lane < group_rows; ++lane)
-                for (int bin = 0; bin < 8; ++bin)
-                    hist[lane][group * 8 + bin] = lanes[group][lane][0][bin] + lanes[group][lane][1][bin];
+        hmx_i8_hvx_histogram_tiles(scores, (unsigned)complete, hist);
     } else {
-        memset(hist, 0, sizeof(Histograms));
+        memset(hist, 0, sizeof(LaneHistograms));
     }
-    for (int lane = 0; lane < group_rows; ++lane)
-        for (int col = complete * tile_cols; col < visible + lane; ++col)
-            ++hist[lane][scores[tile_offset(lane, col)]];
+    for (int lane = 0; lane < group_rows; ++lane) {
+        for (int col = complete * tile_cols; col < visible + lane; ++col) {
+            const unsigned score = scores[tile_offset(lane, col)];
+            ++hist[score / bins_per_vector][lane][0][score % bins_per_vector];
+        }
+    }
+}
+
+static inline unsigned lane_count(const LaneHistograms hist, int lane, uint8_t score) {
+    const uint16_t (*banks)[bins_per_vector] = hist[score / bins_per_vector][lane];
+    const unsigned bin = score % bins_per_vector;
+    return (unsigned)banks[0][bin] + banks[1][bin];
 }
 
 static inline HVX_Vector pack_predicate(HVX_VectorPred predicate) {
@@ -124,7 +127,7 @@ int hmx_i8_hvx_topk_native(const uint8_t *scores, int rows, int padded_columns,
     for (int group = 0; group < rows; group += group_rows) {
         const int visible = valid_columns - rows + group + 1;
         const uint8_t *block = scores + (size_t)group * padded_columns;
-        Histograms histogram;
+        _Alignas(vector_bytes) LaneHistograms histogram;
         int thresholds[group_rows], ties[group_rows], keep[group_rows];
         uint16_t *out[group_rows];
         tile_histogram(block, visible, histogram);
@@ -134,8 +137,12 @@ int hmx_i8_hvx_topk_native(const uint8_t *scores, int rows, int padded_columns,
             keep[lane] = offsets[row + 1] - offsets[row];
             out[lane] = indices + offsets[row];
             int remaining = keep[lane];
-            while (threshold >= -128 && remaining > histogram[lane][(uint8_t)threshold]) {
-                remaining -= histogram[lane][(uint8_t)threshold];
+            // The histogram instruction groups bins by vector and bank. Keep
+            // that layout and reduce just the bins visited in this row.
+            while (threshold >= -128) {
+                const int count = (int)lane_count(histogram, lane, (uint8_t)threshold);
+                if (remaining <= count) break;
+                remaining -= count;
                 --threshold;
             }
             if (threshold < -128) return -1;
