@@ -81,6 +81,55 @@ __arm_new("za") void accumulateRows(
   }
 }
 
+// The source contains 16 FP16 values. LD1H into 32-bit lanes places each
+// value in the even halfword and sets the odd halfword to zero.
+__attribute__((always_inline)) inline svfloat16_t loadEvenHalves(
+    svbool_t words, const __fp16* data) __arm_streaming {
+  svuint32_t packed;
+  asm("ld1h { %0.s }, %1/z, [%2]" : "=w"(packed) : "Upl"(words), "r"(data), "m"(*reinterpret_cast<const __fp16 (*)[16]>(data)));
+  return svreinterpret_f16_u32(packed);
+}
+
+// Four ZA tiles hold two 16-row tiles and two 16-channel slices.
+__arm_new("za") void accumulateSharedValues(
+    const __fp16* values, const int32_t* keys, const __fp16* panel, int32_t count, float* output) __arm_streaming {
+  const auto words = svptrue_b32();
+  const auto lanes = svptrue_b16();
+  const auto parity = svand_n_u16_x(lanes, svindex_u16(0, 1), 1);
+  const auto even = svcmpeq_n_u16(lanes, parity, 0);
+  const auto empty = svdup_f32(0);
+
+  for (int channel = 0; channel < kSparsePvChannels; channel += 32) {
+    svzero_za();
+    for (int index = 0; index < count; ++index) {
+      const auto encoded = static_cast<uint32_t>(keys[index]);
+      const size_t key = encoded & kSparsePvSharedKeyMask;
+      const auto* value = values + key * kSparsePvChannels + channel;
+      const auto v0 = loadEvenHalves(words, value);
+      const auto v1 = loadEvenHalves(words, value + 16);
+      const auto* weights = panel + key * kSparsePvSharedRows;
+      if (encoded & kSparsePvSharedFirst) {
+        const auto coeff = loadEvenHalves(words, weights);
+        svmopa_za32_f16_m(0, even, even, coeff, v0);
+        svmopa_za32_f16_m(1, even, even, coeff, v1);
+      }
+      if (encoded & kSparsePvSharedSecond) {
+        const auto coeff = loadEvenHalves(words, weights + kSparsePvRows);
+        svmopa_za32_f16_m(2, even, even, coeff, v0);
+        svmopa_za32_f16_m(3, even, even, coeff, v1);
+      }
+    }
+    for (unsigned row = 0; row < kSparsePvRows; ++row) {
+      auto* lo = output + row * kSparsePvChannels + channel;
+      auto* hi = lo + kSparsePvRows * kSparsePvChannels;
+      svst1_f32(words, lo, svread_hor_za32_f32_m(empty, words, 0, row));
+      svst1_f32(words, lo + 16, svread_hor_za32_f32_m(empty, words, 1, row));
+      svst1_f32(words, hi, svread_hor_za32_f32_m(empty, words, 2, row));
+      svst1_f32(words, hi + 16, svread_hor_za32_f32_m(empty, words, 3, row));
+    }
+  }
+}
+
 }  // namespace
 
 __arm_locally_streaming void sparsePvRowsSme(
@@ -93,6 +142,11 @@ __arm_locally_streaming void sparsePvRowsSmeRetirePanel(
     const __fp16* values, const int32_t* keys, __fp16* panel, int32_t key_count, float* output, bool ordered_keys) noexcept {
   if (ordered_keys) accumulateRows<true, true>(values, keys, panel, key_count, output);
   else accumulateRows<true, false>(values, keys, panel, key_count, output);
+}
+
+__arm_locally_streaming void sparsePvSharedRowsSme(
+    const __fp16* values, const int32_t* keys, const __fp16* panel, int32_t key_count, float* output) noexcept {
+  accumulateSharedValues(values, keys, panel, key_count, output);
 }
 
 }  // namespace mllm::cpu::shadownpu

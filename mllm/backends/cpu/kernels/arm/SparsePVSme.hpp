@@ -19,6 +19,10 @@ namespace mllm::cpu::shadownpu {
 
 inline constexpr int kSparsePvRows = 16;
 inline constexpr int kSparsePvChannels = 128;
+inline constexpr int kSparsePvSharedRows = 2 * kSparsePvRows;
+inline constexpr uint32_t kSparsePvSharedKeyMask = 0xffff;
+inline constexpr uint32_t kSparsePvSharedFirst = 1U << 16;
+inline constexpr uint32_t kSparsePvSharedSecond = 1U << 17;
 
 inline bool sparsePvOption(const char* name) noexcept {
   const auto* value = std::getenv(name);
@@ -53,11 +57,20 @@ inline bool useSparsePvOrderedKeys() noexcept {
   return enabled;
 }
 
+inline bool useSparsePvSharedValues() noexcept {
+  static const bool enabled = sparsePvOption("MLLM_HMX_SME_PV_SHARED_VALUES");
+  return enabled;
+}
+
 // The panel is key-major, with sixteen FP16 row weights per key.
 void sparsePvRowsSme(const __fp16* values, const int32_t* keys, const __fp16* panel, int32_t key_count,
                      float* output, bool ordered_keys = false) noexcept;
 void sparsePvRowsSmeRetirePanel(const __fp16* values, const int32_t* keys, __fp16* panel, int32_t key_count,
                                 float* output, bool ordered_keys = false) noexcept;
+
+// Each key carries two query-block membership bits in the upper halfword.
+void sparsePvSharedRowsSme(const __fp16* values, const int32_t* keys, const __fp16* panel, int32_t key_count,
+                           float* output) noexcept;
 
 }  // namespace mllm::cpu::shadownpu
 #endif
