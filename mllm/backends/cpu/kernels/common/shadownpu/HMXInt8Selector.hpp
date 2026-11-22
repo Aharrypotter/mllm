@@ -5503,6 +5503,8 @@ private:
         std::uint64_t topk_busy_ns = 0;
         std::uint64_t sparse_busy_ns = 0;
         std::uint64_t sparse_assist_busy_ns = 0;
+        std::uint64_t sparse_caller_last_tile_ns = 0;
+        std::uint64_t sparse_inline_last_tile_ns = 0;
         std::atomic<bool> topk_failed{false};
         std::string topk_error;
         std::string sparse_error;
@@ -5745,6 +5747,9 @@ private:
                         ? CPUAttentionProfiler::nowNs() : 0;
                     try {
                         consume_rows(*stream, local, row_begin, request.query_len - row_begin);
+                        if (timeline_enabled && local + 1U == stream->count) {
+                            sparse_inline_last_tile_ns = CPUAttentionProfiler::nowNs();
+                        }
                         if (profile_enabled) {
                             sparse_assist_busy_ns +=
                                 CPUAttentionProfiler::nowNs() - assist_begin;
@@ -5923,6 +5928,9 @@ private:
                                     - sparse_begin;
                             }
                             ++consumed;
+                            if (timeline_enabled && consumed == stream.count) {
+                                sparse_caller_last_tile_ns = CPUAttentionProfiler::nowNs();
+                            }
                             continue;
                         }
                         if (cancelled.load(std::memory_order_acquire)) {
@@ -6003,8 +6011,9 @@ private:
         }
         topk_busy_ns = *std::max_element(
             topk_worker_busy_ns.begin(), topk_worker_busy_ns.end());
+        const std::uint64_t sparse_caller_busy_ns = sparse_busy_ns;
         sparse_busy_ns = std::max(
-            sparse_busy_ns, sparse_assist_busy_ns);
+            sparse_caller_busy_ns, sparse_assist_busy_ns);
         if (!sparse_assist_error.empty()) {
             return fail(sparse_assist_error, error);
         }
@@ -6038,6 +6047,9 @@ private:
                 std::memory_order_acquire);
             const std::uint64_t last_ready = last_ready_ns.load(
                 std::memory_order_acquire);
+            const auto relative_us = [begin_ns](std::uint64_t timestamp) {
+                return timestamp >= begin_ns && timestamp != 0 ? (timestamp - begin_ns) / 1000.0 : 0.0;
+            };
             std::cerr << "[HMX_DIRECT_THREE_STAGE] layer="
                       << request.layer_id << " key_len=" << request.key_len
                       << " heads=" << validated.matrix_count
@@ -6072,6 +6084,10 @@ private:
                       << " total_us=" << (finish_ns - begin_ns) / 1000.0
                       << " topk_busy_us=" << topk_busy_ns / 1000.0
                       << " sparse_busy_us=" << sparse_busy_ns / 1000.0
+                      << " sparse_caller_busy_us=" << sparse_caller_busy_ns / 1000.0
+                      << " sparse_assist_busy_us=" << sparse_assist_busy_ns / 1000.0
+                      << " sparse_caller_last_tile_us=" << relative_us(sparse_caller_last_tile_ns)
+                      << " sparse_inline_last_tile_us=" << relative_us(sparse_inline_last_tile_ns)
                       << std::endl;
         }
         return succeed(error);
