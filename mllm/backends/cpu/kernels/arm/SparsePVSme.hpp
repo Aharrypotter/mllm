@@ -67,6 +67,11 @@ inline bool useSparsePvSharedValues() noexcept {
   return enabled;
 }
 
+inline bool useSparsePvBitmapSharedValues() noexcept {
+  static const bool enabled = sparsePvOption("MLLM_HMX_SME_PV_BITMAP_SHARED_VALUES");
+  return enabled;
+}
+
 // The panel is key-major, with sixteen FP16 row weights per key.
 void sparsePvRowsSme(const __fp16* values, const int32_t* keys, const __fp16* panel, int32_t key_count,
                      float* output, bool ordered_keys = false) noexcept;
