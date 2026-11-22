@@ -276,7 +276,11 @@ struct SparsePvTile {
   bool panel_needs_clear = false;
 
   void reserve(int32_t key_len, bool shared) {
-    panel.resize(static_cast<size_t>(key_len) * (shared ? kSparsePvSharedRows : kSparsePvRows));
+    const auto key_count = static_cast<size_t>(key_len);
+    const auto words = key_count * (shared ? kSparsePvSharedRows : kSparsePvRows);
+    // Resizing can expose old weights under a different stride even at the same byte size.
+    if (!panel.empty() && (keys.size() != key_count || panel.size() != words)) panel_needs_clear = true;
+    panel.resize(words);
     active_keys.resize((static_cast<size_t>(key_len) + 63) / 64);
     if (shared) second_block_keys.resize(active_keys.size());
     keys.resize(key_len);
