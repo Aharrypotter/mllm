@@ -326,10 +326,10 @@ struct SparsePvTile {
   void compute(const mllm_fp16_t* values, float* output, bool retire) {
     const int32_t count = collectActiveKeys();
     if (retire) {
-      sparsePvRowsSmeRetirePanel(values, keys.data(), panel.data(), count, output);
+      sparsePvRowsSmeRetirePanel(values, keys.data(), panel.data(), count, output, useSparsePvOrderedKeys());
       panel_needs_clear = false;
     } else {
-      sparsePvRowsSme(values, keys.data(), panel.data(), count, output);
+      sparsePvRowsSme(values, keys.data(), panel.data(), count, output, useSparsePvOrderedKeys());
     }
   }
 
@@ -339,7 +339,7 @@ struct SparsePvTile {
       std::fill_n(panel.data() + static_cast<size_t>(keys[i]) * kSparsePvRows, kSparsePvRows, mllm_fp16_t(0));
     }
     if (!bitmap.scatterWeights<mllm_fp16_t, kSparsePvRows>(first_row, tile_offsets, tile_weights, panel)) return false;
-    sparsePvRowsSme(values, keys.data(), panel.data(), count, output);
+    sparsePvRowsSme(values, keys.data(), panel.data(), count, output, useSparsePvOrderedKeys());
     return true;
   }
 };
@@ -637,6 +637,10 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
     std::fprintf(stderr, "[SHADOWNPU_SME_PV] key_len=%d matrix_begin=%zu matrices=%zu row_begin=%d tiled_rows=%d tail_rows=%d\n",
                  params.key_len, matrix_begin, matrix_count, query_row_begin, sme_end - query_row_begin,
                  query_row_begin + query_row_count - sme_end);
+    if (useSparsePvOrderedKeys()) {
+      std::fprintf(stderr, "[SHADOWNPU_SME_ORDERED_KEYS] key_len=%d matrix_begin=%zu matrices=%zu row_begin=%d tiled_rows=%d\n",
+                   params.key_len, matrix_begin, matrix_count, query_row_begin, sme_end - query_row_begin);
+    }
     if (use_bitmap_panel) {
       std::fprintf(stderr, "[SHADOWNPU_SME_BITMAP_PANEL] key_len=%d matrix_begin=%zu row_begin=%d tiled_rows=%d\n",
                    params.key_len, matrix_begin, query_row_begin, sme_end - query_row_begin);

@@ -131,6 +131,21 @@ theorem direct_scatter_retires (selected : Nat → Nat → Bool) (weight : Nat �
   | false => cases active : activeFromTile selected key <;> simp [retiredPanel, scatteredPanel, active, written]
   | true => simp [retiredPanel, selected_lane_is_active selected key lane inTile written]
 
+-- Splitting each interleaved pair preserves the order of an arbitrary update,
+-- including the single remaining key when the active-key count is odd.
+def foldPairs {α β : Type} (step : α → β → α) (acc : α) : List β → α
+  | [] => acc
+  | [key] => step acc key
+  | first :: second :: rest => foldPairs step (step (step acc first) second) rest
+
+theorem fold_pairs_in_key_order {α β : Type} (step : α → β → α) (acc : α) (keys : List β) :
+    foldPairs step acc keys = keys.foldl step acc := by
+  match keys with
+  | [] => rfl
+  | [_] => rfl
+  | first :: second :: rest =>
+    exact fold_pairs_in_key_order step (step (step acc first) second) rest
+
 -- Integer arithmetic describes which contributions may be omitted. Rounding and instructions are outside this model.
 def pv (keys : List Nat) (weight value : Nat → Int) : Int :=
   keys.foldr (fun key acc => weight key * value key + acc) 0
@@ -165,4 +180,5 @@ end ShadowNPU.SparsePvLayout
 #print axioms ShadowNPU.SparsePvLayout.retire_restores_zero_panel
 #print axioms ShadowNPU.SparsePvLayout.retire_after_last_channel_load
 #print axioms ShadowNPU.SparsePvLayout.direct_scatter_retires
+#print axioms ShadowNPU.SparsePvLayout.fold_pairs_in_key_order
 #print axioms ShadowNPU.SparsePvLayout.zero_weight_filter

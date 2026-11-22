@@ -48,11 +48,16 @@ inline bool useSparsePvRetiringPanel() noexcept {
   return enabled;
 }
 
+inline bool useSparsePvOrderedKeys() noexcept {
+  static const bool enabled = sparsePvOption("MLLM_HMX_SME_PV_ORDERED_KEYS");
+  return enabled;
+}
+
 // The panel is key-major, with sixteen FP16 row weights per key.
 void sparsePvRowsSme(const __fp16* values, const int32_t* keys, const __fp16* panel, int32_t key_count,
-                     float* output) noexcept;
+                     float* output, bool ordered_keys = false) noexcept;
 void sparsePvRowsSmeRetirePanel(const __fp16* values, const int32_t* keys, __fp16* panel, int32_t key_count,
-                                float* output) noexcept;
+                                float* output, bool ordered_keys = false) noexcept;
 
 }  // namespace mllm::cpu::shadownpu
 #endif
