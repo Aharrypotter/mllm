@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <new>
 
+#include "HTP/core/log.h"
 #include "HTP/core/op_package_feature_support.h"
 #include "HTP/core/op_register_ext.h"
 #include "HTP/core/simple_reg.h"
@@ -30,23 +31,38 @@ GraphStatus packCorrection(Tensor& output, const Tensor& activation, const Tenso
       || code_batch != batch || code_height != height || code_width != width || code_depth != out_width
       || out_batch != 1 || out_height != tile_rows || out_spatial_width != 1 || out_depth != words_per_row
       || control_batch * control_height * control_width * control_depth != 3) {
+    errlog("ShadowCorrectionPacket geometry activation=%zu:%zu:%zu:%zu codes=%zu:%zu:%zu:%zu controls=%zu:%zu:%zu:%zu output=%zu:%zu:%zu:%zu",
+           batch, height, width, depth, code_batch, code_height, code_width, code_depth,
+           control_batch, control_height, control_width, control_depth, out_batch, out_height, out_spatial_width, out_depth);
     return GraphStatus::ErrorDimensions;
   }
   if (activation.get_dtype() != DType::Float32 || codes.get_dtype() != DType::QInt16 || codes.interface_offset() != 0
       || controls.get_dtype() != DType::Int32 || output.get_dtype() != DType::Int32
       || !isFlat(output) || !isFlat(activation) || !isFlat(codes) || !isFlat(controls)) {
+    errlog("ShadowCorrectionPacket tensor types=%u:%u:%u:%u formats=%x:%x:%x:%x code_offset=%d",
+           static_cast<unsigned>(activation.get_dtype()), static_cast<unsigned>(codes.get_dtype()),
+           static_cast<unsigned>(controls.get_dtype()), static_cast<unsigned>(output.get_dtype()),
+           activation.get_tensor_format_code(), codes.get_tensor_format_code(), controls.get_tensor_format_code(),
+           output.get_tensor_format_code(), codes.interface_offset());
     return GraphStatus::ErrorFatal;
   }
 
   if (output.total_storage_elements() < packet_words || activation.total_storage_elements() < tile_rows * in_width
       || codes.total_storage_elements() < tile_rows * out_width || controls.total_storage_elements() < 3) {
+    errlog("ShadowCorrectionPacket storage elements activation=%zu codes=%zu controls=%zu output=%zu",
+           activation.total_storage_elements(), codes.total_storage_elements(), controls.total_storage_elements(),
+           output.total_storage_elements());
     return GraphStatus::ErrorDimensions;
   }
   auto* destination = output.raw_data();
   const auto* rows = static_cast<const float*>(activation.raw_data_const());
   const auto* projected = static_cast<const std::int16_t*>(codes.raw_data_const());
   const auto* limits = static_cast<const std::uint32_t*>(controls.raw_data_const());
-  if (!destination || !rows || !projected || !limits) { return GraphStatus::ErrorFatal; }
+  if (!destination || !rows || !projected || !limits) {
+    errlog("ShadowCorrectionPacket missing data activation=%d codes=%d controls=%d output=%d",
+           rows == nullptr, projected == nullptr, limits == nullptr, destination == nullptr);
+    return GraphStatus::ErrorFatal;
+  }
 
   auto* packet = new (destination) correction_packet;
   pack_shadow_correction_tile(rows, projected, limits[0], limits[1], limits[2], packet);
