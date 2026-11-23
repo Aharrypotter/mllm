@@ -6,11 +6,13 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <span>
 #include <vector>
@@ -473,6 +475,15 @@ inline bool bitmapPairQkOption(const char* name) {
   return value != nullptr && value[0] == '1' && value[1] == '\0';
 }
 
+inline int32_t parseBitmapPairMinimumKeys(const char* value) {
+  if (value == nullptr) return 0;
+  const char* end = value + std::strlen(value);
+  int32_t minimum_keys = 0;
+  const auto result = std::from_chars(value, end, minimum_keys);
+  if (result.ec != std::errc{} || result.ptr != end || minimum_keys < 0) return -1;
+  return minimum_keys;
+}
+
 template<bool First, bool Second>
 inline void bitmapPairDot128(const mllm_fp16_t* a, const mllm_fp16_t* b, const mllm_fp16_t* key,
                             float scale, float* score_a, float* score_b) {
@@ -637,8 +648,11 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
 #if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
   static const bool pair_option = detail::bitmapPairQkOption("MLLM_HMX_BITMAP_PAIR_QK");
   static const bool pair_trace = detail::bitmapPairQkOption("MLLM_HMX_BITMAP_PAIR_QK_TRACE");
+  static const int32_t pair_minimum_keys =
+      detail::parseBitmapPairMinimumKeys(std::getenv("MLLM_HMX_BITMAP_PAIR_QK_MIN_KEYS"));
   // Pair only inside this callback and inside the same 16- or 32-row PV tile.
-  const bool pair_qk = pair_option && use_bitmap && params.query_key_dim == detail::kPairQkWidth
+  const bool pair_qk = pair_option && pair_minimum_keys >= 0 && params.key_len >= pair_minimum_keys && use_bitmap
+                       && params.query_key_dim == detail::kPairQkWidth
                        && query_row_begin % 2 == 0 && query_row_count >= 2;
   if (pair_qk) {
     scratch.paired_indices.resize(params.key_len);
