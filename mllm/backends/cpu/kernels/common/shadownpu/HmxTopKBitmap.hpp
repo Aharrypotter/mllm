@@ -70,6 +70,50 @@ class HmxTopKBitmapRows {
     return emitted == indices.size();
   }
 
+  // The producer places each adjacent pair of lanes in the same four-row group.
+  // Emit in ascending key order, with independent offsets for each selected row.
+  template <class Visitor>
+  bool visitPair(int32_t row, size_t first_count, size_t second_count, std::span<uint64_t> active_keys,
+                 Visitor&& visit) const noexcept {
+    static_assert(HMX_I8_TOPK_BITMAP_ROWS == 4 && HMX_I8_TOPK_BITMAP_COLS == 32);
+    if (data_ == nullptr || row < 0 || row >= rows_ - 1 || row % 2 != 0) return false;
+    const int32_t visible = prefix_ + row + 1;
+    if (first_count == 0 || first_count > static_cast<size_t>(visible)
+        || second_count == 0 || second_count > static_cast<size_t>(visible + 1)
+        || (!active_keys.empty() && active_keys.size() < static_cast<size_t>((visible + 64) / 64))) {
+      return false;
+    }
+    const int32_t group = row / HMX_I8_TOPK_BITMAP_ROWS;
+    const int32_t lane = row % HMX_I8_TOPK_BITMAP_ROWS;
+    size_t first = 0, second = 0;
+    int32_t column = 0;
+    for (size_t word = group_offset_[group] + lane; word < group_offset_[group + 1];
+         word += HMX_I8_TOPK_BITMAP_ROWS, column += HMX_I8_TOPK_BITMAP_COLS) {
+      const uint32_t a = loadWord(word);
+      const uint32_t b = loadWord(word + 1);
+      uint32_t pending = a | b;
+      if (pending == 0) continue;
+      if ((a != 0 && column + static_cast<int32_t>(std::bit_width(a)) > visible)
+          || (b != 0 && column + static_cast<int32_t>(std::bit_width(b)) > visible + 1)
+          || static_cast<size_t>(std::popcount(a)) > first_count - first
+          || static_cast<size_t>(std::popcount(b)) > second_count - second) {
+        return false;
+      }
+      if (!active_keys.empty()) active_keys[column / 64] |= uint64_t(pending) << (column % 64);
+      while (pending != 0) {
+        const auto bit = std::countr_zero(pending);
+        const auto mask = uint32_t{1} << bit;
+        const bool in_first = (a & mask) != 0;
+        const bool in_second = (b & mask) != 0;
+        visit(column + bit, in_first, in_second, first, second);
+        first += in_first;
+        second += in_second;
+        pending &= pending - 1;
+      }
+    }
+    return first == first_count && second == second_count;
+  }
+
   // Rows store probabilities in the same increasing-key order as decode.
   // The consumer can share the same four-row producer words even when its
   // sixteen-row tile starts partway through a producer group.

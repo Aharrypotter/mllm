@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <span>
 #include <vector>
@@ -257,6 +258,10 @@ struct HmxF16SparseScratch {
   std::vector<mllm_fp16_t> query;
   std::vector<mllm_fp16_t> weights;
   std::vector<int32_t> row_indices;
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
+  std::vector<float> paired_probabilities;
+  std::vector<int32_t> paired_indices;
+#endif
 
   void resize(size_t key_len, size_t head_dim) {
     probabilities.resize(key_len);
@@ -460,6 +465,64 @@ inline float selectedQKScoresF16(const mllm_fp16_t* query, const mllm_fp16_t* ke
   return row_max;
 }
 
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
+inline constexpr int kPairQkWidth = 128;
+
+inline bool bitmapPairQkOption(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+template<bool First, bool Second>
+inline void bitmapPairDot128(const mllm_fp16_t* a, const mllm_fp16_t* b, const mllm_fp16_t* key,
+                            float scale, float* score_a, float* score_b) {
+  float32x4_t a_low{}, a_high{}, b_low{}, b_high{};
+  for (int dim = 0; dim < kPairQkWidth; dim += 8) {
+    const auto k = vld1q_f16(reinterpret_cast<const float16_t*>(key + dim));
+    if constexpr (First) {
+      const auto q = vld1q_f16(reinterpret_cast<const float16_t*>(a + dim));
+      a_low = vfmlalq_low_f16(a_low, q, k);
+      a_high = vfmlalq_high_f16(a_high, q, k);
+    }
+    if constexpr (Second) {
+      const auto q = vld1q_f16(reinterpret_cast<const float16_t*>(b + dim));
+      b_low = vfmlalq_low_f16(b_low, q, k);
+      b_high = vfmlalq_high_f16(b_high, q, k);
+    }
+  }
+  if constexpr (First) *score_a = vaddvq_f32(vaddq_f32(a_low, a_high)) * scale;
+  if constexpr (Second) *score_b = vaddvq_f32(vaddq_f32(b_low, b_high)) * scale;
+}
+
+template<bool Trace>
+inline bool scoreBitmapPair(const HmxTopKBitmapRows& bitmap, int32_t row, int32_t keep, int32_t next_keep,
+                            const float* query, int32_t query_stride, const mllm_fp16_t* key, float scale,
+                            std::span<uint64_t> active_keys, HmxF16SparseScratch& scratch, size_t& shared) {
+  std::array<mllm_fp16_t, kPairQkWidth> next_query;
+  mllm_fp32_to_fp16_row(query, scratch.query.data(), kPairQkWidth);
+  mllm_fp32_to_fp16_row(query + query_stride, next_query.data(), kPairQkWidth);
+  return bitmap.visitPair(row, keep, next_keep, active_keys, [&](int32_t token, bool a, bool b, size_t i, size_t j) {
+    const auto* key_row = key + static_cast<size_t>(token) * kPairQkWidth;
+    if (a) {
+      scratch.row_indices[i] = token;
+      if (b) {
+        scratch.paired_indices[j] = token;
+        bitmapPairDot128<true, true>(scratch.query.data(), next_query.data(), key_row, scale,
+                                    scratch.probabilities.data() + i, scratch.paired_probabilities.data() + j);
+        if constexpr (Trace) ++shared;
+      } else {
+        bitmapPairDot128<true, false>(scratch.query.data(), next_query.data(), key_row, scale,
+                                     scratch.probabilities.data() + i, nullptr);
+      }
+    } else {
+      scratch.paired_indices[j] = token;
+      bitmapPairDot128<false, true>(scratch.query.data(), next_query.data(), key_row, scale,
+                                   nullptr, scratch.paired_probabilities.data() + j);
+    }
+  });
+}
+#endif
+
 inline void normalizeSoftmax(float* probabilities, int32_t keep) {
 #if defined(MLLM_HOST_ARCH_ARM64) || defined(MLLM_HOST_ARCH_ARM)
   arm::softmax_v1_fp32(probabilities, probabilities, keep, 1, 1);
@@ -571,6 +634,18 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
     }
     scratch.row_indices.resize(params.key_len);
   }
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
+  static const bool pair_option = detail::bitmapPairQkOption("MLLM_HMX_BITMAP_PAIR_QK");
+  static const bool pair_trace = detail::bitmapPairQkOption("MLLM_HMX_BITMAP_PAIR_QK_TRACE");
+  // Pair only inside this callback and inside the same 16- or 32-row PV tile.
+  const bool pair_qk = pair_option && use_bitmap && params.query_key_dim == detail::kPairQkWidth
+                       && query_row_begin % 2 == 0 && query_row_count >= 2;
+  if (pair_qk) {
+    scratch.paired_indices.resize(params.key_len);
+    scratch.paired_probabilities.resize(params.key_len);
+  }
+  size_t paired_rows = 0, paired_positions = 0, shared_keys = 0;
+#endif
 #if defined(MLLM_ANDROID_SME_SPARSE_PV)
   // HMX publishes unique per-row indices. The opt-in SME reduction uses the
   // same FP16 probabilities for finite values, grouped sixteen rows at a time.
@@ -600,20 +675,26 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
     const mllm_fp16_t* value_base =
         value + static_cast<size_t>(batch) * params.value_stride[0] + static_cast<size_t>(kv_head) * params.value_stride[1];
     const int32_t* row_offsets = external_row_offsets + static_cast<size_t>(query_head) * external_row_offsets_head_stride;
-    for (int32_t query_index = query_row_begin; query_index < query_row_begin + query_row_count; ++query_index) {
-      const int32_t valid = params.causal_mask && params.query_len > 1
-                                ? std::min(params.key_len, params.key_len - params.query_len + query_index + 1)
-                                : params.key_len;
-      const int32_t expected_keep =
-          valid <= params.dense_tokens
-              ? valid
-              : std::max(1, std::min(valid, static_cast<int32_t>(std::ceil(density * static_cast<float>(valid)))));
+    const int32_t query_row_end = query_row_begin + query_row_count;
+    const auto visibleKeys = [&](int32_t row) {
+      return params.causal_mask && params.query_len > 1
+          ? std::min(params.key_len, params.key_len - params.query_len + row + 1) : params.key_len;
+    };
+    const auto rowKeep = [&](int32_t row, int32_t valid) {
+      const auto expected = valid <= params.dense_tokens
+          ? valid : std::max(1, std::min(valid, static_cast<int32_t>(std::ceil(density * static_cast<float>(valid)))));
+      const int32_t begin = row_offsets[row], end = row_offsets[row + 1];
+      if (begin < 0 || end <= begin || end - begin != expected || static_cast<size_t>(end) > external_head_stride) return 0;
+      return end - begin;
+    };
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
+    bool paired_row_ready = false;
+#endif
+    for (int32_t query_index = query_row_begin; query_index < query_row_end; ++query_index) {
+      const int32_t valid = visibleKeys(query_index);
+      const int32_t keep = rowKeep(query_index, valid);
+      if (keep == 0) return false;
       const int32_t begin = row_offsets[query_index];
-      const int32_t end = row_offsets[query_index + 1];
-      if (begin < 0 || end <= begin || end - begin != expected_keep || static_cast<size_t>(end) > external_head_stride) {
-        return false;
-      }
-      const int32_t keep = end - begin;
       std::span<uint64_t> active_keys;
       mllm_fp16_t* weights = scratch.weights.data();
 #if defined(MLLM_ANDROID_SME_SPARSE_PV)
@@ -631,7 +712,7 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
         if (deferred_bitmap_row) {
           if (lane == 0) {
             const int32_t tile_end = row_offsets[query_index + kSparsePvRows];
-            if (tile_end < end || static_cast<size_t>(tile_end) > external_head_stride) return false;
+            if (tile_end < row_offsets[query_index + 1] || static_cast<size_t>(tile_end) > external_head_stride) return false;
             pv_tile.startBitmap(static_cast<size_t>(tile_end - begin));
           }
           weights = pv_tile.bitmapWeightRow(lane, keep);
@@ -641,24 +722,46 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
         }
       }
 #endif
-      const int32_t* selected;
-      if (use_bitmap) {
-        if (!bitmap_rows.decode(query_index, {scratch.row_indices.data(), static_cast<size_t>(keep)}, active_keys)) return false;
-        selected = scratch.row_indices.data();
-      } else {
-        selected = external_indices + matrix * external_head_stride + begin;
-        for (int32_t index = 0; index < keep; ++index) {
-          if (selected[index] < 0 || selected[index] >= valid) { return false; }
-        }
-      }
       const float* query_row = query + static_cast<size_t>(batch) * params.query_stride[0]
                                + static_cast<size_t>(query_head) * params.query_stride[1]
                                + static_cast<size_t>(query_index) * params.query_stride[2];
-      mllm_fp32_to_fp16_row(query_row, scratch.query.data(), params.query_key_dim);
-      detail::selectedQKScoresF16<true>(scratch.query.data(), key_base, params.key_stride[2], selected, keep,
-                                        params.query_key_dim, scale, scratch.probabilities.data());
-      detail::normalizeSoftmax(scratch.probabilities.data(), keep);
-      mllm_fp32_to_fp16_row(scratch.probabilities.data(), weights, keep);
+      const int32_t* selected;
+      float* probabilities = scratch.probabilities.data();
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
+      if (paired_row_ready) {
+        selected = scratch.paired_indices.data();
+        probabilities = scratch.paired_probabilities.data();
+        paired_row_ready = false;
+      } else if (pair_qk && query_index % 2 == 0 && query_index + 1 < query_row_end) {
+        const int32_t next_keep = rowKeep(query_index + 1, visibleKeys(query_index + 1));
+        if (next_keep == 0) return false;
+        const auto score_pair = pair_trace ? detail::scoreBitmapPair<true> : detail::scoreBitmapPair<false>;
+        if (!score_pair(bitmap_rows, query_index, keep, next_keep, query_row, params.query_stride[2],
+                        key_base, scale, active_keys, scratch, shared_keys)) return false;
+        if (pair_trace) {
+          paired_rows += 2;
+          paired_positions += static_cast<size_t>(keep) + next_keep;
+        }
+        selected = scratch.row_indices.data();
+        paired_row_ready = true;
+      } else
+#endif
+      {
+        if (use_bitmap) {
+          if (!bitmap_rows.decode(query_index, {scratch.row_indices.data(), static_cast<size_t>(keep)}, active_keys)) return false;
+          selected = scratch.row_indices.data();
+        } else {
+          selected = external_indices + matrix * external_head_stride + begin;
+          for (int32_t index = 0; index < keep; ++index) {
+            if (selected[index] < 0 || selected[index] >= valid) { return false; }
+          }
+        }
+        mllm_fp32_to_fp16_row(query_row, scratch.query.data(), params.query_key_dim);
+        detail::selectedQKScoresF16<true>(scratch.query.data(), key_base, params.key_stride[2], selected, keep,
+                                         params.query_key_dim, scale, probabilities);
+      }
+      detail::normalizeSoftmax(probabilities, keep);
+      mllm_fp32_to_fp16_row(probabilities, weights, keep);
       float* output_row = output + static_cast<size_t>(batch) * params.output_stride[0]
                           + static_cast<size_t>(query_head) * params.output_stride[1]
                           + static_cast<size_t>(query_index) * params.output_stride[2];
@@ -693,6 +796,12 @@ inline bool patternSparseAttentionHmxF16Range(const PatternSparseAttentionF32Par
       detail::sparseValueF16(value_base, selected, weights, keep, params.value_dim, output_row);
     }
   }
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
+  if (pair_qk && pair_trace) {
+    std::fprintf(stderr, "[SHADOWNPU_BITMAP_PAIR_QK] key_len=%d matrix_begin=%zu row_begin=%d pair_rows=%zu positions=%zu shared_keys=%zu\n",
+                 params.key_len, matrix_begin, query_row_begin, paired_rows, paired_positions, shared_keys);
+  }
+#endif
 #if defined(MLLM_ANDROID_SME_SPARSE_PV)
   if (use_sme && traceSparsePvSme()) {
     std::fprintf(stderr, "[SHADOWNPU_SME_PV] key_len=%d matrix_begin=%zu matrices=%zu row_begin=%d tiled_rows=%d tail_rows=%d\n",
