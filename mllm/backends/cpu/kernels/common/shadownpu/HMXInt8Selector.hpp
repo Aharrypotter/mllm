@@ -887,11 +887,45 @@ private:
         found->second.raw_key_padded_n = 0;
     }
 
+    static bool tracePackedKeyGroups() noexcept {
+        static const bool enabled = [] {
+            const char *value = std::getenv("MLLM_HMX_INT8_PACKED_K_REUSE_TRACE");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        return enabled;
+    }
+
+    static bool aliasPackedLayerCacheEnabled() noexcept {
+        static const bool enabled = [] {
+            const char *value = std::getenv("MLLM_HMX_INT8_ALIAS_LAYER_K_CACHE");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        return enabled;
+    }
+
+    static bool packedKeyIsAlias(std::optional<std::uint64_t> sources,
+                                 std::size_t local) noexcept {
+        return sources && ((*sources >> (local * 4)) & 15u) != local;
+    }
+
+    static void tracePackedLayerTransfer(const Request &request,
+                                         const char *action, int tokens,
+                                         std::size_t slots) noexcept {
+        if (!tracePackedKeyGroups()) return;
+        const std::size_t rows = slots * static_cast<std::size_t>(tokens);
+        std::fprintf(stderr,
+                     "[HMX_INT8_LAYER_K_TRANSFER] action=%s layer=%d key_len=%d "
+                     "tokens=%d slots=%zu packed_bytes=%zu sum_bytes=%zu\n",
+                     action, request.layer_id, request.key_len, tokens, slots,
+                     rows * request.head_dim, rows * sizeof(std::int32_t));
+    }
+
     LayerPackedKeyPlan loadLayerPackedKeyGroup(
         const Request &request, std::size_t count,
         const std::size_t *matrix_indices, float k_scale, int actual_n,
         std::int8_t *direct_key, std::int32_t *direct_sums,
-        bool profile_enabled, const float *per_head_k_scales = nullptr) {
+        bool profile_enabled, const float *per_head_k_scales = nullptr,
+        std::optional<std::uint64_t> packed_sources = std::nullopt) {
         LayerPackedKeyPlan plan;
         if (!layerPackedKeyCacheEnabled() || matrix_indices == nullptr
             || direct_key == nullptr || direct_sums == nullptr) {
@@ -912,12 +946,14 @@ private:
 
         int common_tokens = -1;
         for (std::size_t local = 0; local < count; ++local) {
+            if (packedKeyIsAlias(packed_sources, local)) continue;
             const std::size_t matrix = matrix_indices[local];
             LayerPackedKeyCache &cache = layer_packed_key_cache_[matrix];
             const float matrix_k_scale = per_head_k_scales == nullptr
                 ? k_scale : per_head_k_scales[local];
             if (!cache.valid(request.key_heads[matrix], matrix_k_scale,
-                             request.key_len, request.head_dim)) {
+                             request.key_len, request.head_dim)
+                || (packed_sources && cache.tokens != causal_prefix)) {
                 common_tokens = 0;
                 break;
             }
@@ -935,10 +971,13 @@ private:
             = static_cast<std::size_t>(actual_n) * request.head_dim;
         const std::size_t packed_prefix
             = static_cast<std::size_t>(plan.key_begin) * request.head_dim;
+        std::size_t copied_slots = 0;
         {
             ScopedAttentionProfile profile(
                 AttentionProfileStage::HMX_K_CACHE_LOAD, profile_enabled);
             for (std::size_t local = 0; local < count; ++local) {
+                if (packedKeyIsAlias(packed_sources, local)) continue;
+                ++copied_slots;
                 const LayerPackedKeyCache &cache =
                     layer_packed_key_cache_[matrix_indices[local]];
                 std::memcpy(direct_key + local * direct_head_stride,
@@ -950,6 +989,7 @@ private:
                                 * sizeof(std::int32_t));
             }
         }
+        tracePackedLayerTransfer(request, "load", plan.key_begin, copied_slots);
         plan.reuse_packed = plan.key_begin == request.key_len;
         return plan;
     }
@@ -959,7 +999,8 @@ private:
         const std::size_t *matrix_indices, float k_scale, int actual_n,
         int key_begin, const std::int8_t *direct_key,
         const std::int32_t *direct_sums, bool profile_enabled,
-        const float *per_head_k_scales = nullptr) {
+        const float *per_head_k_scales = nullptr,
+        std::optional<std::uint64_t> packed_sources = std::nullopt) {
         if (!layerPackedKeyCacheEnabled() || matrix_indices == nullptr
             || direct_key == nullptr || direct_sums == nullptr) {
             return;
@@ -973,6 +1014,7 @@ private:
             = static_cast<std::size_t>(actual_n) * request.head_dim;
         const std::size_t packed_begin
             = static_cast<std::size_t>(key_begin) * request.head_dim;
+        std::size_t copied_slots = 0;
         {
             ScopedAttentionProfile profile(
                 AttentionProfileStage::HMX_K_CACHE_STORE, profile_enabled);
@@ -981,6 +1023,13 @@ private:
                 const float matrix_k_scale = per_head_k_scales == nullptr
                     ? k_scale : per_head_k_scales[local];
                 LayerPackedKeyCache &cache = layer_packed_key_cache_[matrix];
+                if (packedKeyIsAlias(packed_sources, local)) {
+                    // The producer never writes an alias slot. Retire any old
+                    // entry before the head can become a producer again.
+                    cache.reset(request.key_heads[matrix], matrix_k_scale);
+                    continue;
+                }
+                ++copied_slots;
                 if (key_begin == 0
                     || cache.source != request.key_heads[matrix]
                     || cache.scale != matrix_k_scale) {
@@ -1003,6 +1052,8 @@ private:
                 cache.tokens = request.key_len;
             }
         }
+        tracePackedLayerTransfer(request, "store", actual_n - key_begin,
+                                 copied_slots);
     }
 
     static std::mutex &processOperatorMutex() {
@@ -2820,6 +2871,19 @@ private:
                         layerPackedKeyCacheEnabled()
                         && (!dynamic_qk_scale
                             || execution_group.per_head_bucket_scales);
+                    const bool cpu_packed_pipeline =
+                        cpuPackedPipelineEnabled()
+                        && execution_group.per_head_bucket_scales;
+                    // One Q slice can share the representative map for the
+                    // cached prefix, new K tiles and the DSP consumer.
+                    const auto cached_packed_sources =
+                        use_layer_key_cache && aliasPackedLayerCacheEnabled()
+                        && cpu_packed_pipeline
+                        && bucket.execute_cpu_packed_shared_key_hn != nullptr
+                        && request.query_len <= bucket.info.m
+                        ? packedKeySources(request, group, count,
+                                           per_head_k_scales.data())
+                        : std::nullopt;
                     const LayerPackedKeyPlan layer_key_plan =
                         use_layer_key_cache
                         ? loadLayerPackedKeyGroup(
@@ -2827,7 +2891,8 @@ private:
                             actual_n, direct_key, direct_key_sums,
                             profile_enabled,
                             execution_group.per_head_bucket_scales
-                                ? per_head_k_scales.data() : nullptr)
+                                ? per_head_k_scales.data() : nullptr,
+                            cached_packed_sources)
                         : LayerPackedKeyPlan{};
                     const RawKeyPlan shared_key_plan =
                         dynamic_qk_scale || use_layer_key_cache
@@ -2840,9 +2905,6 @@ private:
                     const bool reuse_packed = use_layer_key_cache
                         ? layer_key_plan.reuse_packed
                         : shared_key_plan.reuse_packed;
-                    const bool cpu_packed_pipeline =
-                        cpuPackedPipelineEnabled()
-                        && execution_group.per_head_bucket_scales;
                     const bool cpu_pack_overlap =
                         cpu_packed_pipeline && cpuPackOverlapEnabled();
                     const bool long_rpc_requested =
@@ -3033,15 +3095,14 @@ private:
                             std::atomic<bool> pack_ok{false};
                             const int cpu_key_begin = query_begin == 0
                                 ? key_begin : actual_n;
-                            // Partial K and multi-slice Q can keep arena data
-                            // from a previous call with a different head map.
-                            const auto key_sources =
-                                bucket.execute_cpu_packed_shared_key_hn != nullptr
-                                && !use_layer_key_cache && cpu_key_begin == 0
-                                && request.query_len <= bucket.info.m
-                                ? packedKeySources(request, group, count,
-                                                   per_head_k_scales.data())
-                                : std::nullopt;
+                            const auto key_sources = use_layer_key_cache
+                                ? cached_packed_sources
+                                : (bucket.execute_cpu_packed_shared_key_hn != nullptr
+                                   && cpu_key_begin == 0
+                                   && request.query_len <= bucket.info.m
+                                   ? packedKeySources(request, group, count,
+                                                      per_head_k_scales.data())
+                                   : std::nullopt);
                             static const bool native_topk_enabled = [] {
                                 const char *value = std::getenv("MLLM_HMX_INT8_NATIVE_TOPK");
                                 return value != nullptr && std::strcmp(value, "1") == 0;
@@ -3521,6 +3582,7 @@ private:
                                     const int cache_heads = request.heads;
                                     const int cache_key_len = request.key_len;
                                     const int cache_head_dim = request.head_dim;
+                                    const int cache_layer = request.layer_id;
                                     const float cache_k_scale =
                                         bucket.info.k_scale;
                                     *deferred_cache_store =
@@ -3533,9 +3595,9 @@ private:
                                                  std::move(cached_k_scales),
                                              cache_batch, cache_heads,
                                              cache_key_len, cache_head_dim,
-                                             count, cache_k_scale, actual_n,
+                                             cache_layer, count, cache_k_scale, actual_n,
                                              key_begin, direct_key,
-                                             direct_key_sums,
+                                             direct_key_sums, cached_packed_sources,
                                              profile_enabled]() mutable {
                                                 Request cache_request;
                                                 cache_request.batch =
@@ -3546,6 +3608,7 @@ private:
                                                     cache_key_len;
                                                 cache_request.head_dim =
                                                     cache_head_dim;
+                                                cache_request.layer_id = cache_layer;
                                                 cache_request.key_heads =
                                                     key_sources.data();
                                                 commitLayerPackedKeyGroup(
@@ -3555,7 +3618,8 @@ private:
                                                     key_begin, direct_key,
                                                     direct_key_sums,
                                                     profile_enabled,
-                                                    cached_k_scales.data());
+                                                    cached_k_scales.data(),
+                                                    cached_packed_sources);
                                             });
                                 } else {
                                     commitLayerPackedKeyGroup(
@@ -3563,7 +3627,7 @@ private:
                                         bucket.info.k_scale, actual_n,
                                         key_begin, direct_key,
                                         direct_key_sums, profile_enabled,
-                                        per_head_k_scales.data());
+                                        per_head_k_scales.data(), cached_packed_sources);
                                 }
                             }
                             if (!long_rpc_pipeline) {
@@ -4455,10 +4519,7 @@ private:
             const char *value = std::getenv("MLLM_HMX_INT8_SHARE_PACKED_K");
             return value != nullptr && std::strcmp(value, "1") == 0;
         }();
-        static const bool trace_key_groups = [] {
-            const char *value = std::getenv("MLLM_HMX_INT8_PACKED_K_REUSE_TRACE");
-            return value != nullptr && std::strcmp(value, "1") == 0;
-        }();
+        const bool trace_key_groups = tracePackedKeyGroups();
         const int first_key_token = (key_begin / 32) * 32;
         std::size_t distinct_sources = 0;
         std::size_t distinct_packs = 0;
@@ -4478,8 +4539,7 @@ private:
             auto *key_destination = direct_key + local * key_stride;
             const std::size_t sum_stride = static_cast<std::size_t>(padded_n);
             auto *sum_destination = direct_sums + local * sum_stride;
-            const bool alias_key = key_sources
-                && ((*key_sources >> (local * 4)) & 15u) != local;
+            const bool alias_key = packedKeyIsAlias(key_sources, local);
             const bool copy_key = !key_sources && share_packed_key
                 && representative != local;
             aliased_heads += alias_key;
