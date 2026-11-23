@@ -48,7 +48,7 @@ TensorValue::ptr_t shadowRawGraphOutput(const ir::graph::SubGraphOp::ptr_t& grap
   for (const auto& op : region->ops()) {
     const auto custom = std::dynamic_pointer_cast<ir::linalg::CustomizedOp>(op);
     if (custom && dynamic_cast<ShadowCorrectionPacketOp*>(custom->getAOp()) && custom->outputs().size() == 1) {
-      actual_packet = custom->outputs()[0]->cast_<TensorValue>();
+      actual_packet = custom->outputs().front()->cast_<TensorValue>();
       break;
     }
   }
@@ -56,8 +56,8 @@ TensorValue::ptr_t shadowRawGraphOutput(const ir::graph::SubGraphOp::ptr_t& grap
 
   for (const auto& op : region->ops()) {
     if (!op->isa_<ir::cf::ReturnOp>() || op->inputs().size() != 4) { continue; }
-    const auto raw = op->inputs()[0]->cast_<TensorValue>();
-    const auto returned_packet = op->inputs()[3]->cast_<TensorValue>();
+    const auto raw = op->inputs().front()->cast_<TensorValue>();
+    const auto returned_packet = op->inputs().back()->cast_<TensorValue>();
     const auto& raw_shape = raw->tensor_.shape();
     if (returned_packet == actual_packet && raw->getAttr("is_graph_output") && raw_shape.size() == 4
         && raw_shape[0] == 1 && raw_shape[1] * raw_shape[2] == packet::tile_rows
