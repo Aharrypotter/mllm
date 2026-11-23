@@ -26,6 +26,7 @@
 #include "mllm/models/qwen_npu/QnnAttentionLayout.hpp"
 #include "mllm/models/qwen_npu/ShadowNPUAttentionQuantization.hpp"
 #include "configuration_qwen_npu.hpp"
+#include "mllm/models/qwen_npu/native_kv_attention.hpp"
 
 namespace mllm::models::qwen_npu {
 
@@ -467,6 +468,8 @@ class QwenAttentionMatmul final : public nn::Module {
     key_states = kv_outputs[0];
     value_states = kv_outputs[1];
 
+    const bool native_kv = !Context::instance().thisThread()->trace_mode && num_key_value_groups_ > 1
+                           && key_states.shape()[1] == num_key_value_heads_;
     Tensor output;
     if (use_sparse_prefill_attention_ && S > 1) {
       if (use_pattern_sparse_prefill_attention_) {
@@ -478,19 +481,19 @@ class QwenAttentionMatmul final : public nn::Module {
             const char* value = std::getenv("MLLM_HMX_COMPACT_KV_STAGE");
             return value && value[0] == '1' && value[1] == '\0';
           }();
-          // StaticCache stores replicas of each KV head consecutively. Both
-          // sparse attention and the HMX selector already map query heads to KV heads.
-          if (compact_kv_stage && num_key_value_groups_ > 1 && hmxDirectKVCastEnabled()
-              && !Context::instance().thisThread()->trace_mode && supportsDirectHmxKVStage(key_states)
-              && supportsDirectHmxKVStage(value_states) && key_states.shape()[1] == num_attention_heads_
-              && value_states.shape()[1] == num_attention_heads_) {
+          const bool direct_stage = hmxDirectKVCastEnabled() && !Context::instance().thisThread()->trace_mode
+                                    && supportsDirectHmxKVStage(key_states) && supportsDirectHmxKVStage(value_states);
+          // The replicated cache stores each group consecutively.
+          if (compact_kv_stage && !native_kv && num_key_value_groups_ > 1 && direct_stage
+              && key_states.shape()[1] == num_attention_heads_ && value_states.shape()[1] == num_attention_heads_) {
             kv_head_group_size = num_key_value_groups_;
           }
           static const bool incremental_kv_stage = [] {
             const char* value = std::getenv("MLLM_HMX_INCREMENTAL_KV_STAGE");
             return value && value[0] == '1' && value[1] == '\0';
           }();
-          if (incremental_kv_stage && kv_head_group_size > 1 && kv_cache_.getStaticCache() != nullptr) {
+          if (incremental_kv_stage && (native_kv || kv_head_group_size > 1) && direct_stage
+              && kv_cache_.getStaticCache() != nullptr) {
             sparse_key_states = hmx_prefill_keys_.stage(key_states, kv_head_group_size, S);
             sparse_value_states = hmx_prefill_values_.stage(value_states, kv_head_group_size, S);
           } else
@@ -513,6 +516,8 @@ class QwenAttentionMatmul final : public nn::Module {
             nn::functional::matmul(query_states.to(kFloat32), key_states.to(kFloat32), false, true) * (1.f / sqrtf(head_dim_));
         output = sparse_softmax_value_(logits, value_states);
       }
+    } else if (native_kv) {
+      output = nativeKVDenseAttention(query_states, key_states, value_states, mask_, softmax_);
     } else {
       // attention weight
       // [B, H, S, S]

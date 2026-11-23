@@ -3,6 +3,7 @@
 #include <cmath>
 
 #include "mllm/models/qwen_npu/configuration_qwen_npu.hpp"
+#include "mllm/models/qwen_npu/native_kv_attention.hpp"
 #include "mllm/models/ARGeneration.hpp"
 #include "mllm/nn/Nn.hpp"
 #include "mllm/nn/Module.hpp"
@@ -164,18 +165,18 @@ class QwenAttentionCPU final : public nn::Module {
     key_states = kv_outputs[0];
     value_states = kv_outputs[1];
 
-    // Attention weights: [B,H,S,S] where S for query is current input length, S for key is cached length
-    auto attn_weights = nn::functional::matmul(query_states.to(kFloat32), key_states.to(kFloat32), /*trans_a=*/false,
-                                               /*trans_b=*/true)
-                        * (1.f / std::sqrt(static_cast<float>(head_dim_)));
-
-    attn_weights = mask_(attn_weights);
-    // HF Qwen2 computes softmax in float32, then converts back to original dtype
-    auto attn_weights_dtype = attn_weights.dtype();
-    attn_weights = softmax_(attn_weights.to(kFloat32)).to(attn_weights_dtype);
-
-    // Attention output: [B,H,S,S] @ [B,H,S,D] -> [B,H,S,D]
-    auto attn_output = nn::functional::matmul(attn_weights, value_states.to(attn_weights.dtype()));
+    Tensor attn_output;
+    if (!Context::instance().thisThread()->trace_mode && key_states.shape()[1] != num_attention_heads_) {
+      attn_output = nativeKVDenseAttention(query_states, key_states, value_states, mask_, softmax_);
+    } else {
+      // Attention weights: [B,H,S,T], where T is the cached length.
+      auto attn_weights = nn::functional::matmul(query_states.to(kFloat32), key_states.to(kFloat32), false, true)
+                          * (1.f / std::sqrt(static_cast<float>(head_dim_)));
+      attn_weights = mask_(attn_weights);
+      const auto attn_weights_dtype = attn_weights.dtype();
+      attn_weights = softmax_(attn_weights.to(kFloat32)).to(attn_weights_dtype);
+      attn_output = nn::functional::matmul(attn_weights, value_states.to(attn_weights.dtype()));
+    }
     // -> [B,S,H,D] -> [B,S,H*D]
     attn_output = attn_output.transpose(1, 2).view({B, S, num_attention_heads_ * head_dim_});
 

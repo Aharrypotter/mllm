@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include <sys/resource.h>
+
 #include <mllm/mllm.hpp>
 #include <mllm/utils/AnyValue.hpp>
 #include <mllm/core/DataTypes.hpp>
@@ -38,6 +40,58 @@
 using mllm::Argparse;
 
 namespace {
+
+int64_t peakRssKiB() {
+  rusage usage{};
+  if (getrusage(RUSAGE_SELF, &usage) != 0) { return -1; }
+#if defined(__APPLE__)
+  return usage.ru_maxrss / 1024;
+#else
+  return usage.ru_maxrss;
+#endif
+}
+
+class ProfiledSharedKVCache final : public mllm::nn::StaticCache {
+ public:
+  ProfiledSharedKVCache(int32_t capacity, int32_t layers, int32_t cache_heads, int32_t kv_heads, int32_t head_dim)
+      : StaticCache(capacity, layers, cache_heads, kv_heads, head_dim, mllm::kFloat32, mllm::kFloat32, mllm::kCPU, false),
+        bytes_per_token_(uint64_t{2} * cache_heads * head_dim * sizeof(float)),
+        capacity_bytes_(bytes_per_token_ * capacity * layers) {}
+
+  void beginPrefill() {
+    peak_before_prefill_kib_ = peakRssKiB();
+    active_ = true;
+  }
+
+  std::array<mllm::Tensor, 2> updateKVCache(int32_t layer, mllm::Tensor key, mllm::Tensor value) override {
+    if (!active_) { return StaticCache::updateKVCache(layer, std::move(key), std::move(value)); }
+    const auto tokens = key.shape()[2];
+    const auto start = std::chrono::steady_clock::now();
+    auto states = StaticCache::updateKVCache(layer, std::move(key), std::move(value));
+    elapsed_ += std::chrono::steady_clock::now() - start;
+    written_bytes_ += bytes_per_token_ * tokens;
+    ++append_calls_;
+    return states;
+  }
+
+  void finishPrefill() {
+    active_ = false;
+    const auto peak_first_token_kib = peakRssKiB();
+    const double append_ms = std::chrono::duration<double, std::milli>(elapsed_).count();
+    fmt::print("SHADOWNPU_SHARED_KV_PREFILL append_calls={} cache_capacity_bytes={} logical_written_bytes={} "
+               "append_ms={:.3f} peak_rss_before_prefill_kib={} peak_rss_at_first_token_kib={}\n",
+               append_calls_, capacity_bytes_, written_bytes_, append_ms, peak_before_prefill_kib_, peak_first_token_kib);
+  }
+
+ private:
+  uint64_t bytes_per_token_;
+  uint64_t capacity_bytes_;
+  uint64_t written_bytes_ = 0;
+  uint64_t append_calls_ = 0;
+  std::chrono::steady_clock::duration elapsed_{};
+  int64_t peak_before_prefill_kib_ = -1;
+  bool active_ = false;
+};
 
 std::string readPromptFile(const std::string& path) {
   std::ifstream input(path);
@@ -287,6 +341,10 @@ int main(int argc, char** argv) {
       Argparse::add<std::string>("--attention-mode")
           .help("Prefill attention mode: dense, f32-topk, or hmx-topk")
           .def("dense");
+  auto& native_shared_kv =
+      Argparse::add<bool>("--native-shared-kv").help("Keep the shared QNN prefill and CPU decode cache at native KV-head count");
+  auto& profile_shared_kv =
+      Argparse::add<bool>("--profile-shared-kv").help("Report shared KV append time, logical bytes, and process peak RSS at TTFT");
   auto& head_profile =
       Argparse::add<std::string>("--head-retain-profile")
           .help("Exact layer-major per-head retention profile for f32-topk or hmx-topk");
@@ -320,6 +378,8 @@ int main(int argc, char** argv) {
       Argparse::add<bool>("--debug-qnn-layer-outputs").help("Copy and summarize every QNN decoder residual output");
   auto& debug_qnn_boundary_dir = Argparse::add<std::string>("--debug-qnn-boundary-dir")
                                       .help("Dump every QNN layer Q/K/V and CPU attention output as raw Float32");
+  auto& dump_qnn_prefill_logits = Argparse::add<std::string>("--dump-qnn-prefill-logits")
+                                      .help("Write the last prompt token's QNN prefill logits as raw Float32 to this file");
 
   Argparse::parse(argc, argv);
 
@@ -332,6 +392,16 @@ int main(int argc, char** argv) {
   const bool use_npu_prefill = !cpu_prefill.isSet();
   const bool prepare_context = prepare_qnn_context.isSet();
   const bool run_prefill_only = prefill_only.isSet();
+  if (profile_shared_kv.isSet() && (!use_npu_prefill || prepare_context)) {
+    fmt::print(stderr, "Error: --profile-shared-kv requires QNN prefill execution.\n");
+    ::mllm::shutdownContext();
+    return 2;
+  }
+  if (dump_qnn_prefill_logits.isSet() && (!use_npu_prefill || prepare_context)) {
+    fmt::print(stderr, "Error: --dump-qnn-prefill-logits requires a QNN prefill run.\n");
+    ::mllm::shutdownContext();
+    return 2;
+  }
   if (!use_npu_prefill && qnn_qkv_bias_after_dequant.isSet()) {
     fmt::print(stderr, "Error: --qnn-qkv-bias-after-dequant requires QNN prefill.\n");
     ::mllm::shutdownContext();
@@ -445,6 +515,11 @@ int main(int argc, char** argv) {
     ::mllm::shutdownContext();
     return 2;
   }
+  if (native_shared_kv.isSet() && (!use_npu_prefill || f32_topk)) {
+    fmt::print(stderr, "Error: --native-shared-kv requires QNN prefill in dense or hmx-topk mode.\n");
+    ::mllm::shutdownContext();
+    return 2;
+  }
   if (sparse_topk && (!use_npu_prefill || !head_profile.isSet())) {
     fmt::print(stderr, "Error: {} requires QNN prefill and --head-retain-profile.\n", attention_mode.get());
     ::mllm::shutdownContext();
@@ -531,7 +606,8 @@ int main(int argc, char** argv) {
              dense_heads, dense_layers, max_new_tokens.get(), prefill_chunk.get(), qnn_sequence_tile.get(), context_receipt,
              context_mode);
 
-  std::unique_ptr<mllm::nn::StaticCache> shared_kv_cache = nullptr;
+  std::unique_ptr<mllm::nn::StaticCache> shared_kv_cache;
+  std::unique_ptr<ProfiledSharedKVCache> profiled_kv_cache;
   std::unique_ptr<mllm::models::qwen_npu::QwenForCausalLM> npu_model;
   std::shared_ptr<mllm::qnn::QNNBackend> qnn_backend;
   int32_t prefill_seq_len = 0;
@@ -553,11 +629,19 @@ int main(int argc, char** argv) {
     if (!qnn_backend) { throw std::runtime_error("QNN backend initialization did not register QNNBackend"); }
     qnn_backend->setSequenceTile(qnn_sequence_tile.get());
 
-    shared_kv_cache = std::make_unique<mllm::nn::StaticCache>(
-        cpu_cfg.max_cache_length, cpu_cfg.num_hidden_layers, cpu_cfg.num_attention_heads, cpu_cfg.num_key_value_heads,
-        cpu_cfg.head_dim, mllm::kFloat32, mllm::kFloat32, mllm::kCPU, false);
-    MLLM_INFO("Created shared StaticCache with {} layers (K=F32, V=F32; HMX keys use per-call F16 staging)",
-              cpu_cfg.num_hidden_layers);
+    // StaticCache repeats each incoming head until it reaches the requested storage head count.
+    const int32_t cache_heads = native_shared_kv.isSet() ? cpu_cfg.num_key_value_heads : cpu_cfg.num_attention_heads;
+    if (profile_shared_kv.isSet()) {
+      profiled_kv_cache = std::make_unique<ProfiledSharedKVCache>(
+          cpu_cfg.max_cache_length, cpu_cfg.num_hidden_layers, cache_heads, cpu_cfg.num_key_value_heads, cpu_cfg.head_dim);
+    } else {
+      shared_kv_cache = std::make_unique<mllm::nn::StaticCache>(
+          cpu_cfg.max_cache_length, cpu_cfg.num_hidden_layers, cache_heads, cpu_cfg.num_key_value_heads, cpu_cfg.head_dim,
+          mllm::kFloat32, mllm::kFloat32, mllm::kCPU, false);
+    }
+    auto* runtime_cache = profiled_kv_cache ? profiled_kv_cache.get() : shared_kv_cache.get();
+    fmt::print("SHADOWNPU_SHARED_KV_LAYOUT query_heads={} cache_heads={} capacity={} layers={} dtype=f32\n",
+               cpu_cfg.num_attention_heads, cache_heads, cpu_cfg.max_cache_length, cpu_cfg.num_hidden_layers);
 
     npu_model = std::make_unique<mllm::models::qwen_npu::QwenForCausalLM>("", cpu_cfg);
     auto npu_param = mllm::load(npu_model_path.get(), file_version);
@@ -569,7 +653,7 @@ int main(int argc, char** argv) {
     for (int32_t layer_idx = 0; layer_idx < cpu_cfg.num_hidden_layers; ++layer_idx) {
       auto& npu_block = npu_decode_blocks.list()[layer_idx];
       auto& npu_kv_cache = npu_block.getKVCache();
-      npu_kv_cache.setStaticCache(shared_kv_cache.get());
+      npu_kv_cache.setStaticCache(runtime_cache);
       npu_kv_cache.setLayerIndex(layer_idx);
     }
     MLLM_INFO("Configured {} QNN KVCache layers to use shared StaticCache", cpu_cfg.num_hidden_layers);
@@ -580,7 +664,7 @@ int main(int argc, char** argv) {
       for (int32_t layer_idx = 0; layer_idx < cpu_cfg.num_hidden_layers; ++layer_idx) {
         auto& cpu_block = cpu_decode_blocks.list()[layer_idx];
         auto& cpu_kv_cache = cpu_block.getKVCache();
-        cpu_kv_cache.setStaticCache(shared_kv_cache.get());
+        cpu_kv_cache.setStaticCache(runtime_cache);
         cpu_kv_cache.setLayerIndex(layer_idx);
       }
       MLLM_INFO("Configured {} CPU KVCache layers to use shared StaticCache", cpu_cfg.num_hidden_layers);
@@ -619,6 +703,7 @@ int main(int argc, char** argv) {
   std::vector<int64_t> generated_token_ids;
   std::string generated_text;
   bool prefill_hit_eos = false;
+  bool logits_dump_failed = false;
 
   mllm::models::ARGenerationOutputPast past{{"sequence", raw_input_tokens}};
   mllm::models::ARGenerationArgs args;
@@ -750,6 +835,7 @@ int main(int argc, char** argv) {
 
     mllm::cpu::shadownpu::CPUAttentionProfiler::reset();
     mllm::cpu::shadownpu::CPUSparseSelectionStats::reset();
+    if (profiled_kv_cache) { profiled_kv_cache->beginPrefill(); }
     auto prefill_start = std::chrono::steady_clock::now();
     mllm::models::ARGenerationOutputPast prefill_output;
     prefill_chunk_count = prefill_seq_len / logical_chunk;
@@ -801,6 +887,7 @@ int main(int argc, char** argv) {
       fmt::print("SHADOWNPU_TTFT basis=prefill_start_to_first_token attention_mode={} prompt_tokens={} "
                  "first_token_id={} ttft_ms={:.3f}\n",
                  attention_mode.get(), prefill_seq_len, first_next_id, ttft.count());
+      if (profiled_kv_cache) { profiled_kv_cache->finishPrefill(); }
       MLLM_INFO("QNN prefill completed: seq_len={}, chunks={}, logical_chunk={}, qnn_tile={}, time={:.2f}s", prefill_seq_len,
                 prefill_chunk_count, logical_chunk, qnn_sequence_tile.get(), prefill_duration.count() / 1000.0);
 
@@ -817,6 +904,18 @@ int main(int argc, char** argv) {
       }
 
       printLogitSummary("qnn_prefill", logits_data, vocab_size);
+      if (dump_qnn_prefill_logits.isSet()) {
+        const auto& path = dump_qnn_prefill_logits.get();
+        std::ofstream dump(path, std::ios::binary);
+        dump.write(reinterpret_cast<const char*>(logits_data), static_cast<std::streamsize>(vocab_size * sizeof(float)));
+        dump.close();
+        logits_dump_failed = !dump;
+        if (logits_dump_failed) {
+          fmt::print(stderr, "Error: could not write QNN prefill logits to {}.\n", path);
+        } else {
+          fmt::print("SHADOWNPU_PREFILL_LOGITS_DUMP values={} path={}\n", vocab_size, path);
+        }
+      }
 
       past["sequence"] = mllm::Tensor::empty({1, 1}, mllm::kInt64, mllm::kCPU).alloc();
       past["sequence"].at<mllm::mllm_int64_t>({0, 0}) = static_cast<mllm::mllm_int64_t>(first_next_id);
@@ -828,6 +927,10 @@ int main(int argc, char** argv) {
       std::wcout << first_token_str << std::flush;
       prefill_hit_eos = first_next_id == eos_token_id;
     } else {
+      if (dump_qnn_prefill_logits.isSet()) {
+        fmt::print(stderr, "Error: no final QNN prefill logits are available to dump.\n");
+        logits_dump_failed = true;
+      }
       auto last_token_idx = raw_input_tokens.shape()[1] - 1;
       past["sequence"] = mllm::Tensor::empty({1, 1}, mllm::kInt64, mllm::kCPU).alloc();
       past["sequence"].at<mllm::mllm_int64_t>({0, 0}) = raw_input_tokens.at<mllm::mllm_int64_t>({0, last_token_idx});
@@ -838,7 +941,7 @@ int main(int argc, char** argv) {
 
   double total_decode_time_ms = 0.0;
   int decode_count = 0;
-  if (!run_prefill_only && !prefill_hit_eos) {
+  if (!run_prefill_only && !prefill_hit_eos && !logits_dump_failed) {
     // Decode phase
     MLLM_INFO("Starting CPU decode...");
     constexpr int decode_start_step = 1;
@@ -953,5 +1056,5 @@ int main(int argc, char** argv) {
   qnn_backend.reset();
   ::mllm::shutdownContext();
 
-  return 0;
+  return logits_dump_failed ? 2 : 0;
 }
