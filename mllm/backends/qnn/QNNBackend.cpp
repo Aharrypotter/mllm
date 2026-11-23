@@ -9,6 +9,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -40,6 +41,18 @@
 #include "mllm/utils/Log.hpp"
 
 namespace mllm::qnn {
+
+namespace {
+
+bool sequenceTileBufferPoolEnabled() {
+  static const bool enabled = [] {
+    const auto* value = std::getenv("MLLM_QNN_SEQUENCE_TILE_BUFFER_POOL");
+    return value && value[0] == '1' && value[1] == '\0';
+  }();
+  return enabled;
+}
+
+}  // namespace
 
 QNNBackend::QNNBackend() : Backend(kQNN, createQNNAllocator()) {
   // register ops
@@ -826,13 +839,18 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
   }
 
   if (sequenceTile_ > 0) {
+    // A shared tile remains exclusive through both input staging and output copy.
+    static std::mutex sequence_tile_pool_mutex;
+    const bool use_buffer_pool = sequenceTileBufferPoolEnabled();
+    std::unique_lock pool_lock(sequence_tile_pool_mutex, std::defer_lock);
+    if (use_buffer_pool) { pool_lock.lock(); }
     const auto input_wrappers = model->getGraphInputTensorWrappers();
     const auto output_wrappers = model->getGraphOutputTensorWrappers();
     auto state_it = sequenceTileGraphs_.find(graphName);
     if (state_it == sequenceTileGraphs_.end()) {
       SequenceTileGraphState state;
       auto prepare_boundary = [&](Tensor& logical, const std::shared_ptr<QNNTensorWrapper>& wrapper,
-                                  std::vector<QNNSequenceTilePlan>& plans, std::vector<Tensor>& tiles, const char* direction,
+                                  std::vector<QNNSequenceTilePlan>& plans, std::vector<Tensor>& tiles, bool is_input,
                                   size_t index) {
         if (logical.isNil() || logical.device() != kQNN || !logical.isContiguous()
             || logical.impl()->storage()->ptr_ == nullptr) {
@@ -851,9 +869,23 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
           throw std::invalid_argument("QNN graph boundaries have inconsistent sequence-tile counts");
         }
 
-        auto tile = Tensor::empty(plan.compiled_shape, logical.dtype(), kQNN).alloc();
-        tile.setName("qnn_sequence_tile_" + graphName + "_" + direction + std::to_string(index));
-        sequenceTileProfile_.scratch_bytes += tile.bytes();
+        Tensor tile;
+        if (use_buffer_pool) {
+          for (const auto& [_, peer] : sequenceTileGraphs_) {
+            const auto& peer_tiles = is_input ? peer.tile_inputs : peer.tile_outputs;
+            if (index >= peer_tiles.size()) { continue; }
+            const auto& peer_tile = peer_tiles[index];
+            if (peer_tile.dtype() == logical.dtype() && peer_tile.shape() == plan.compiled_shape) {
+              tile = peer_tile;
+              break;
+            }
+          }
+        }
+        if (tile.isNil()) {
+          tile = Tensor::empty(plan.compiled_shape, logical.dtype(), kQNN).alloc();
+          tile.setName("qnn_sequence_tile_" + graphName + (is_input ? "_input" : "_output") + std::to_string(index));
+          sequenceTileProfile_.scratch_bytes += tile.bytes();
+        }
         wrapper->__rebindDataContainerForExecution(tile);
         wrapper->alloc();
         plans.push_back(std::move(plan));
@@ -861,14 +893,14 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
       };
 
       for (size_t index = 0; index < inputs.size(); ++index) {
-        prepare_boundary(inputs[index], input_wrappers[index], state.input_plans, state.tile_inputs, "input", index);
+        prepare_boundary(inputs[index], input_wrappers[index], state.input_plans, state.tile_inputs, true, index);
       }
       for (size_t index = 0; index < outputs.size(); ++index) {
         if (outputs[index].isNil()) {
           throw std::invalid_argument("QNN sequence tiling received a nil logical output boundary");
         }
         if (outputs[index].impl()->storage()->ptr_ == nullptr) { outputs[index].alloc(); }
-        prepare_boundary(outputs[index], output_wrappers[index], state.output_plans, state.tile_outputs, "output", index);
+        prepare_boundary(outputs[index], output_wrappers[index], state.output_plans, state.tile_outputs, false, index);
       }
       MLLM_INFO("QNN_SEQUENCE_TILE_SETUP graph={} tile_sequence={} tiles={} scratch_bytes={}", graphName, sequenceTile_,
                 state.tile_count, sequenceTileProfile_.scratch_bytes);
@@ -908,8 +940,7 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
       auto stage_start = clock::now();
       for (size_t index = 0; index < inputs.size(); ++index) {
         const auto& plan = state.input_plans[index];
-        const int32_t rows = plan.compiled_shape[plan.axis];
-        copyQnnSequenceTile(state.tile_inputs[index], 0, inputs[index], tile_index * rows, rows, plan.axis);
+        copyQnnSequenceTile(state.tile_inputs[index], 0, inputs[index], tile_index * sequenceTile_, sequenceTile_, plan.axis);
       }
       sequenceTileProfile_.input_copy_us += elapsed_us(stage_start, clock::now());
 
@@ -921,8 +952,7 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
       stage_start = clock::now();
       for (size_t index = 0; index < outputs.size(); ++index) {
         const auto& plan = state.output_plans[index];
-        const int32_t rows = plan.compiled_shape[plan.axis];
-        copyQnnSequenceTile(outputs[index], tile_index * rows, state.tile_outputs[index], 0, rows, plan.axis);
+        copyQnnSequenceTile(outputs[index], tile_index * sequenceTile_, state.tile_outputs[index], 0, sequenceTile_, plan.axis);
       }
       sequenceTileProfile_.output_copy_us += elapsed_us(stage_start, clock::now());
       ++sequenceTileProfile_.tile_calls;
