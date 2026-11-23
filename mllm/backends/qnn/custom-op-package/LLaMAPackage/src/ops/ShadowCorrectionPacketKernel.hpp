@@ -18,6 +18,11 @@ constexpr int vector_width = 32;
 
 enum class code_encoding : uint16_t { signed_fixed = 0, offset_binary = 0x8000 };
 
+static inline bool valid_controls(uint32_t positive, uint32_t negative, uint32_t flags) {
+  return (flags & ~(clip_input | clip_output)) == 0 && positive != 0 && negative != 0
+         && positive < UINT32_C(0x7F800000) && negative < UINT32_C(0x7F800000);
+}
+
 static inline uint32_t word_bits(const float *value) {
   uint32_t bits;
   memcpy(&bits, value, sizeof(bits));
@@ -115,19 +120,33 @@ static int row_needs_output_repair(const int16_t *codes, uint16_t minimum, uint1
 #endif
 }
 
-template<bool use_activation_codes = false>
+static inline bool append_clipped_vector(correction_packet& packet, const float* values, unsigned channel,
+                                         uint32_t positive, uint32_t negative, unsigned& sparse_count) {
+  uint32_t lanes = clipping_mask(values + channel, positive, negative);
+  if (static_cast<unsigned>(__builtin_popcount(lanes)) > sparse_capacity - sparse_count) { return false; }
+  while (lanes) {
+    const unsigned column = channel + static_cast<unsigned>(__builtin_ctz(lanes));
+    const uint32_t bits = word_bits(values + column);
+    if ((bits & UINT32_C(0x7FFFFFFF)) >= UINT32_C(0x7F800000)) { return false; }
+    packet.sparse[sparse_count++] = sparse_entry{column, bits};
+    lanes &= lanes - 1;
+  }
+  return true;
+}
+
+template<bool use_activation_codes = false, bool use_activation_mask = false>
 inline int pack_shadow_correction_tile(const float *activation, const int16_t *codes,
                                 uint32_t positive, uint32_t negative, uint32_t flags,
                                 struct correction_packet *packet,
                                 code_encoding encoding = code_encoding::signed_fixed,
-                                const uint16_t* activation_codes = nullptr) {
+                                const uint16_t* activation_codes = nullptr,
+                                const uint32_t* activation_mask = nullptr) {
+  static_assert(!(use_activation_codes && use_activation_mask));
+  static_assert(activation_group_width == 2 * vector_width);
   memset(packet, 0, sizeof(*packet));
   packet->status = needs_original_tile;
   packet->mask_flags = flags;
-  if ((flags & ~(clip_input | clip_output)) != 0 || positive == 0 || negative == 0 ||
-      positive >= UINT32_C(0x7F800000) || negative >= UINT32_C(0x7F800000)) {
-    return needs_original_tile;
-  }
+  if (!valid_controls(positive, negative, flags)) { return needs_original_tile; }
 
   // Adding the offset 32768 to a signed code flips only its sign bit.
   const uint16_t bias = static_cast<uint16_t>(encoding);
@@ -143,27 +162,36 @@ inline int pack_shadow_correction_tile(const float *activation, const int16_t *c
       memcpy(packet->dense_rows[dense_count], values, in_width * sizeof(float));
       ++dense_count;
     } else if (!(flags & clip_input)) {
-      for (unsigned channel = 0; channel < in_width; channel += vector_width) {
-#if defined(__HEXAGON_ARCH__) && __HEXAGON_ARCH__ >= 81
-        if constexpr (use_activation_codes) {
-          // One 128-byte native code vector corresponds to two FP32 vectors.
-          constexpr unsigned group_width = sizeof(HVX_Vector) / sizeof(uint16_t);
-          static_assert(group_width == 2 * vector_width && in_width % group_width == 0);
-          const bool group_start = channel % group_width == 0;
-          if (group_start && !activation_group_can_clip(activation_codes + row * in_width + channel)) {
-            channel += vector_width;
-            continue;
+      if constexpr (use_activation_mask) {
+        const auto* row_mask = activation_mask + row * activation_mask_words_per_row;
+        for (unsigned word = 0; word < activation_mask_words_per_row; ++word) {
+          uint32_t groups = row_mask[word];
+          while (groups) {
+            const unsigned group = word * activation_groups_per_word + static_cast<unsigned>(__builtin_ctz(groups));
+            if (group >= activation_groups_per_row) { return needs_original_tile; }
+            const unsigned channel = group * activation_group_width;
+            if (!append_clipped_vector(*packet, values, channel, positive, negative, sparse_count)
+                || !append_clipped_vector(*packet, values, channel + vector_width, positive, negative, sparse_count)) {
+              return needs_original_tile;
+            }
+            groups &= groups - 1;
           }
         }
+      } else {
+        for (unsigned channel = 0; channel < in_width; channel += vector_width) {
+#if defined(__HEXAGON_ARCH__) && __HEXAGON_ARCH__ >= 81
+          if constexpr (use_activation_codes) {
+            static_assert(activation_group_width == sizeof(HVX_Vector) / sizeof(uint16_t));
+            if (channel % activation_group_width == 0
+                && !activation_group_can_clip(activation_codes + row * in_width + channel)) {
+              channel += vector_width;
+              continue;
+            }
+          }
 #endif
-        uint32_t lanes = clipping_mask(values + channel, positive, negative);
-        if ((unsigned)__builtin_popcount(lanes) > sparse_capacity - sparse_count) return needs_original_tile;
-        while (lanes) {
-          const unsigned column = channel + (unsigned)__builtin_ctz(lanes);
-          const uint32_t bits = word_bits(values + column);
-          if ((bits & UINT32_C(0x7FFFFFFF)) >= UINT32_C(0x7F800000)) return needs_original_tile;
-          packet->sparse[sparse_count++] = sparse_entry{column, bits};
-          lanes &= lanes - 1;
+          if (!append_clipped_vector(*packet, values, channel, positive, negative, sparse_count)) {
+            return needs_original_tile;
+          }
         }
       }
     }

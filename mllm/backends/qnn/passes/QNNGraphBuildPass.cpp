@@ -30,6 +30,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string_view>
 
@@ -74,6 +75,77 @@ bool isQwenMlpGraph(std::string_view name) {
   name.remove_prefix(prefix.size());
   name.remove_suffix(2);
   return !name.empty() && name.find_first_not_of("0123456789") == std::string_view::npos;
+}
+
+bool flagEnabled(const char* variable) {
+  const char* value = std::getenv(variable);
+  return value && std::string_view(value) == "1";
+}
+
+struct ShadowMaskLowering {
+  ir::op_ptr_t multiply;
+  ir::op_ptr_t packet;
+  std::string name;
+};
+
+ShadowMaskLowering findShadowMaskLowering(const std::string& graph_name, const ir::graph::SubGraphOp::ptr_t& graph) {
+  namespace packet = ::shadow_correction_packet;
+  // The replay companion retains the original multiply and raw activation.
+  if (!flagEnabled("MLLM_QNN_SHADOW_PRODUCER_MASK") || !isQwenMlpGraph(graph_name)) { return {}; }
+
+  const std::string multiply_name = graph_name + ".Mul.0";
+  ir::op_ptr_t multiply;
+  for (const auto& op : graph->getTopRegion()->ops()) {
+    const auto* mul = dynamic_cast<const ir::linalg::MulOp*>(op.get());
+    if (mul && dynamic_cast<QNNMulOp*>(mul->getAOp()) && mul->getAOp()->getName() == multiply_name
+        && op->inputs().size() == 2 && op->outputs().size() == 1) {
+      const auto product = op->outputs().front()->cast_<TensorValue>();
+      const auto& shape = product->tensor_.shape();
+      const auto is_fp32_tile = [&shape](const TensorValue::ptr_t& value) {
+        return value->tensor_.dtype() == kFloat32 && value->tensor_.shape() == shape;
+      };
+      if (!product->getAttr("is_graph_output") && shape.size() == 4 && shape[0] == 1
+          && shape[1] * shape[2] == packet::tile_rows && shape[3] == packet::in_width
+          && is_fp32_tile(product) && is_fp32_tile(op->inputs().front()->cast_<TensorValue>())
+          && is_fp32_tile(op->inputs().back()->cast_<TensorValue>())) {
+        multiply = op;
+      }
+    }
+
+    const auto* custom = dynamic_cast<const ir::linalg::CustomizedOp*>(op.get());
+    if (multiply && custom && dynamic_cast<ShadowCorrectionPacketOp*>(custom->getAOp())
+        && !op->inputs().empty()
+        && op->inputs().front()->cast_<TensorValue>()->name() == multiply->outputs().front()->cast_<TensorValue>()->name()) {
+      return {multiply, op, multiply_name + ".activation_mask"};
+    }
+  }
+  return {};
+}
+
+bool addShadowMaskedMultiply(const std::string& graph_name, const std::shared_ptr<QNNModel>& model,
+                             const ShadowMaskLowering& lowering) {
+  namespace packet = ::shadow_correction_packet;
+  const auto product = lowering.multiply->outputs().front()->cast_<TensorValue>();
+  const auto gate = lowering.multiply->inputs().front()->cast_<TensorValue>();
+  const auto up = lowering.multiply->inputs().back()->cast_<TensorValue>();
+  const auto* packet_op = static_cast<const ShadowCorrectionPacketOp*>(
+      lowering.packet->cast_<ir::linalg::CustomizedOp>()->getAOp());
+  auto mask_shape = product->tensor_.shape();
+  mask_shape.back() = packet::activation_mask_words_per_row;
+  const auto mask = Tensor::empty(mask_shape, kInt32, kQNN);
+  if (model->addTensor(product->name(), getQnnOutputTensorType(product), product->tensor_) != MODEL_NO_ERROR
+      || model->addTensor(lowering.name, QNN_TENSOR_TYPE_NATIVE, mask) != MODEL_NO_ERROR) { return false; }
+
+  auto controls = QNNParamTensorWrapper::create("controls", lowering.name + ".controls", QNN_DATATYPE_INT_32,
+                                                std::vector<uint32_t>{1, 1, 1, 3});
+  const auto& words = packet_op->controls();
+  std::memcpy(controls->alloc(), words.data(), words.size() * sizeof(words[0]));
+  const auto err = model->addNode(QNN_OPCONFIG_VERSION_1, lowering.name + ".producer", QNN_Custom_Op_Package,
+                                  "ShadowMulActivationMask", {controls}, {}, {gate->name(), up->name()},
+                                  {product->name(), lowering.name});
+  if (err != MODEL_NO_ERROR) { return false; }
+  MLLM_INFO("QNN_SHADOW_PRODUCER_MASK graph={} tensor={}", graph_name, lowering.name);
+  return true;
 }
 
 ir::op_ptr_t findMlpQuantizeConsumer(const std::string& graph_name, const ir::graph::SubGraphOp::ptr_t& graph,
@@ -310,10 +382,15 @@ bool QNNGraphBuildPass::buildQnnGraph(const ir::graph::SubGraphOp::ptr_t& sub_gr
   const char* fuse_request = std::getenv("MLLM_QNN_MLP_HVX_MUL_QUANTIZE16");
   const bool fuse_mul_quantize = fuse_request && std::string_view(fuse_request) == "1" && isQwenMlpGraph(shadowMainGraphName(graph_name));
   const auto& ops = graph_region->ops();
+  const auto masked = findShadowMaskLowering(graph_name, sub_graph_op);
   ir::op_ptr_t fused_consumer;
   if (fuse_mul_quantize) { MLLM_INFO("QNN_MLP_HVX_MUL_QUANTIZE16_SCAN graph={}", graph_name); }
   for (const auto& region_op : ops) {
     if (region_op == fused_consumer) { continue; }
+    if (region_op == masked.multiply) {
+      if (!addShadowMaskedMultiply(graph_name, qnn_model, masked)) { return false; }
+      continue;
+    }
     if (fuse_mul_quantize && !fused_consumer) {
       if (auto consumer = findMlpQuantizeConsumer(graph_name, sub_graph_op, region_op)) {
         if (!addMlpMulQuantize(graph_name, qnn_model, region_op, consumer)) { return false; }
@@ -332,6 +409,12 @@ bool QNNGraphBuildPass::buildQnnGraph(const ir::graph::SubGraphOp::ptr_t& sub_gr
       // Collect op outputs
       for (auto& output_val : linalg_op->outputs()) { op_outputs.emplace_back(output_val->cast_<ir::tensor::TensorValue>()); }
 
+      if (region_op == masked.packet) {
+        if (!QNNShadowCorrectionPacketPattern::addNodeWithMask(graph_name, region_op, op_inputs, op_outputs, masked.name)) {
+          return false;
+        }
+        continue;
+      }
       if (patterns_.contains(op_types)) {
         auto pattern = patterns_[op_types];
         if (!pattern->addNode(graph_name, linalg_op, op_inputs, op_outputs)) {

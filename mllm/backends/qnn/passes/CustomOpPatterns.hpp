@@ -25,6 +25,9 @@ class QNNShadowCorrectionPacketPattern : public QNNBasePattern {
 
   bool addNode(const std::string& graphName, const ir::op_ptr_t& op, const std::vector<ir::tensor::TensorValue::ptr_t>& inputs,
                const std::vector<ir::tensor::TensorValue::ptr_t>& outputs) override;
+  static bool addNodeWithMask(const std::string& graph_name, const ir::op_ptr_t& op,
+                              const std::vector<ir::tensor::TensorValue::ptr_t>& inputs,
+                              const std::vector<ir::tensor::TensorValue::ptr_t>& outputs, const std::string& mask_name);
 };
 
 }  // namespace mllm::qnn

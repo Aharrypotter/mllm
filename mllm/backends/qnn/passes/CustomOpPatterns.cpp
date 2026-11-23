@@ -100,10 +100,18 @@ bool QNNDequantizeAddPattern::addNode(const std::string& graphName, const ir::op
 bool QNNShadowCorrectionPacketPattern::addNode(const std::string& graph_name, const ir::op_ptr_t& op,
                                                 const std::vector<ir::tensor::TensorValue::ptr_t>& inputs,
                                                 const std::vector<ir::tensor::TensorValue::ptr_t>& outputs) {
+  return addNodeWithMask(graph_name, op, inputs, outputs, {});
+}
+
+bool QNNShadowCorrectionPacketPattern::addNodeWithMask(const std::string& graph_name, const ir::op_ptr_t& op,
+                                                        const std::vector<ir::tensor::TensorValue::ptr_t>& inputs,
+                                                        const std::vector<ir::tensor::TensorValue::ptr_t>& outputs,
+                                                        const std::string& mask_name) {
   const auto* ir_op = dynamic_cast<ir::linalg::CustomizedOp*>(op.get());
   const auto* packet_op = ir_op ? dynamic_cast<ShadowCorrectionPacketOp*>(ir_op->getAOp()) : nullptr;
   if (!packet_op || (inputs.size() != 2 && inputs.size() != 3) || outputs.size() != 1) { return false; }
-  const bool guarded = inputs.size() == 3;
+  const bool masked = !mask_name.empty();
+  const bool guarded = inputs.size() == 3 && !masked;
   const auto& shape = inputs[0]->tensor_.shape();
   if (shape[1] * shape[2] != ::shadow_correction_packet::tile_rows) {
     MLLM_ERROR("ShadowCorrectionPacket requires an M256 QNN graph, got {}", graph_name);
@@ -119,8 +127,9 @@ bool QNNShadowCorrectionPacketPattern::addNode(const std::string& graph_name, co
   const auto& words = packet_op->controls();
   std::memcpy(controls->alloc(), words.data(), words.size() * sizeof(words[0]));
   std::vector<std::string> input_names{inputs[0]->name(), inputs[1]->name()};
+  if (masked) { input_names.push_back(mask_name); }
   if (guarded) { input_names.push_back(inputs[2]->name()); }
-  const char* type = guarded ? "ShadowCorrectionPacketGuarded" : "ShadowCorrectionPacket";
+  const char* type = masked ? "ShadowCorrectionPacketMasked" : (guarded ? "ShadowCorrectionPacketGuarded" : "ShadowCorrectionPacket");
   backend->graphAddNode(graph_name, packet_op->getName(), type, input_names, {outputs[0]->name()}, {controls}, {},
                         QNN_Custom_Op_Package);
   if (guarded) { MLLM_INFO("QNN_SHADOW_CORRECTION_ACTIVATION_CODES graph={}", graph_name); }

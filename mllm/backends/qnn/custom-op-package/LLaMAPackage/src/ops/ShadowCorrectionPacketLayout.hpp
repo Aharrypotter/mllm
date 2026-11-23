@@ -15,7 +15,13 @@ enum {
   dense_capacity = 2,
   words_per_row = 136,
   packet_words = tile_rows * words_per_row,
+  activation_group_width = 64,
+  activation_groups_per_row = in_width / activation_group_width,
+  activation_groups_per_word = 32,
+  activation_mask_words_per_row = (activation_groups_per_row + activation_groups_per_word - 1) / activation_groups_per_word,
 };
+
+static_assert(in_width % activation_group_width == 0);
 
 enum { complete = 0, needs_original_tile = 1 };
 enum { clip_input = 1, clip_output = 2 };
