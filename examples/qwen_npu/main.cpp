@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -15,6 +16,10 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
 
 #include <mllm/mllm.hpp>
 #include <mllm/utils/AnyValue.hpp>
@@ -38,6 +43,31 @@
 using mllm::Argparse;
 
 namespace {
+
+void traceProcessFaults(const char* phase, int step = 0) {
+#if defined(__linux__)
+  static const bool enabled = [] {
+    const auto* option = std::getenv("MLLM_SHADOWNPU_PHASE_FAULTS");
+    return option != nullptr && option[0] == '1' && option[1] == '\0';
+  }();
+  if (!enabled) return;
+
+  rusage usage{};
+  if (::getrusage(RUSAGE_SELF, &usage) != 0) return;
+  const auto wall_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch()).count();
+  const auto cpuTimeUs = [](const timeval& time) {
+    return static_cast<int64_t>(time.tv_sec) * 1000000 + time.tv_usec;
+  };
+  fmt::print("SHADOWNPU_PROCESS_FAULTS phase={} step={} wall_us={} major_faults={} minor_faults={} "
+             "user_us={} system_us={} peak_rss_kib={}\n",
+             phase, step, wall_us, usage.ru_majflt, usage.ru_minflt, cpuTimeUs(usage.ru_utime), cpuTimeUs(usage.ru_stime),
+             usage.ru_maxrss);
+#else
+  (void)phase;
+  (void)step;
+#endif
+}
 
 std::string readPromptFile(const std::string& path) {
   std::ifstream input(path);
@@ -269,6 +299,7 @@ void dumpQNNBoundaryTensors(const std::filesystem::path& root,
 }  // namespace
 
 int main(int argc, char** argv) {
+  traceProcessFaults("main_begin");
 #ifdef MLLM_PERFETTO_ENABLE
   mllm::perf::start();
 #endif
@@ -549,6 +580,7 @@ int main(int argc, char** argv) {
     cpu_decode_model.emplace("", cpu_cfg);
     auto cpu_param = mllm::load(cpu_model_path.get(), file_version);
     cpu_decode_model->load(cpu_param);
+    traceProcessFaults("cpu_model_ready");
     MLLM_INFO("CPU decode model loaded from: {}", cpu_model_path.get());
   }
 
@@ -559,6 +591,7 @@ int main(int argc, char** argv) {
     qnn_backend = std::dynamic_pointer_cast<mllm::qnn::QNNBackend>(mllm::Context::instance().getBackend(mllm::kQNN));
     if (!qnn_backend) { throw std::runtime_error("QNN backend initialization did not register QNNBackend"); }
     qnn_backend->setSequenceTile(qnn_sequence_tile.get());
+    traceProcessFaults("qnn_context_ready");
 
     shared_kv_cache = std::make_unique<mllm::nn::StaticCache>(
         cpu_cfg.max_cache_length, cpu_cfg.num_hidden_layers, cpu_cfg.num_attention_heads, cpu_cfg.num_key_value_heads,
@@ -569,6 +602,7 @@ int main(int argc, char** argv) {
     npu_model = std::make_unique<mllm::models::qwen_npu::QwenForCausalLM>("", cpu_cfg);
     auto npu_param = mllm::load(npu_model_path.get(), file_version);
     npu_model->load(npu_param);
+    traceProcessFaults("npu_model_ready");
     MLLM_INFO("QNN prefill model loaded from: {}", npu_model_path.get());
 
     // Configure QNN model KVCache layers to use shared StaticCache
@@ -758,6 +792,7 @@ int main(int argc, char** argv) {
 
     mllm::cpu::shadownpu::CPUAttentionProfiler::reset();
     mllm::cpu::shadownpu::CPUSparseSelectionStats::reset();
+    traceProcessFaults("qnn_prefill_begin");
     auto prefill_start = std::chrono::steady_clock::now();
     mllm::models::ARGenerationOutputPast prefill_output;
     prefill_chunk_count = prefill_seq_len / logical_chunk;
@@ -782,6 +817,7 @@ int main(int argc, char** argv) {
     }
 
     auto prefill_end = std::chrono::steady_clock::now();
+    traceProcessFaults("qnn_prefill_end");
     const auto prefill_duration = std::chrono::duration<double, std::milli>(prefill_end - prefill_start);
     prefill_time_ms = prefill_duration.count();
 
@@ -805,6 +841,7 @@ int main(int argc, char** argv) {
       }
 
       const auto first_token_ready = std::chrono::steady_clock::now();
+      traceProcessFaults("first_token_ready");
       const auto ttft = std::chrono::duration<double, std::milli>(first_token_ready - prefill_start);
       fmt::print("SHADOWNPU_TTFT basis=prefill_start_to_first_token attention_mode={} prompt_tokens={} "
                  "first_token_id={} ttft_ms={:.3f}\n",
@@ -868,9 +905,11 @@ int main(int argc, char** argv) {
     constexpr int decode_start_step = 1;
 
     for (int step = decode_start_step; step < max_new_tokens_value; ++step) {
+      traceProcessFaults("cpu_forward_begin", step);
       auto step_start = std::chrono::high_resolution_clock::now();
       auto output = cpu_decode_model->forward(past, args);
       auto step_end = std::chrono::high_resolution_clock::now();
+      traceProcessFaults("cpu_forward_end", step);
       auto step_duration = std::chrono::duration_cast<std::chrono::microseconds>(step_end - step_start);
       double step_time_ms = step_duration.count() / 1000.0;
 
@@ -976,6 +1015,7 @@ int main(int argc, char** argv) {
   npu_model.reset();
   qnn_backend.reset();
   ::mllm::shutdownContext();
+  traceProcessFaults("shutdown_done");
 
   return logits_dump_failed ? 2 : 0;
 }
