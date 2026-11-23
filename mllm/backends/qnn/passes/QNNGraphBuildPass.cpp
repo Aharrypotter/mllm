@@ -5,6 +5,9 @@
 #include "QnnTypes.h"
 #include "mllm/backends/qnn/QNNBackend.hpp"
 #include "mllm/backends/qnn/QNNUtils.hpp"
+#include "mllm/backends/qnn/CustomLayers.hpp"
+#include "mllm/backends/qnn/ShadowCorrectionGraph.hpp"
+#include "mllm/backends/qnn/custom-op-package/LLaMAPackage/src/ops/ShadowCorrectionPacketLayout.hpp"
 #include "mllm/backends/qnn/op/QNNCastTypeOp.hpp"
 #include "mllm/backends/qnn/op/QNNElewiseOp.hpp"
 #include "mllm/backends/qnn/op/QNNRMSNormOp.hpp"
@@ -36,6 +39,35 @@ namespace {
 
 using TensorValue = ir::tensor::TensorValue;
 
+TensorValue::ptr_t shadowRawGraphOutput(const ir::graph::SubGraphOp::ptr_t& graph) {
+  namespace packet = ::shadow_correction_packet;
+  auto region = graph->getTopRegion();
+  if (!region) { return {}; }
+
+  TensorValue::ptr_t actual_packet;
+  for (const auto& op : region->ops()) {
+    const auto custom = std::dynamic_pointer_cast<ir::linalg::CustomizedOp>(op);
+    if (custom && dynamic_cast<ShadowCorrectionPacketOp*>(custom->getAOp()) && custom->outputs().size() == 1) {
+      actual_packet = custom->outputs()[0]->cast_<TensorValue>();
+      break;
+    }
+  }
+  if (!actual_packet) { return {}; }
+
+  for (const auto& op : region->ops()) {
+    if (!op->isa_<ir::cf::ReturnOp>() || op->inputs().size() != 4) { continue; }
+    const auto raw = op->inputs()[0]->cast_<TensorValue>();
+    const auto returned_packet = op->inputs()[3]->cast_<TensorValue>();
+    const auto& raw_shape = raw->tensor_.shape();
+    if (returned_packet == actual_packet && raw->getAttr("is_graph_output") && raw_shape.size() == 4
+        && raw_shape[0] == 1 && raw_shape[1] * raw_shape[2] == packet::tile_rows
+        && raw_shape[3] == packet::in_width && raw->tensor_.dtype() == kFloat32) {
+      return raw;
+    }
+  }
+  return {};
+}
+
 bool isQwenMlpGraph(std::string_view name) {
   constexpr std::string_view prefix = "model.layers.";
   if (!name.starts_with(prefix) || (!name.ends_with("_1") && !name.ends_with("_2"))) { return false; }
@@ -47,7 +79,7 @@ bool isQwenMlpGraph(std::string_view name) {
 ir::op_ptr_t findMlpQuantizeConsumer(const std::string& graph_name, const ir::graph::SubGraphOp::ptr_t& graph,
                                     const ir::op_ptr_t& mul) {
   const auto* mul_op = dynamic_cast<const ir::linalg::MulOp*>(mul.get());
-  if (!mul_op || mul_op->getAOp()->getName() != graph_name + ".Mul.0") { return {}; }
+  if (!mul_op || mul_op->getAOp()->getName() != std::string(shadowMainGraphName(graph_name)) + ".Mul.0") { return {}; }
   auto reject = [&](const char* reason) -> ir::op_ptr_t {
     MLLM_INFO("QNN_MLP_HVX_MUL_QUANTIZE16_REJECT graph={} reason={}", graph_name, reason);
     return {};
@@ -188,15 +220,37 @@ uint8_t QNNGraphBuildPass::run(const ir::node_ptr_t& op) {
     }
   }
 
-  // QNN Graph build and compile
+  const char* choice = std::getenv("MLLM_QNN_SHADOW_COMPACT_CORRECTION");
+  const bool compact_shadow = choice && std::string_view(choice) == "1";
   for (auto& graph_ir : graphs_ir_to_be_compiled) {
-    if (!buildQnnGraph(graph_ir)) { return ir::PASS_RET_FAILURE; }
+    const std::string name = graph_ir->getSymbolAttr()->str();
+    const auto raw = compact_shadow ? shadowRawGraphOutput(graph_ir) : nullptr;
+    if (!raw) {
+      if (!buildQnnGraph(graph_ir, name)) { return ir::PASS_RET_FAILURE; }
+      continue;
+    }
+
+    const std::string replay_name = name + std::string(shadow_raw_graph_suffix);
+    if (!buildQnnGraph(graph_ir, replay_name)) { return ir::PASS_RET_FAILURE; }
+    const auto original_output = raw->getAttr("is_graph_output");
+    raw->removeAttr("is_graph_output");
+    bool built = false;
+    try {
+      built = buildQnnGraph(graph_ir, name);
+    } catch (...) {
+      raw->setAttr("is_graph_output", original_output);
+      throw;
+    }
+    raw->setAttr("is_graph_output", original_output);
+    if (!built) { return ir::PASS_RET_FAILURE; }
+    MLLM_INFO("QNN_SHADOW_COMPACT_GRAPH graph={} replay={}", name, replay_name);
   }
 
   return ir::PASS_RET_SUCCESS;
 }
 
-bool QNNGraphBuildPass::buildQnnGraph(const ir::graph::SubGraphOp::ptr_t& sub_graph_op) {
+bool QNNGraphBuildPass::buildQnnGraph(const ir::graph::SubGraphOp::ptr_t& sub_graph_op,
+                                      const std::string& graph_name) {
   auto& mllm_ctx = mllm::Context::instance();
   auto backend = mllm_ctx.getBackend(kQNN);
 
@@ -217,8 +271,6 @@ bool QNNGraphBuildPass::buildQnnGraph(const ir::graph::SubGraphOp::ptr_t& sub_gr
     MLLM_ERROR("SubGraphOp has no top region");
     return false;
   }
-
-  std::string graph_name = sub_graph_op->getSymbolAttr()->str();
 
   // Create QNN model using the backend
   auto qnn_model = qnn_backend->createQnnGraph(graph_name);
@@ -256,7 +308,7 @@ bool QNNGraphBuildPass::buildQnnGraph(const ir::graph::SubGraphOp::ptr_t& sub_gr
 
   // Process each operation in the subgraph
   const char* fuse_request = std::getenv("MLLM_QNN_MLP_HVX_MUL_QUANTIZE16");
-  const bool fuse_mul_quantize = fuse_request && std::string_view(fuse_request) == "1" && isQwenMlpGraph(graph_name);
+  const bool fuse_mul_quantize = fuse_request && std::string_view(fuse_request) == "1" && isQwenMlpGraph(shadowMainGraphName(graph_name));
   const auto& ops = graph_region->ops();
   ir::op_ptr_t fused_consumer;
   if (fuse_mul_quantize) { MLLM_INFO("QNN_MLP_HVX_MUL_QUANTIZE16_SCAN graph={}", graph_name); }

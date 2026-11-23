@@ -1,6 +1,7 @@
 // Copyright (c) MLLM Team.
 // Licensed under the MIT License.
 
+#include "mllm/backends/qnn/ShadowCorrectionGraph.hpp"
 #include <cstdlib>
 #include <string_view>
 
@@ -63,7 +64,7 @@ bool QNNSiLUPattern::addNode(const std::string& graphName, const ir::op_ptr_t& o
   }
 
   const auto& node_name = qnnSiLUOp->getName();
-  const std::string_view graph = graphName;
+  const auto graph = shadowMainGraphName(graphName);
   constexpr std::string_view layer_prefix = "model.layers.";
   const char* request = std::getenv("MLLM_QNN_QWEN_FP32_HVX_SILU");
   bool use_hvx = false;

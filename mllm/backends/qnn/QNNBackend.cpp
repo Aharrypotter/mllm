@@ -24,6 +24,8 @@
 #include "HTP/QnnHtpContext.h"
 
 #include "mllm/backends/qnn/QNNBackend.hpp"
+#include "mllm/backends/qnn/ShadowCorrectionGraph.hpp"
+#include "mllm/backends/qnn/custom-op-package/LLaMAPackage/src/ops/ShadowCorrectionPacketLayout.hpp"
 #include "mllm/backends/qnn/QNNTypeMacros.hpp"
 #include "mllm/backends/qnn/QNNUtils.hpp"
 #include "mllm/backends/qnn/QNNAllocator.hpp"
@@ -832,7 +834,52 @@ void QNNBackend::graphExecute(const std::string& graphName, std::vector<Tensor>&
     return;
   }
 
-  if (outputs.size() != model->getGraphOutputTensorWrappers().size()) {
+  const auto graph_outputs = model->getGraphOutputTensorWrappers().size();
+  if (graph_outputs == 3 && outputs.size() == 4) {
+    const std::string replay_name = graphName + std::string(shadow_raw_graph_suffix);
+    if (qnnModelIndexMap_.contains(replay_name)) {
+      namespace packet = ::shadow_correction_packet;
+      const auto enabled = [](const char* name) {
+        const auto* value = std::getenv(name);
+        return value && value[0] == '1' && value[1] == '\0';
+      };
+      if (enabled("MLLM_QNN_SHADOW_PACKET_FORCE_FALLBACK")) {
+        graphExecute(replay_name, inputs, outputs);
+        return;
+      }
+
+      // Copies of the three tensors share the caller's logical output storage.
+      std::vector<Tensor> compact(outputs.begin() + 1, outputs.end());
+      graphExecute(graphName, inputs, compact);
+      const auto& encoded = compact.back();
+      const auto* words = encoded.ptr<int32_t>();
+      MLLM_RT_ASSERT(encoded.dtype() == kInt32 && words && encoded.numel() % packet::packet_words == 0);
+      for (size_t offset = 0; offset < static_cast<size_t>(encoded.numel()); offset += packet::packet_words) {
+        if (words[offset] != packet::complete) {
+          MLLM_INFO("QNN_SHADOW_COMPACT_REPLAY graph={} status={}", graphName, words[offset]);
+          graphExecute(replay_name, inputs, outputs);
+          return;
+        }
+      }
+
+      if (enabled("MLLM_QNN_SHADOW_PACKET_VERIFY")) {
+        // Keep the raw output for CPU correction checking, and compare the
+        // compact graph's code, residual and packet with independent buffers.
+        std::vector<Tensor> replay{outputs.front()};
+        for (const auto& tensor : compact) { replay.push_back(Tensor::empty(tensor.shape(), tensor.dtype(), kQNN)); }
+        graphExecute(replay_name, inputs, replay);
+        for (size_t index = 0; index < compact.size(); ++index) {
+          if (std::memcmp(compact[index].ptr<void>(), replay[index + 1].ptr<void>(), compact[index].bytes()) != 0) {
+            MLLM_WARN("QNN_SHADOW_COMPACT_MISMATCH graph={} port={}", graphName, index);
+            break;
+          }
+        }
+      }
+      return;
+    }
+  }
+
+  if (outputs.size() != graph_outputs) {
     MLLM_ERROR("Output size mismatch: expected {}, got {} for graph '{}'", model->getGraphOutputTensorWrappers().size(),
                outputs.size(), graphName);
     return;

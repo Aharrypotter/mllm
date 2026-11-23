@@ -1,6 +1,7 @@
 // Copyright (c) MLLM Team.
 // Licensed under the MIT License.
 
+#include "mllm/backends/qnn/ShadowCorrectionGraph.hpp"
 #include <cstdlib>
 #include <string_view>
 
@@ -156,11 +157,11 @@ bool QNNMulPattern::addNode(const std::string& graphName, const ir::op_ptr_t& op
 
   const auto& node_name = qnnMulOp->getName();
   const char* request = std::getenv("MLLM_QNN_MLP_HVX_MUL");
-  const std::string_view graph = graphName;
+  const auto graph = shadowMainGraphName(graphName);
   constexpr std::string_view layer_prefix = "model.layers.";
   bool use_hvx = false;
   if (request != nullptr && std::string_view(request) == "1" && graph.starts_with(layer_prefix)
-      && (graph.ends_with("_1") || graph.ends_with("_2")) && node_name == graphName + ".Mul.0"
+      && (graph.ends_with("_1") || graph.ends_with("_2")) && node_name == std::string(graph) + ".Mul.0"
       && inputs.size() == 2 && outputs.size() == 1) {
     // The output graph is _1 after the QKV graph receives its own name, and _2 in the fused-bias trace.
     const auto layer = graph.substr(layer_prefix.size(), graph.size() - layer_prefix.size() - 2);
