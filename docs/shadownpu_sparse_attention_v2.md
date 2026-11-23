@@ -261,6 +261,46 @@ rejects dense/sparse generated-token mismatches. The summarizer also requires
 executions per logical graph call. It does not transfer files,
 reboot the phone, alter clocks or thermal policy, or delete remote data.
 
+## Xiaomi 17 Pro resident QNN context
+
+The tested Xiaomi 17 Pro configuration loads an existing Hexagon v81 QNN
+context with graph switching disabled while retaining the persistent binary.
+The launcher applies both settings to the supplied command. Use it with the
+device's matching Android runner, QAIRT runtime, v81 HMX and QNN operator
+packages, and a previously qualified context. Set the runtime's library paths,
+operator bank, and CPU placement for the target installation as usual.
+
+The following command runs sparse prefill for the 2,048-token case in Termux.
+Set the paths to the artifacts provisioned on the phone.
+
+```bash
+bash tools/shadownpu/run_qwen_v81_resident.sh \
+  taskset -c 2,4,5,6,7 "$RUNNER" \
+  --npu-model "$NPU_MODEL" --cpu-model "$CPU_MODEL" --model-version v2 \
+  --config "$CONFIG" --qnn-context "$CONTEXT" \
+  --tokenizer "$TOKENIZER" --merges "$MERGES" \
+  --prompt-token-ids-file "$PROMPT_IDS" --expected-prompt-tokens 2048 \
+  --prefill-chunk 512 --qnn-sequence-tile 256 --qnn-qkv-bias-after-dequant \
+  --attention-mode hmx-topk --head-retain-profile "$HEAD_PROFILE" \
+  --expected-access-code "$ACCESS_CODE" --max-new-tokens 9
+```
+
+For a dense correctness check, use `--attention-mode dense` and omit
+`--head-retain-profile`. For the 4,096-token case, supply the corresponding
+prompt IDs and change the expected length. The runner reports
+`SHADOWNPU_TTFT` from the start of prefill to the first token. Time the whole
+process separately when comparing context loading policies.
+
+Add `--dump-qnn-prefill-logits "$LOGITS_DUMP"` to write the last prompt token's
+vocabulary logits as raw Float32 before decode. Compare each mode with its own
+reference dump for the same model, input and context.
+
+The residency change was tested with the 28-layer Qwen2.5-1.5B v81 context
+containing 33 graphs. In that test, the launcher settings were applied to an
+already qualified Android bundle. Preserve the model, context, runtime and
+input hashes when repeating the benchmark. The shell launcher reuses those
+artifacts and can also run a compatible bundle built separately from source.
+
 ## Current overlap status
 
 The mllmV2 `PatternSparseAttention` operator now connects both whole-head and

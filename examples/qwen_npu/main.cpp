@@ -320,6 +320,8 @@ int main(int argc, char** argv) {
       Argparse::add<bool>("--debug-qnn-layer-outputs").help("Copy and summarize every QNN decoder residual output");
   auto& debug_qnn_boundary_dir = Argparse::add<std::string>("--debug-qnn-boundary-dir")
                                       .help("Dump every QNN layer Q/K/V and CPU attention output as raw Float32");
+  auto& dump_qnn_prefill_logits = Argparse::add<std::string>("--dump-qnn-prefill-logits")
+                                      .help("Write the last prompt token's QNN prefill logits as raw Float32 to this file");
 
   Argparse::parse(argc, argv);
 
@@ -332,6 +334,11 @@ int main(int argc, char** argv) {
   const bool use_npu_prefill = !cpu_prefill.isSet();
   const bool prepare_context = prepare_qnn_context.isSet();
   const bool run_prefill_only = prefill_only.isSet();
+  if (dump_qnn_prefill_logits.isSet() && (!use_npu_prefill || prepare_context)) {
+    fmt::print(stderr, "Error: --dump-qnn-prefill-logits requires a QNN prefill run.\n");
+    ::mllm::shutdownContext();
+    return 2;
+  }
   if (!use_npu_prefill && qnn_qkv_bias_after_dequant.isSet()) {
     fmt::print(stderr, "Error: --qnn-qkv-bias-after-dequant requires QNN prefill.\n");
     ::mllm::shutdownContext();
@@ -619,6 +626,7 @@ int main(int argc, char** argv) {
   std::vector<int64_t> generated_token_ids;
   std::string generated_text;
   bool prefill_hit_eos = false;
+  bool logits_dump_failed = false;
 
   mllm::models::ARGenerationOutputPast past{{"sequence", raw_input_tokens}};
   mllm::models::ARGenerationArgs args;
@@ -817,6 +825,18 @@ int main(int argc, char** argv) {
       }
 
       printLogitSummary("qnn_prefill", logits_data, vocab_size);
+      if (dump_qnn_prefill_logits.isSet()) {
+        const auto& path = dump_qnn_prefill_logits.get();
+        std::ofstream dump(path, std::ios::binary);
+        dump.write(reinterpret_cast<const char*>(logits_data), static_cast<std::streamsize>(vocab_size * sizeof(float)));
+        dump.close();
+        logits_dump_failed = !dump;
+        if (logits_dump_failed) {
+          fmt::print(stderr, "Error: could not write QNN prefill logits to {}.\n", path);
+        } else {
+          fmt::print("SHADOWNPU_PREFILL_LOGITS_DUMP values={} path={}\n", vocab_size, path);
+        }
+      }
 
       past["sequence"] = mllm::Tensor::empty({1, 1}, mllm::kInt64, mllm::kCPU).alloc();
       past["sequence"].at<mllm::mllm_int64_t>({0, 0}) = static_cast<mllm::mllm_int64_t>(first_next_id);
@@ -828,6 +848,10 @@ int main(int argc, char** argv) {
       std::wcout << first_token_str << std::flush;
       prefill_hit_eos = first_next_id == eos_token_id;
     } else {
+      if (dump_qnn_prefill_logits.isSet()) {
+        fmt::print(stderr, "Error: no final QNN prefill logits are available to dump.\n");
+        logits_dump_failed = true;
+      }
       auto last_token_idx = raw_input_tokens.shape()[1] - 1;
       past["sequence"] = mllm::Tensor::empty({1, 1}, mllm::kInt64, mllm::kCPU).alloc();
       past["sequence"].at<mllm::mllm_int64_t>({0, 0}) = raw_input_tokens.at<mllm::mllm_int64_t>({0, last_token_idx});
@@ -838,7 +862,7 @@ int main(int argc, char** argv) {
 
   double total_decode_time_ms = 0.0;
   int decode_count = 0;
-  if (!run_prefill_only && !prefill_hit_eos) {
+  if (!run_prefill_only && !prefill_hit_eos && !logits_dump_failed) {
     // Decode phase
     MLLM_INFO("Starting CPU decode...");
     constexpr int decode_start_step = 1;
@@ -953,5 +977,5 @@ int main(int argc, char** argv) {
   qnn_backend.reset();
   ::mllm::shutdownContext();
 
-  return 0;
+  return logits_dump_failed ? 2 : 0;
 }
