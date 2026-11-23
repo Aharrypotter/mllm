@@ -60,6 +60,9 @@ class StaticCache : public AbstractStaticCache {
 
   [[nodiscard]] inline Tensor getVCacheBuffer(int32_t layer_idx) const { return v_cache_[layer_idx]; };
 
+ protected:
+  void setLayerSequenceLength(int32_t layer_idx, int32_t seq) { current_seq_cnt_[layer_idx] = seq; }
+
  private:
   DeviceTypes device_type_;
   DataTypes k_dtype_;

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -53,9 +54,11 @@ int64_t peakRssKiB() {
 
 class ProfiledSharedKVCache final : public mllm::nn::StaticCache {
  public:
-  ProfiledSharedKVCache(int32_t capacity, int32_t layers, int32_t cache_heads, int32_t kv_heads, int32_t head_dim)
-      : StaticCache(capacity, layers, cache_heads, kv_heads, head_dim, mllm::kFloat32, mllm::kFloat32, mllm::kCPU, false),
-        bytes_per_token_(uint64_t{2} * cache_heads * head_dim * sizeof(float)),
+  ProfiledSharedKVCache(int32_t capacity, int32_t layers, int32_t cache_heads, int32_t kv_heads, int32_t head_dim,
+                        mllm::DataTypes dtype)
+      : StaticCache(capacity, layers, cache_heads, kv_heads, head_dim, dtype, dtype, mllm::kCPU, false),
+        dtype_(dtype),
+        bytes_per_token_(uint64_t{2} * cache_heads * head_dim * mllm::bytesOfType(dtype)),
         capacity_bytes_(bytes_per_token_ * capacity * layers) {}
 
   void beginPrefill() {
@@ -64,10 +67,10 @@ class ProfiledSharedKVCache final : public mllm::nn::StaticCache {
   }
 
   std::array<mllm::Tensor, 2> updateKVCache(int32_t layer, mllm::Tensor key, mllm::Tensor value) override {
-    if (!active_) { return StaticCache::updateKVCache(layer, std::move(key), std::move(value)); }
+    if (!active_) { return append(layer, std::move(key), std::move(value)); }
     const auto tokens = key.shape()[2];
     const auto start = std::chrono::steady_clock::now();
-    auto states = StaticCache::updateKVCache(layer, std::move(key), std::move(value));
+    auto states = append(layer, std::move(key), std::move(value));
     elapsed_ += std::chrono::steady_clock::now() - start;
     written_bytes_ += bytes_per_token_ * tokens;
     ++append_calls_;
@@ -84,6 +87,52 @@ class ProfiledSharedKVCache final : public mllm::nn::StaticCache {
   }
 
  private:
+  static void writeFp16Block(mllm::Tensor input, mllm::Tensor output, int32_t start) {
+    const auto shape = input.shape();
+    const auto stride = input.stride();
+    const int32_t elements = shape[2] * shape[3];
+    if (stride[3] != 1 || stride[2] != shape[3]) { input = input.contiguous(); }
+    for (int32_t head = 0; head < shape[1]; ++head) {
+      auto* destination = output.offsettedPtr<mllm::mllm_fp16_t>({0, head, start, 0});
+      if (input.dtype() == mllm::kFloat16) {
+        const auto* source = input.cptrAt<mllm::mllm_fp16_t>({0, head, 0, 0});
+        std::memcpy(destination, source, static_cast<size_t>(elements) * sizeof(*source));
+      } else {
+        const auto* source = input.cptrAt<mllm::mllm_fp32_t>({0, head, 0, 0});
+#if defined(MLLM_HOST_ARCH_ARM64)
+        mllm::cpu::arm::fp32_2_fp16(source, destination, elements, 1);
+#else
+        std::copy_n(source, elements, destination);
+#endif
+      }
+    }
+  }
+
+  std::array<mllm::Tensor, 2> append(int32_t layer, mllm::Tensor key, mllm::Tensor value) {
+    if (dtype_ != mllm::kFloat16) { return StaticCache::updateKVCache(layer, std::move(key), std::move(value)); }
+
+    MLLM_RT_ASSERT(layer >= 0 && layer < getLayerNums());
+    auto key_cache = getKCacheBuffer(layer);
+    auto value_cache = getVCacheBuffer(layer);
+    const auto shape = key.shape();
+    const auto cache_shape = key_cache.shape();
+    MLLM_RT_ASSERT(shape.size() == 4 && value.shape() == shape && shape[0] == 1 && shape[1] == cache_shape[1]
+                   && shape[3] == cache_shape[3] && key.device() == mllm::kCPU && value.device() == mllm::kCPU);
+    MLLM_RT_ASSERT((key.dtype() == mllm::kFloat16 || key.dtype() == mllm::kFloat32)
+                   && (value.dtype() == mllm::kFloat16 || value.dtype() == mllm::kFloat32));
+    const int32_t start = getCurrentSeqCnt(layer);
+    const int32_t capacity = cache_shape[2];
+    if (start < 0 || start > capacity || shape[2] <= 0 || shape[2] > capacity - start
+        || static_cast<int64_t>(shape[2]) * shape[3] > std::numeric_limits<int>::max()) {
+      throw std::out_of_range("Native FP16 shared KV cache append exceeds capacity");
+    }
+    writeFp16Block(std::move(key), std::move(key_cache), start);
+    writeFp16Block(std::move(value), std::move(value_cache), start);
+    setLayerSequenceLength(layer, start + shape[2]);
+    return getKVCache(layer);
+  }
+
+  mllm::DataTypes dtype_;
   uint64_t bytes_per_token_;
   uint64_t capacity_bytes_;
   uint64_t written_bytes_ = 0;
@@ -343,6 +392,8 @@ int main(int argc, char** argv) {
           .def("dense");
   auto& native_shared_kv =
       Argparse::add<bool>("--native-shared-kv").help("Keep the shared QNN prefill and CPU decode cache at native KV-head count");
+  auto& fp16_shared_kv =
+      Argparse::add<bool>("--fp16-shared-kv").help("Store the native shared K/V heads in Float16");
   auto& profile_shared_kv =
       Argparse::add<bool>("--profile-shared-kv").help("Report shared KV append time, logical bytes, and process peak RSS at TTFT");
   auto& head_profile =
@@ -520,6 +571,11 @@ int main(int argc, char** argv) {
     ::mllm::shutdownContext();
     return 2;
   }
+  if (fp16_shared_kv.isSet() && (!native_shared_kv.isSet() || prepare_context || !qnn_context_path.isSet())) {
+    fmt::print(stderr, "Error: --fp16-shared-kv requires --native-shared-kv and a prebuilt QNN context.\n");
+    return 1;
+  }
+
   if (sparse_topk && (!use_npu_prefill || !head_profile.isSet())) {
     fmt::print(stderr, "Error: {} requires QNN prefill and --head-retain-profile.\n", attention_mode.get());
     ::mllm::shutdownContext();
@@ -631,17 +687,20 @@ int main(int argc, char** argv) {
 
     // StaticCache repeats each incoming head until it reaches the requested storage head count.
     const int32_t cache_heads = native_shared_kv.isSet() ? cpu_cfg.num_key_value_heads : cpu_cfg.num_attention_heads;
-    if (profile_shared_kv.isSet()) {
+    const auto cache_dtype = fp16_shared_kv.isSet() ? mllm::kFloat16 : mllm::kFloat32;
+    if (profile_shared_kv.isSet() || fp16_shared_kv.isSet()) {
       profiled_kv_cache = std::make_unique<ProfiledSharedKVCache>(
-          cpu_cfg.max_cache_length, cpu_cfg.num_hidden_layers, cache_heads, cpu_cfg.num_key_value_heads, cpu_cfg.head_dim);
+          cpu_cfg.max_cache_length, cpu_cfg.num_hidden_layers, cache_heads, cpu_cfg.num_key_value_heads, cpu_cfg.head_dim,
+          cache_dtype);
     } else {
       shared_kv_cache = std::make_unique<mllm::nn::StaticCache>(
           cpu_cfg.max_cache_length, cpu_cfg.num_hidden_layers, cache_heads, cpu_cfg.num_key_value_heads, cpu_cfg.head_dim,
           mllm::kFloat32, mllm::kFloat32, mllm::kCPU, false);
     }
     auto* runtime_cache = profiled_kv_cache ? profiled_kv_cache.get() : shared_kv_cache.get();
-    fmt::print("SHADOWNPU_SHARED_KV_LAYOUT query_heads={} cache_heads={} capacity={} layers={} dtype=f32\n",
-               cpu_cfg.num_attention_heads, cache_heads, cpu_cfg.max_cache_length, cpu_cfg.num_hidden_layers);
+    fmt::print("SHADOWNPU_SHARED_KV_LAYOUT query_heads={} cache_heads={} capacity={} layers={} dtype={}\n",
+               cpu_cfg.num_attention_heads, cache_heads, cpu_cfg.max_cache_length, cpu_cfg.num_hidden_layers,
+               fp16_shared_kv.isSet() ? "f16" : "f32");
 
     npu_model = std::make_unique<mllm::models::qwen_npu::QwenForCausalLM>("", cpu_cfg);
     auto npu_param = mllm::load(npu_model_path.get(), file_version);
@@ -835,7 +894,7 @@ int main(int argc, char** argv) {
 
     mllm::cpu::shadownpu::CPUAttentionProfiler::reset();
     mllm::cpu::shadownpu::CPUSparseSelectionStats::reset();
-    if (profiled_kv_cache) { profiled_kv_cache->beginPrefill(); }
+    if (profile_shared_kv.isSet()) { profiled_kv_cache->beginPrefill(); }
     auto prefill_start = std::chrono::steady_clock::now();
     mllm::models::ARGenerationOutputPast prefill_output;
     prefill_chunk_count = prefill_seq_len / logical_chunk;
@@ -887,7 +946,7 @@ int main(int argc, char** argv) {
       fmt::print("SHADOWNPU_TTFT basis=prefill_start_to_first_token attention_mode={} prompt_tokens={} "
                  "first_token_id={} ttft_ms={:.3f}\n",
                  attention_mode.get(), prefill_seq_len, first_next_id, ttft.count());
-      if (profiled_kv_cache) { profiled_kv_cache->finishPrefill(); }
+      if (profile_shared_kv.isSet()) { profiled_kv_cache->finishPrefill(); }
       MLLM_INFO("QNN prefill completed: seq_len={}, chunks={}, logical_chunk={}, qnn_tile={}, time={:.2f}s", prefill_seq_len,
                 prefill_chunk_count, logical_chunk, qnn_sequence_tile.get(), prefill_duration.count() / 1000.0);
 

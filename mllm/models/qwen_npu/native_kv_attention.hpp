@@ -24,11 +24,13 @@ inline Tensor nativeKVDenseAttention(Tensor query, Tensor key, Tensor value, Mas
   // Fold query heads into GEMM rows within each KV group. The causal mask
   // operates on the restored query-head dimension and the original token rows.
   auto grouped_query = query.to(kFloat32).contiguous().view({batch, kv_heads, group_rows, head_dim});
-  auto scores = nn::functional::matmul(grouped_query, key.to(kFloat32), false, true);
+  if (key.dtype() != kFloat32) { key = key.contiguous().to(kFloat32); }
+  auto scores = nn::functional::matmul(grouped_query, key, false, true);
   auto weights = scores.view({batch, query_heads, query_tokens, context_tokens}) * (1.f / std::sqrt(static_cast<float>(head_dim)));
   weights = softmax(mask(weights));
   auto grouped_weights = weights.view({batch, kv_heads, group_rows, context_tokens});
-  auto output = nn::functional::matmul(grouped_weights, value.to(weights.dtype()));
+  if (value.dtype() != weights.dtype()) { value = value.contiguous().to(weights.dtype()); }
+  auto output = nn::functional::matmul(grouped_weights, value);
   return output.view({batch, query_heads, query_tokens, head_dim});
 }
 

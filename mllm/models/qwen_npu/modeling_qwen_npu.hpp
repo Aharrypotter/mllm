@@ -148,6 +148,15 @@ class IncrementalHmxKVStage {
 #endif
 
 inline auto stageHmxPrefillKV(Tensor states, int head_group_size = 1) -> Tensor {
+  // Sparse attention accepts the cache's full-capacity head stride.
+  if (head_group_size == 1 && states.dtype() == kFloat16 && states.shape().size() == 4 && states.stride()[3] == 1
+      && states.stride()[2] == states.shape()[3]) {
+    static std::once_flag log_first_direct_read;
+    std::call_once(log_first_direct_read, [&] {
+      MLLM_INFO("SHADOWNPU_HMX_FP16_CACHE_VIEW heads={} head_stride={}", states.shape()[1], states.stride()[1]);
+    });
+    return states;
+  }
 #if defined(MLLM_HOST_ARCH_ARM64)
   if (hmxDirectKVCastEnabled() && !Context::instance().thisThread()->trace_mode
       && (head_group_size > 1 || !states.isContiguous()) && supportsDirectHmxKVStage(states)) {
