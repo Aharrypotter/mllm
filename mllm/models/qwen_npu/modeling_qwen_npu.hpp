@@ -558,6 +558,7 @@ class QwenOutProjAndMLP final : public nn::Module {
   nn::Param pre_mlp_proj_quantize_scale_;
   nn::Param down_proj_quantize_scale_;
   std::optional<nn::qnn::ShadowCorrectionPacket> shadow_packet_;
+  bool shadow_packet_int16_guard_ = false;
 
   int hidden_size_, intermediate_size_;
   bool shadow_down_proj_ = false;
@@ -609,6 +610,7 @@ class QwenOutProjAndMLP final : public nn::Module {
         reg<nn::Param>("down_proj_quantize_scale_", getModuleName() + ".mlp.down_proj.input_scale", Tensor::shape_t{1});
     if (shadow_down_proj_ && cfg.qnn_shadow_correction_packet) {
       shadow_packet_.emplace(reg<nn::qnn::ShadowCorrectionPacket>("mlp.down_proj.packet"));
+      shadow_packet_int16_guard_ = cfg.qnn_shadow_correction_int16_guard;
     }
   }
 
@@ -737,8 +739,8 @@ class QwenOutProjAndMLP final : public nn::Module {
                 getModuleName(), B, S / token_width, token_width, intermediate_size_);
     }
     x.attach("qnn_quant_scale", down_proj_quantize_scale_.weight().impl());
-    x = x.to(kInt16);
-    x = down_proj_(x);
+    const auto quantized_activation = x.to(kInt16);
+    x = down_proj_(quantized_activation);
     const auto native_down_proj = x;
     x = x.view({B, S, 1, hidden_size_});
     auto quantized_down_proj = x;
@@ -752,7 +754,15 @@ class QwenOutProjAndMLP final : public nn::Module {
       // activation stays available for a tile whose packet cannot represent it.
       auto projection = native_down_proj;
       if (mlp_width != token_width) { projection = projection.view({B, S / mlp_width, mlp_width, hidden_size_}); }
-      auto packet = (*shadow_packet_)(shadow_input, projection);
+      if (!shadow_packet_int16_guard_) {
+        auto packet = (*shadow_packet_)(shadow_input, projection);
+        return {shadow_input, quantized_down_proj, x, packet};
+      }
+      auto activation_codes = quantized_activation;
+      if (mlp_width != token_width) {
+        activation_codes = activation_codes.view({B, S / mlp_width, mlp_width, intermediate_size_});
+      }
+      auto packet = (*shadow_packet_)(shadow_input, projection, activation_codes);
       return {shadow_input, quantized_down_proj, x, packet};
     }
     return {shadow_input, quantized_down_proj, x};

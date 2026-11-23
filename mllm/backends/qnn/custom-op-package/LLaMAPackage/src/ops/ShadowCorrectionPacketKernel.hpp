@@ -33,6 +33,18 @@ static inline bool any_predicate_byte(HVX_VectorPred predicate) {
 }
 #endif
 
+#if defined(__HEXAGON_ARCH__) && __HEXAGON_ARCH__ >= 81
+static inline bool activation_group_can_clip(const uint16_t* codes) {
+  HVX_Vector values;
+  memcpy(&values, codes, sizeof(values));
+  constexpr uint16_t lower_last = 1;
+  constexpr uint16_t upper_first = UINT16_MAX - 1;
+  const auto near_low = Q6_Q_vcmp_gt_VuhVuh(Q6_Vh_vsplat_R(lower_last + 1), values);
+  const auto near_high = Q6_Q_vcmp_gt_VuhVuh(values, Q6_Vh_vsplat_R(upper_first - 1));
+  return any_predicate_byte(Q6_Q_or_QQ(near_low, near_high));
+}
+#endif
+
 static inline uint32_t clipping_mask(const float *values, uint32_t positive, uint32_t negative) {
   // One uniquely weighted bit per word reduces the predicate to a scalar lane mask.
   static const uint32_t lane_bits[vector_width] __attribute__((aligned(128))) = {
@@ -103,10 +115,12 @@ static int row_needs_output_repair(const int16_t *codes, uint16_t minimum, uint1
 #endif
 }
 
+template<bool use_activation_codes = false>
 inline int pack_shadow_correction_tile(const float *activation, const int16_t *codes,
                                 uint32_t positive, uint32_t negative, uint32_t flags,
                                 struct correction_packet *packet,
-                                code_encoding encoding = code_encoding::signed_fixed) {
+                                code_encoding encoding = code_encoding::signed_fixed,
+                                const uint16_t* activation_codes = nullptr) {
   memset(packet, 0, sizeof(*packet));
   packet->status = needs_original_tile;
   packet->mask_flags = flags;
@@ -130,6 +144,18 @@ inline int pack_shadow_correction_tile(const float *activation, const int16_t *c
       ++dense_count;
     } else if (!(flags & clip_input)) {
       for (unsigned channel = 0; channel < in_width; channel += vector_width) {
+#if defined(__HEXAGON_ARCH__) && __HEXAGON_ARCH__ >= 81
+        if constexpr (use_activation_codes) {
+          // One 128-byte native code vector corresponds to two FP32 vectors.
+          constexpr unsigned group_width = sizeof(HVX_Vector) / sizeof(uint16_t);
+          static_assert(group_width == 2 * vector_width && in_width % group_width == 0);
+          const bool group_start = channel % group_width == 0;
+          if (group_start && !activation_group_can_clip(activation_codes + row * in_width + channel)) {
+            channel += vector_width;
+            continue;
+          }
+        }
+#endif
         uint32_t lanes = clipping_mask(values + channel, positive, negative);
         if ((unsigned)__builtin_popcount(lanes) > sparse_capacity - sparse_count) return needs_original_tile;
         while (lanes) {

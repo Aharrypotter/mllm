@@ -40,6 +40,10 @@ struct QwenNPUConfig : protected ConfigFile {
     shadow_down_proj_layers = data().value("shadow_down_proj_layers", shadow_down_proj_layers);
     qnn_shadow_activation_fp16 = data().value("qnn_shadow_activation_fp16", false);
     qnn_shadow_correction_packet = data().value("qnn_shadow_correction_packet", false);
+    qnn_shadow_correction_int16_guard = data().value("qnn_shadow_correction_int16_guard", false);
+    if (qnn_shadow_correction_int16_guard && !qnn_shadow_correction_packet) {
+      throw std::invalid_argument("Shadow correction INT16 guard requires the correction packet");
+    }
     if (qnn_shadow_correction_packet && qnn_shadow_activation_fp16) {
       throw std::invalid_argument("Shadow correction packets require the original FP32 activation");
     }
@@ -102,6 +106,7 @@ struct QwenNPUConfig : protected ConfigFile {
   std::vector<int32_t> shadow_down_proj_layers;
   bool qnn_shadow_activation_fp16 = false;
   bool qnn_shadow_correction_packet = false;
+  bool qnn_shadow_correction_int16_guard = false;
   bool qnn_shadow_int8_input = false;
   bool qnn_cross_layer_graphs = false;
   // Rotated checkpoints may carry Q/K/V ranges calibrated before adding their Float32 biases.

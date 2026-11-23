@@ -22,7 +22,9 @@ bool isFlat(const Tensor& value) {
   return (value.get_tensor_format_code() & incompatible) == 0;
 }
 
-GraphStatus packCorrection(Tensor& output, const Tensor& activation, const Tensor& codes, const Tensor& controls) {
+template<bool use_activation_codes>
+GraphStatus packCorrectionImpl(Tensor& output, const Tensor& activation, const Tensor& codes, const Tensor& controls,
+                               const Tensor* quantized_activation) {
   const auto [batch, height, width, depth] = activation.dims();
   const auto [code_batch, code_height, code_width, code_depth] = codes.dims();
   const auto [control_batch, control_height, control_width, control_depth] = controls.dims();
@@ -67,10 +69,36 @@ GraphStatus packCorrection(Tensor& output, const Tensor& activation, const Tenso
     return GraphStatus::ErrorFatal;
   }
 
+  const uint16_t* activation_codes = nullptr;
+  if constexpr (use_activation_codes) {
+    const auto [q_batch, q_height, q_width, q_depth] = quantized_activation->dims();
+    if (q_batch != batch || q_height != height || q_width != width || q_depth != depth
+        || quantized_activation->total_storage_elements() < tile_rows * in_width) {
+      errlog("ShadowCorrectionPacketGuarded: activation code shape differs from FP32 input");
+      return GraphStatus::ErrorDimensions;
+    }
+    if (quantized_activation->get_dtype() != DType::QUInt16 || quantized_activation->interface_offset() != 32768
+        || !isFlat(*quantized_activation) || !quantized_activation->raw_data_const()) {
+      errlog("ShadowCorrectionPacketGuarded: expected flat offset-binary INT16 activation codes");
+      return GraphStatus::ErrorFatal;
+    }
+    activation_codes = static_cast<const uint16_t*>(quantized_activation->raw_data_const());
+  }
+
   auto* packet = new (destination) correction_packet;
   const auto encoding = offset_binary ? code_encoding::offset_binary : code_encoding::signed_fixed;
-  pack_shadow_correction_tile(rows, projected, limits[0], limits[1], limits[2], packet, encoding);
+  pack_shadow_correction_tile<use_activation_codes>(rows, projected, limits[0], limits[1], limits[2], packet,
+                                                    encoding, activation_codes);
   return GraphStatus::Success;
+}
+
+GraphStatus packCorrection(Tensor& output, const Tensor& activation, const Tensor& codes, const Tensor& controls) {
+  return packCorrectionImpl<false>(output, activation, codes, controls, nullptr);
+}
+
+GraphStatus packCorrectionGuarded(Tensor& output, const Tensor& activation, const Tensor& codes,
+                                 const Tensor& quantized_activation, const Tensor& controls) {
+  return packCorrectionImpl<true>(output, activation, codes, controls, &quantized_activation);
 }
 
 }  // namespace
@@ -81,5 +109,11 @@ DEF_TENSOR_PROPERTIES(Op("ShadowCorrectionPacket", "activation", "codes", "contr
                       Flat("*", "activation", "codes", "controls"),
                       MainMemory("*", "activation", "codes", "controls"))
 DEF_PACKAGE_PARAM_ORDER("ShadowCorrectionPacket", "controls", true, nullptr)
+
+DEF_PACKAGE_OP_AND_COST_AND_FLAGS(packCorrectionGuarded, "ShadowCorrectionPacketGuarded", SNAIL, Flags::RESOURCE_HVX)
+DEF_TENSOR_PROPERTIES(Op("ShadowCorrectionPacketGuarded", "activation", "codes", "quantized_activation", "controls"),
+                      Flat("*", "activation", "codes", "quantized_activation", "controls"),
+                      MainMemory("*", "activation", "codes", "quantized_activation", "controls"))
+DEF_PACKAGE_PARAM_ORDER("ShadowCorrectionPacketGuarded", "controls", true, nullptr)
 
 END_PKG_OP_DEFINITION(PKG_ShadowCorrectionPacket);

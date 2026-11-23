@@ -102,7 +102,8 @@ bool QNNShadowCorrectionPacketPattern::addNode(const std::string& graph_name, co
                                                 const std::vector<ir::tensor::TensorValue::ptr_t>& outputs) {
   const auto* ir_op = dynamic_cast<ir::linalg::CustomizedOp*>(op.get());
   const auto* packet_op = ir_op ? dynamic_cast<ShadowCorrectionPacketOp*>(ir_op->getAOp()) : nullptr;
-  if (!packet_op || inputs.size() != 2 || outputs.size() != 1) { return false; }
+  if (!packet_op || (inputs.size() != 2 && inputs.size() != 3) || outputs.size() != 1) { return false; }
+  const bool guarded = inputs.size() == 3;
   const auto& shape = inputs[0]->tensor_.shape();
   if (shape[1] * shape[2] != ::shadow_correction_packet::tile_rows) {
     MLLM_ERROR("ShadowCorrectionPacket requires an M256 QNN graph, got {}", graph_name);
@@ -117,9 +118,12 @@ bool QNNShadowCorrectionPacketPattern::addNode(const std::string& graph_name, co
                                                 std::vector<uint32_t>{1, 1, 1, 3});
   const auto& words = packet_op->controls();
   std::memcpy(controls->alloc(), words.data(), words.size() * sizeof(words[0]));
-  backend->graphAddNode(graph_name, packet_op->getName(), "ShadowCorrectionPacket",
-                        {inputs[0]->name(), inputs[1]->name()}, {outputs[0]->name()},
-                        {controls}, {}, QNN_Custom_Op_Package);
+  std::vector<std::string> input_names{inputs[0]->name(), inputs[1]->name()};
+  if (guarded) { input_names.push_back(inputs[2]->name()); }
+  const char* type = guarded ? "ShadowCorrectionPacketGuarded" : "ShadowCorrectionPacket";
+  backend->graphAddNode(graph_name, packet_op->getName(), type, input_names, {outputs[0]->name()}, {controls}, {},
+                        QNN_Custom_Op_Package);
+  if (guarded) { MLLM_INFO("QNN_SHADOW_CORRECTION_ACTIVATION_CODES graph={}", graph_name); }
   MLLM_INFO("QNN_SHADOW_CORRECTION_PACKET graph={} positive={} negative={} flags={}", graph_name, words[0], words[1], words[2]);
   return true;
 }

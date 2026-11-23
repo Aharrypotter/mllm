@@ -142,7 +142,7 @@ void ShadowCorrectionPacketOp::forward(const std::vector<Tensor>&, std::vector<T
 }
 
 void ShadowCorrectionPacketOp::reshape(const std::vector<Tensor>& inputs, std::vector<Tensor>& outputs) {
-  MLLM_RT_ASSERT_EQ(inputs.size(), 2);
+  MLLM_RT_ASSERT(inputs.size() == 2 || inputs.size() == 3);
   const auto& activation = inputs[0];
   const auto& projection = inputs[1];
   MLLM_RT_ASSERT(activation.rank() == 4 && projection.rank() == 4);
@@ -152,6 +152,10 @@ void ShadowCorrectionPacketOp::reshape(const std::vector<Tensor>& inputs, std::v
   MLLM_RT_ASSERT(activation.device() == kQNN && activation.dtype() == kFloat32 && shape[3] == packet::in_width);
   MLLM_RT_ASSERT(projection.device() == kQNN && projection.dtype() == kInt16);
   MLLM_RT_ASSERT_EQ(projection.shape(), (Tensor::shape_t{1, shape[1], shape[2], packet::out_width}));
+  if (inputs.size() == 3) {
+    MLLM_RT_ASSERT(inputs[2].device() == kQNN && inputs[2].dtype() == kInt16);
+    MLLM_RT_ASSERT_EQ(inputs[2].shape(), shape);
+  }
   outputs.emplace_back(Tensor::empty({1, rows, 1, packet::words_per_row}, kInt32, kQNN));
 }
 
