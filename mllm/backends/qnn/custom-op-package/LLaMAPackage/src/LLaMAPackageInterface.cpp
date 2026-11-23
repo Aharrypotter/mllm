@@ -44,7 +44,7 @@ END_PKG_OPS_OPTS_LIST()
 // op package info
 static constexpr auto sg_packageName = THIS_PKG_NAME_STR;  // package name passed in as compile flag
 
-static std::array<const char*, 19> sg_opNames{{"RMSNorm", "KVCache", "LLaMADequantizeAdd", "LLaMAMul", "LLaMAReLU",
+static std::array<const char*, 20> sg_opNames{{"RMSNorm", "KVCache", "LLaMADequantizeAdd", "LLaMAMul", "LLaMAReLU",
                                                "CausalMask", "SiLU", "QLayerNorm", "RoPE", "RoPESimple", "WNop", "LLaMAAdd",
                                                "IRoPE", "LLaMALinear", "LLaMADequantize", "LLaMASuperSiLU", "LLaMAQuantize",
                                                "LLaMAMulQuantize16", "ShadowCorrectionPacket", "ShadowCorrectionPacketGuarded"}};
